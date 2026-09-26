@@ -264,7 +264,7 @@ pub fn download_and_stage(
     Ok(staging)
 }
 
-fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
+pub(crate) fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
     let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("zip open failed: {e}"))?;
     for i in 0..zip.len() {

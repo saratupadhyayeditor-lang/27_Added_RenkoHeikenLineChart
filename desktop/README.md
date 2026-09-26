@@ -51,7 +51,33 @@ Windows (PowerShell):
 powershell -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
 ```
 
-Output: `dist/` containing `algo-desktop`, `algo-server` and `static/`.
+Output: `dist/` containing `algo-desktop`, `algo-server`, `static/`, the update
+asset `algo-desktop-<os>-<arch>.zip`, `SHA256SUMS`, aur ek single-file portable
+launcher `algo-desktop-<os>-<arch>-portable`.
+
+## Portable single-file launcher
+
+`dist/algo-desktop-<os>-<arch>-portable` (Windows par `.exe`) ek hi file hai
+jisme shell + `algo-server` + `static/` embedded hote hain.
+
+- Double-click karo, installer ya admin rights ki zaroorat nahi.
+- Pehli baar chalane par ye apne andar se runtime `<data_dir>/runtime/<hash>/`
+  me extract karta hai (content-hash cache, dobara extract nahi hota).
+- `data_dir` default `data/`, `ALGODHAN_DATA_DIR` se badal sakte ho.
+- Portable folder (`algo-desktop` + `algo-server` + `static/`) primary supported
+  form hai; single-file variant convenience ke liye hai. Note: self-extracting
+  single file antivirus / Windows SmartScreen me kabhi flag ho sakti hai -
+  unhe "More info -> Run anyway" karna pad sakta hai.
+
+Manual build:
+
+```bash
+desktop/target/release/algo-desktop --make-launcher \
+  desktop/target/release/algo-desktop \
+  target/release/algo-server \
+  crates/server/static \
+  dist/algo-desktop-linux-x86_64-portable
+```
 
 ## Manual updater (GitHub Releases)
 
@@ -110,7 +136,13 @@ algo-desktop --test-update http://host:port algo-desktop-linux-x86_64.zip /tmp/t
 
 # helper mode (app ise khud call karta hai update apply ke liye)
 algo-desktop --apply <staging> <target> <launch> <pid>
+
+# single-file portable launcher banao
+algo-desktop --make-launcher <shell_exe> <server_exe> <static_dir> <out_exe>
 ```
+
+Server resolution order: `ALGO_SERVER_BIN` env -> embedded payload (agar launcher
+hai) -> sibling `algo-server` -> dev `target/` build.
 
 `ALGO_UI_SELFTEST=1` ke saath chalao to shell injected updater panel aur IPC
 round-trip verify karke exit kar jata hai.

@@ -25,6 +25,7 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::window::WindowBuilder;
 use wry::WebViewBuilder;
 
+mod payload;
 mod ui;
 mod updater;
 
@@ -43,6 +44,30 @@ enum UserEvent {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Build a single-file launcher: shell exe + embedded server/static payload.
+    if args.get(1).map(String::as_str) == Some("--make-launcher") {
+        let shell = args.get(2).map(PathBuf::from);
+        let server = args.get(3).map(PathBuf::from);
+        let static_dir = args.get(4).map(PathBuf::from);
+        let out = args.get(5).map(PathBuf::from);
+        match (shell, server, static_dir, out) {
+            (Some(s), Some(srv), Some(st), Some(o)) => match payload::make_launcher(&s, &srv, &st, &o) {
+                Ok(()) => {
+                    println!("launcher -> {}", o.display());
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("make-launcher failed: {e}");
+                    std::process::exit(1);
+                }
+            },
+            _ => {
+                eprintln!("usage: --make-launcher <shell_exe> <server_exe> <static_dir> <out_exe>");
+                std::process::exit(2);
+            }
+        }
+    }
 
     // Helper mode: swap files after the main app exits, then relaunch.
     if args.get(1).map(String::as_str) == Some("--apply") {
@@ -418,6 +443,13 @@ fn resolve_server_bin() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         if p.is_file() {
             return Some(p);
+        }
+    }
+    // Single-file launcher: extract the embedded runtime if present.
+    if payload::is_launcher() {
+        if let Some(server) = payload::extract_embedded_server(&resolve_data_dir()) {
+            println!("[algo-desktop] using embedded runtime at {}", server.display());
+            return Some(server);
         }
     }
     let name = if cfg!(windows) { "algo-server.exe" } else { "algo-server" };
