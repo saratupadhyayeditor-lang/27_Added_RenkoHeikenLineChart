@@ -180,10 +180,10 @@ pub struct Settings {
     pub trade_limit: bool,
     pub trade_limit_count: i64,
     pub ai_trades: bool,
-    pub hft: bool,
-    pub hft_ops: i64,
-    pub hft_exec_on_cb: bool,
-    pub hft_exec_on: String,
+    /// Global order-rate cap in orders per second. Every entry the engine opens
+    /// (live or paper) is throttled so no more than this many orders are sent in
+    /// any trailing one-second window. Dhan's API allows ~6/sec; clamped 1..=30.
+    pub order_per_sec: i64,
     pub start_after_enabled: bool,
     pub start_after: String,
     pub no_trade_after_enabled: bool,
@@ -387,10 +387,7 @@ impl Default for Settings {
             trade_limit: false,
             trade_limit_count: 5,
             ai_trades: false,
-            hft: false,
-            hft_ops: 6,
-            hft_exec_on_cb: true,
-            hft_exec_on: "close".into(),
+            order_per_sec: 6,
             start_after_enabled: false,
             start_after: "09:15".into(),
             no_trade_after_enabled: false,
@@ -1058,7 +1055,7 @@ pub struct RealtimeState {
     nifty_seq: Arc<AtomicI64>,
     /// Throttle for the tick-native NIFTY flip watchdog (millisecond clock).
     last_nifty_flip: Arc<AtomicI64>,
-    /// Order timestamps (ms) in the last second, powering the HFT orders/sec cap.
+    /// Order timestamps (ms) in the last second, powering the orders/sec cap.
     order_times: Arc<Mutex<Vec<i64>>>,
     /// Paper-only simulated entry latency: strategy id -> due ms for entries
     /// currently queued by `queue_delayed_entry`. The map doubles as the
@@ -1138,15 +1135,12 @@ impl RealtimeState {
         if doc.settings.trade_limit_count <= 0 {
             doc.settings.trade_limit_count = 5;
         }
-        // HFT orders/sec: 0 (or nonsense) means "unset" -> old default 6, and
-        // anything above the Dhan ceiling is clamped to 30.
-        if doc.settings.hft_ops <= 0 {
-            doc.settings.hft_ops = 6;
+        // Orders/sec: 0 (or nonsense) means "unset" -> default 6; anything above
+        // the Dhan ceiling is clamped to 30.
+        if doc.settings.order_per_sec <= 0 {
+            doc.settings.order_per_sec = 6;
         }
-        doc.settings.hft_ops = hft_ops_budget(doc.settings.hft_ops);
-        if !matches!(doc.settings.hft_exec_on.as_str(), "open" | "high" | "low" | "close" | "candle_open" | "candle_high" | "candle_low" | "candle_close") {
-            doc.settings.hft_exec_on = "close".into();
-        }
+        doc.settings.order_per_sec = order_per_sec_budget(doc.settings.order_per_sec);
         let st = Self {
             dhan,
             paper,
@@ -1267,20 +1261,14 @@ impl RealtimeState {
         let mut parsed: RtDoc = serde_json::from_value(v.clone())
             .map_err(|e| format!("invalid engine state: {e}"))?;
         // Apply the same normalisation the startup loader does, so a restored
-        // state can never carry a nonsense HFT/limit value.
+        // state can never carry a nonsense order-rate value.
         if parsed.settings.trade_limit_count <= 0 {
             parsed.settings.trade_limit_count = 5;
         }
-        if parsed.settings.hft_ops <= 0 {
-            parsed.settings.hft_ops = 6;
+        if parsed.settings.order_per_sec <= 0 {
+            parsed.settings.order_per_sec = 6;
         }
-        parsed.settings.hft_ops = hft_ops_budget(parsed.settings.hft_ops);
-        if !matches!(
-            parsed.settings.hft_exec_on.as_str(),
-            "open" | "high" | "low" | "close" | "candle_open" | "candle_high" | "candle_low" | "candle_close"
-        ) {
-            parsed.settings.hft_exec_on = "close".into();
-        }
+        parsed.settings.order_per_sec = order_per_sec_budget(parsed.settings.order_per_sec);
         let count = parsed.strategies.len() + parsed.positions.len() + parsed.closed.len();
         {
             let mut d = self.doc.lock().map_err(|_| "state lock poisoned".to_string())?;
@@ -1576,9 +1564,9 @@ impl RealtimeState {
         resp
     }
 
-    /// HFT orders/sec budget: true when fewer than `max_per_sec` orders were
+    /// Orders/sec budget: true when fewer than `max_per_sec` orders were
     /// placed in the trailing second.
-    fn hft_allow(&self, max_per_sec: i64) -> bool {
+    fn order_allow(&self, max_per_sec: i64) -> bool {
         if max_per_sec <= 0 {
             return false;
         }
@@ -1591,7 +1579,7 @@ impl RealtimeState {
         (g.len() as i64) < max_per_sec
     }
 
-    fn hft_record(&self) {
+    fn order_record(&self) {
         let now = now_ms();
         if let Ok(mut g) = self.order_times.lock() {
             g.push(now);
@@ -1604,8 +1592,8 @@ impl RealtimeState {
 
     fn spawn_engine(self) {
         tokio::spawn(async move {
-            // 100ms ultrafast base timer: HFT strategies are re-scanned every
-            // tick; classic strategies self-throttle to their bar timeframe.
+            // 100ms base timer: every strategy is re-scanned on the live bar each
+            // tick; entry rate is bounded by the orders/sec cap.
             let mut tick = tokio::time::interval(Duration::from_millis(100));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -2889,21 +2877,10 @@ impl RealtimeState {
             if !in_run(&strat) || strat.security_id <= 0 || (strat.conditions.is_empty() && !strat.synthetic) {
                 continue;
             }
-            let (hft, hft_ops, hft_exec_enabled, hft_field) = self
+            let order_per_sec = self
                 .doc()
-                .map(|d| {
-                    (
-                        d.settings.hft,
-                        hft_ops_budget(d.settings.hft_ops),
-                        d.settings.hft_exec_on_cb,
-                        if d.settings.hft_exec_on.trim().is_empty() {
-                            "close".to_string()
-                        } else {
-                            d.settings.hft_exec_on.clone()
-                        },
-                    )
-                })
-                .unwrap_or((false, 6, true, "close".into()));
+                .map(|d| order_per_sec_budget(d.settings.order_per_sec))
+                .unwrap_or(6);
             let settings = self.doc().map(|d| d.settings.clone()).unwrap_or_default();
             // Engine controls: the 1min/5min checkboxes (or the strategy's own TF
             // when "Use AST settings" is off) and Multi-TF confirm choose the run
@@ -2914,13 +2891,13 @@ impl RealtimeState {
                 Some((entry, _)) => entry.clone(),
                 None => engine_tf(&settings, &strat),
             };
-            // Classic mode never opens a second position for the same strategy;
-            // HFT may stack, bounded globally by the orders/sec cap below.
+            // Never open a second position for the same strategy; the global
+            // orders/sec cap below bounds how fast new entries may fire.
             let running = self
                 .doc()
                 .map(|d| d.positions.iter().filter(|p| js(p, "strategyId") == strat.id).count())
                 .unwrap_or(0);
-            if !hft && running > 0 {
+            if running > 0 {
                 continue;
             }
             let now = now_ms();
@@ -3028,15 +3005,6 @@ impl RealtimeState {
             }
             if eval.is_empty() {
                 continue;
-            }
-            // HFT "execute on": when the enable box is ticked, test every
-            // condition against the chosen candle value (open/high/low/close,
-            // default close) of the scanned bar; when unticked each condition
-            // keeps its own default source.
-            if hft && hft_exec_enabled {
-                for (_, c) in eval.iter_mut() {
-                    apply_hft_price(c, offset, &hft_field);
-                }
             }
             let mut all_pass = true;
             let synth = strat.synthetic;
@@ -3180,8 +3148,9 @@ impl RealtimeState {
             if let Ok(mut m) = self.last_sig.lock() {
                 m.insert(strat.id.clone(), now);
             }
-            // HFT orders/sec cap (Dhan allows ~6/sec).
-            if hft && !self.hft_allow(hft_ops) {
+            // Orders/sec cap: never send more than the configured number of
+            // entries in any trailing one-second window (Dhan allows ~6/sec).
+            if !self.order_allow(order_per_sec) {
                 continue;
             }
             // Entry-timing diagnostics: stamp the moment the full filter set
@@ -3198,7 +3167,7 @@ impl RealtimeState {
             // branch is skipped entirely, so the real tab and a paper tab with
             // the box unticked keep behaving identically.
             if self.paper && settings.paper_exec_delay_on && settings.paper_exec_delay_ms > 0.0 {
-                self.queue_delayed_entry(&strat.id, &exec_strat, settings.paper_exec_delay_ms, hft);
+                self.queue_delayed_entry(&strat.id, &exec_strat, settings.paper_exec_delay_ms);
                 continue;
             }
             match self.open_entry(&exec_strat).await {
@@ -3206,9 +3175,7 @@ impl RealtimeState {
                     if strat.synthetic {
                         self.log_throttled(&format!("entry:{}", strat.id), 5_000, "info", &format!("scan ENTRY ok {} -> {} [{}]", strat.name, exec_strat.trading_symbol, exec_strat.instrument));
                     }
-                    if hft {
-                        self.hft_record();
-                    }
+                    self.order_record();
                 }
                 Err(e) => {
                     self.log("error", &format!("entry {} failed: {e}", strat.name));
@@ -4150,7 +4117,7 @@ impl RealtimeState {
     /// so the 100ms scanner cannot queue a duplicate; it is removed once the
     /// entry resolves. If the engine stops or is disarmed during the wait the
     /// queued order is dropped, matching the live tab's arm gate.
-    fn queue_delayed_entry(&self, id: &str, strat: &Strategy, delay_ms: f64, hft: bool) {
+    fn queue_delayed_entry(&self, id: &str, strat: &Strategy, delay_ms: f64) {
         let due = now_ms() + delay_ms.max(0.0) as i64;
         {
             let Ok(mut m) = self.paper_pending.lock() else { return };
@@ -4172,9 +4139,7 @@ impl RealtimeState {
             if ready {
                 match me.open_entry(&strat).await {
                     Ok(()) => {
-                        if hft {
-                            me.hft_record();
-                        }
+                        me.order_record();
                         me.log_throttled(
                             &format!("delay-entry:{}", strat.id),
                             5_000,
@@ -5172,28 +5137,6 @@ fn series_value(s: &algo_core::model::SeriesOut, from_end: usize) -> Option<f64>
     }
     let p = &s.data[n - 1 - from_end];
     Some(p.value)
-}
-
-/// HFT "execute on": overwrite the close of the evaluated bar with the chosen
-/// candle value so the strategy condition is tested against it.
-fn apply_hft_price(candles: &mut [Candle], offset: usize, field: &str) {
-    let n = candles.len();
-    if n <= offset {
-        return;
-    }
-    let i = n - 1 - offset;
-    let body = &candles[i];
-    // The UI stores the selection as `candle_close` / `candle_open` / ...; a
-    // missing prefix is tolerated so older saved state keeps working.
-    let key = field.trim().to_ascii_lowercase();
-    let key = key.strip_prefix("candle_").unwrap_or(&key);
-    let v = match key {
-        "open" => body.open,
-        "high" => body.high,
-        "low" => body.low,
-        _ => body.close,
-    };
-    candles[i].close = v;
 }
 
 fn conditions_met(conds: &[Condition], candles: &[Candle], offset: usize) -> bool {
@@ -7107,9 +7050,9 @@ fn more_favourable(is_buy: bool, a: f64, b: f64) -> bool {
     }
 }
 
-/// HFT orders/sec budget, exactly like the old engine: clamped to 1..30
-/// (Dhan rejects bursts above the venue's rate limit).
-fn hft_ops_budget(ops: i64) -> i64 {
+/// Orders/sec budget: clamped to 1..30 (Dhan rejects bursts above the venue's
+/// rate limit). The operator's number is the max orders sent per second.
+fn order_per_sec_budget(ops: i64) -> i64 {
     ops.clamp(1, 30)
 }
 
@@ -7616,18 +7559,12 @@ pub async fn settings_post(State(rt): State<RealtimeState>, Json(v): Json<Value>
         if d.settings.scanner_exclude != old_exclude {
             rt.last_movers.store(0, Ordering::Relaxed);
         }
-        // Normalise a couple of engine fields the old UI also guarded: HFT
-        // orders/sec never means "unset" (fall back to 6) and stays under the
-        // Dhan ceiling; the execute-on field must be a real candle key.
-        if d.settings.hft_ops <= 0 {
-            d.settings.hft_ops = 6;
+        // Normalise the order-rate guard: orders/sec never means "unset" (fall
+        // back to 6) and stays under the Dhan ceiling.
+        if d.settings.order_per_sec <= 0 {
+            d.settings.order_per_sec = 6;
         }
-        d.settings.hft_ops = hft_ops_budget(d.settings.hft_ops);
-        let key = d.settings.hft_exec_on.trim().to_ascii_lowercase();
-        d.settings.hft_exec_on = key.strip_prefix("candle_").unwrap_or(&key).to_string();
-        if !matches!(d.settings.hft_exec_on.as_str(), "open" | "high" | "low" | "close") {
-            d.settings.hft_exec_on = "close".into();
-        }
+        d.settings.order_per_sec = order_per_sec_budget(d.settings.order_per_sec);
         // "Make this default setting" markers (old AST runIn/tradeIn `default`
         // flags): the routing is always persisted, so surface the confirmation
         // the old engine logged instead of leaving the checkbox silently inert.
@@ -9884,21 +9821,18 @@ mod gate_tests {
     }
 
     #[test]
-    fn hft_ops_budget_clamps_to_dhan_ceiling() {
-        assert_eq!(hft_ops_budget(0), 1);
-        assert_eq!(hft_ops_budget(1), 1);
-        assert_eq!(hft_ops_budget(6), 6);
-        assert_eq!(hft_ops_budget(30), 30);
-        assert_eq!(hft_ops_budget(500), 30);
+    fn order_per_sec_budget_clamps_to_dhan_ceiling() {
+        assert_eq!(order_per_sec_budget(0), 1);
+        assert_eq!(order_per_sec_budget(1), 1);
+        assert_eq!(order_per_sec_budget(6), 6);
+        assert_eq!(order_per_sec_budget(30), 30);
+        assert_eq!(order_per_sec_budget(500), 30);
     }
 
     #[test]
-    fn engine_hft_and_time_defaults_match_old_app() {
+    fn engine_order_rate_and_time_defaults_match_old_app() {
         let s = Settings::default();
-        assert!(!s.hft);
-        assert_eq!(s.hft_ops, 6);
-        assert_eq!(s.hft_exec_on, "close");
-        assert!(s.hft_exec_on_cb);
+        assert_eq!(s.order_per_sec, 6);
         assert_eq!(s.start_after, "09:15");
         assert_eq!(s.no_trade_after, "15:30");
         assert_eq!(s.auto_square_off_time, "15:20");
@@ -9926,20 +9860,6 @@ mod gate_tests {
         // matched an index quote, silently dropping the user's index picks.
         assert_eq!(crate::market::quote_key(13, "NSE_EQ"), "13");
         assert_ne!(crate::market::quote_key(13, "NSE_EQ"), crate::market::quote_key(13, "IDX_I"));
-    }
-
-    #[test]
-    fn hft_execute_on_swaps_the_scanned_price() {
-        let mut c = vec![Candle { time: 0, open: 10.0, high: 14.0, low: 8.0, close: 12.0, volume: 1.0 }];
-        // UI stores the selection with a `candle_` prefix; bare names also work.
-        apply_hft_price(&mut c, 0, "candle_high");
-        assert_eq!(c[0].close, 14.0);
-        apply_hft_price(&mut c, 0, "low");
-        assert_eq!(c[0].close, 8.0);
-        apply_hft_price(&mut c, 0, "candle_open");
-        assert_eq!(c[0].close, 10.0);
-        apply_hft_price(&mut c, 0, "candle_close");
-        assert_eq!(c[0].close, 10.0); // close was already replaced by open
     }
 
     #[test]

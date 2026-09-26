@@ -4,6 +4,7 @@
 
 # Packaged installers / distributables (built locally, never part of source backup)
 /dist/
+/dist-windows/
 /AlgoTradingSetup.exe
 /AlgoTradingApp.zip
 /crates/server/static/AlgoTradingSetup.exe

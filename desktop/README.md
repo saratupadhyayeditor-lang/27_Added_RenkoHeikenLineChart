@@ -79,6 +79,35 @@ desktop/target/release/algo-desktop --make-launcher \
   dist/algo-desktop-linux-x86_64-portable
 ```
 
+## Windows installer (AlgoTradingSetup.exe)
+
+`AlgoTradingSetup.exe` ek per-user (no admin / no UAC) NSIS installer hai jo:
+
+- `algo-desktop.exe` (desktop shell + manual updater), `algo-server.exe` aur
+  `static/` ko `%LOCALAPPDATA%\AlgoTrading` me install karta hai.
+- Start Menu aur Desktop shortcut banata hai, aur finish par app launch offer
+  karta hai.
+- Add/Remove Programs me uninstall entry banata hai.
+- Updater installer layout me bhi kaam karta hai (per-user install hai, to
+  update ke liye admin ki zaroorat nahi).
+
+Build (Linux se cross-compile):
+
+```bash
+desktop/scripts/build-windows-installer.sh
+```
+
+Iske liye chahiye: `cargo-xwin`, `clang-cl` + `lld-link` + `llvm-lib`/`llvm-rc`
+(`llvm`), `makensis` (nsis), aur `rustup target add x86_64-pc-windows-msvc`.
+Output: `dist-windows/AlgoTradingSetup.exe`.
+
+Windows par native build: pehle `scripts/build-desktop.ps1` chalao, phir
+`makensis desktop\scripts\installer-windows.nsi` (staging `dist\` se).
+
+Note: `algo-desktop.exe` WebView2 use karta hai (Windows 10/11 par aam taur par
+preinstalled). Agar target system par WebView2 runtime na ho to Microsoft ka
+WebView2 Evergreen Runtime install karna hoga.
+
 ## Manual updater (GitHub Releases)
 
 App ke andar ek floating "Update" panel inject hota hai (app ke apne HTML/JS ko

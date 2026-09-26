@@ -4,7 +4,7 @@
 // AI Smart Trading header with a live P&L summary, an ORDER PLACEMENT METHOD
 // block (Normal / Super / Forever-GTT / Slice-Iceberg name-only checkboxes; the
 // selected method plus all of its order options live in the single Risk &
-// Quantity row), the universal + AI-risk + HFT engine
+// Quantity row), the universal + AI-risk + order-rate engine
 // controls, and the Running / Closed trade tables.
 //
 // Every decision (signals, quantity, trail, arm gating, order routing) lives in
@@ -1029,17 +1029,9 @@ function shell() {
       </div>
 
       <div class="rt-engine-row">
-        <b class="rt-cap">HFT (ultrafast):</b>
-        <label class="rtom-f"><input type="checkbox" data-set="hft"> HFT execution</label>
-        <label class="rtom-f">max <input type="number" data-set="hftOps" step="1" style="width:56px"> orders/sec</label>
-        <label class="rtom-f"><input type="checkbox" data-set="hftExecOnCb"> execute on
-          <select data-set="hftExecOn" style="width:120px">
-            <option value="close">Candle Close</option>
-            <option value="open">Candle Open</option>
-            <option value="high">Candle High</option>
-            <option value="low">Candle Low</option>
-          </select></label>
-        <span id="rtHftStatus" style="font-size:9px;color:#666;font-weight:700"></span>
+        <b class="rt-cap">Order rate:</b>
+        <label class="rtom-f" title="Ek second me maximum itne hi order bhejega (Dhan API ~6/sec allow karta hai). Har entry is cap ke andar hi fire hogi.">Order per Second <input type="number" data-set="orderPerSec" min="1" max="30" step="1" style="width:64px"></label>
+        <span id="rtOpsStatus" style="font-size:9px;color:#666;font-weight:700"></span>
       </div>
 
       <div class="rt-engine-row">
@@ -2440,7 +2432,6 @@ function wireAstPickers() {
 //   - AI Trail TP   <->  Manual Trail TP
 //   - AI TP %       <->  Manual Trail TP
 //   - Risk:Reward   ->   all TP controls
-//   - HFT off       ->   HFT ops + execute-on
 //   - Pick modes, strike count, premium lock, NIFTY-Trend/Top-Movers...
 // A faded control is .disabled + pointerEvents:none, exactly like the old app.
 // ---------------------------------------------------------------------------
@@ -2518,25 +2509,14 @@ function renderTradesStatus() {
   }
 }
 
-function renderHftStatus() {
+function renderOpsStatus() {
   const q = (k) => document.querySelector('#tab-realtime [data-set="' + k + '"]');
-  const box = document.getElementById("rtHftStatus");
+  const box = document.getElementById("rtOpsStatus");
   if (!box) return;
-  const on = !!(q("hft") && q("hft").checked);
-  if (!on) {
-    box.style.color = "#666";
-    box.textContent = " | HFT off - strategies run on their bar timeframe";
-    return;
-  }
-  const ops = Math.max(1, Math.min(30, Math.round(Number(q("hftOps") && q("hftOps").value) || 6)));
-  const cb = q("hftExecOnCb");
-  const fieldSel = q("hftExecOn");
-  const field = fieldSel ? fieldSel.value : "close";
-  const label = field.charAt(0).toUpperCase() + field.slice(1);
+  const el = q("orderPerSec");
+  const ops = Math.max(1, Math.min(30, Math.round(Number(el && el.value) || 6)));
   box.style.color = "#00d4aa";
-  box.textContent = cb && cb.checked
-    ? " | HFT ON - 100ms scan, <= " + ops + " orders/sec, conditions tested on Candle " + label
-    : " | HFT ON - 100ms scan, <= " + ops + " orders/sec, each condition uses its own source";
+  box.textContent = " | Max " + ops + " orders/sec - har entry is cap ke andar hi bhejega";
 }
 
 function renderTimeStatus() {
@@ -2910,13 +2890,8 @@ function syncInterlocks() {
   }
   renderRiskStatus();
 
-  // --- HFT ---
-  const hftOn = checked("hft");
-  dimControl(q("hftOps"), !hftOn);
-  const execCb = q("hftExecOnCb");
-  dimControl(execCb, !hftOn);
-  dimControl(q("hftExecOn"), !(hftOn && execCb && execCb.checked));
-  renderHftStatus();
+  // --- Order rate (orders per second cap) ---
+  renderOpsStatus();
 
   // --- Trade times: the time input only lives while its checkbox is on ---
   fadeControl(q("startAfter"), !checked("startAfterEnabled"));
