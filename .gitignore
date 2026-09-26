@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target
+/desktop/target
 
 # Packaged installers / distributables (built locally, never part of source backup)
 /dist/
