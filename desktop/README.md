@@ -110,14 +110,27 @@ WebView2 Evergreen Runtime install karna hoga.
 
 ## Manual updater (GitHub Releases)
 
-App ke andar ek floating "Update" panel inject hota hai (app ke apne HTML/JS ko
-chhede bina). Usme GitHub repo URL daalo, Save karo, aur "Update App" dabao.
-Shell GitHub Releases se latest version check karke download, verify aur
-apply karta hai, phir app restart ho jata hai.
+App ke andar ek alag **"App Update" tab** hota hai (`crates/server/static/updater.js`),
+jisme GitHub repo URL, live status, live log aur update history dikhti hai. Usme
+repo URL save karo aur "Update App" dabao. Shell GitHub Releases se latest version
+check karke download, sha256-verify aur apply karta hai, phir app restart ho jata
+hai.
+
+Updater tab ka data:
+
+- **Source**: GitHub repo URL (`owner/repo`) - disk par save hota hai.
+- **Live log**: is session ke saare updater steps (check/download/verify/apply).
+- **History**: har update attempt (time, `from -> to`, status, message) disk par
+  `update_history.json` me save hoti hai, app restart ke baad bhi rehti hai.
+  History clear bhi kar sakte ho.
+
+Note: tab UI app khud render karta hai; asli kaam shell Rust me hota hai aur
+wry IPC (`window.ipc.postMessage`) se hota hai. Browser me (bina shell) tab
+"sirf desktop app me available" dikhata hai.
 
 Updater ko chahiye:
 
-1. Repo me ek Release ho, tag `vX.Y.Z` format me (jaise `v0.1.1`).
+1. Repo me ek Release ho, tag `vX.Y.Z` format me (jaise `v0.1.2`).
 2. Us release me platform asset ho, exact naam se:
    - `algo-desktop-windows-x86_64.zip`
    - `algo-desktop-linux-x86_64.zip`
@@ -131,7 +144,7 @@ Asset ke andar `algo-desktop`, `algo-server` aur `static/` root par hone chahiye
 Naya release kaise banao:
 
 ```bash
-# version bump: desktop/Cargo.toml me version badlo, phir:
+# version bump: Cargo.toml (workspace) + desktop/Cargo.toml + installer-windows.nsi me version badlo, phir:
 scripts/build-desktop.sh
 # dist/algo-desktop-<os>-<arch>.zip + dist/SHA256SUMS ko GitHub Release me upload karo
 ```
@@ -173,8 +186,8 @@ algo-desktop --make-launcher <shell_exe> <server_exe> <static_dir> <out_exe>
 Server resolution order: `ALGO_SERVER_BIN` env -> embedded payload (agar launcher
 hai) -> sibling `algo-server` -> dev `target/` build.
 
-`ALGO_UI_SELFTEST=1` ke saath chalao to shell injected updater panel aur IPC
-round-trip verify karke exit kar jata hai.
+`ALGO_UI_SELFTEST=1` ke saath chalao to shell updater tab + IPC round-trip
+verify karke exit kar jata hai.
 
 Installed app ke naye options/settings ke liye signed config pack (templates /
 strategies / selection already data-driven hain) bhi use kar sakte ho - uske

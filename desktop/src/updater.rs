@@ -52,6 +52,51 @@ pub fn save_config(data_dir: &Path, cfg: &UpdateConfig) -> std::io::Result<()> {
     std::fs::write(config_path(data_dir), bytes)
 }
 
+/// One persisted update attempt, shown in the updater tab's history list.
+#[derive(Default, Serialize, Deserialize, Clone)]
+pub struct HistoryEntry {
+    pub time_ms: u64,
+    pub from: String,
+    pub to: String,
+    /// ok | error | info
+    pub status: String,
+    pub message: String,
+}
+
+const HISTORY_LIMIT: usize = 60;
+
+pub fn history_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("update_history.json")
+}
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn load_history(data_dir: &Path) -> Vec<HistoryEntry> {
+    std::fs::read_to_string(history_path(data_dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_history(data_dir: &Path, list: &[HistoryEntry]) -> std::io::Result<()> {
+    std::fs::create_dir_all(data_dir)?;
+    let bytes = serde_json::to_vec_pretty(list).unwrap_or_default();
+    std::fs::write(history_path(data_dir), bytes)
+}
+
+/// Prepend a new entry (newest first) and trim the list.
+pub fn append_history(data_dir: &Path, entry: HistoryEntry) {
+    let mut list = load_history(data_dir);
+    list.insert(0, entry);
+    list.truncate(HISTORY_LIMIT);
+    let _ = save_history(data_dir, &list);
+}
+
 /// Accepts a full GitHub URL, `owner/repo`, or a URL with `.git` / trailing slash.
 pub fn parse_repo(input: &str) -> Option<String> {
     let mut s = input.trim().to_string();

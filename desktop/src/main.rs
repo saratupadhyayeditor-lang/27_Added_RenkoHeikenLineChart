@@ -26,7 +26,6 @@ use tao::window::WindowBuilder;
 use wry::WebViewBuilder;
 
 mod payload;
-mod ui;
 mod updater;
 
 const ENV_APP_URL: &str = "ALGO_APP_URL";
@@ -206,7 +205,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let probe_proxy = proxy.clone();
     let builder = WebViewBuilder::new()
         .with_url(url)
-        .with_initialization_script(ui::injected_script())
         .with_ipc_handler(move |req: wry::http::Request<String>| {
             handle_ipc(req.body(), &ipc_data_dir, &ipc_proxy);
         })
@@ -251,12 +249,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::UserEvent(UserEvent::ProbeUi) => {
                 let _ = webview.evaluate_script_with_callback(
-                    "JSON.stringify({ran: window.__auRan, err: window.__auErr, \
-                     hasUpdater: typeof window.__algoUpdater, \
+                    "JSON.stringify({hasUpdater: typeof window.__algoUpdater, \
                      hasIpc: !!(window.ipc && window.ipc.postMessage), \
-                     btn: !!document.getElementById('__auBtn'), \
-                     panel: !!document.getElementById('__auPanel'), \
-                     body: document.body ? document.body.children.length : -1})",
+                     tab: !!document.querySelector('.tab-btn[data-tab=\"updater\"]'), \
+                     pane: !!document.getElementById('tab-updater'), \
+                     status: !!document.getElementById('__updStatus')})",
                     |res| println!("UI_PROBE={res}"),
                 );
                 let _ = webview.evaluate_script(
@@ -271,7 +268,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Event::UserEvent(UserEvent::ProbeStatus) => {
                 let p = proxy.clone();
                 let _ = webview.evaluate_script_with_callback(
-                    "(document.getElementById('__auStatus')||{}).textContent || ''",
+                    "(document.getElementById('__updStatus')||{}).textContent || ''",
                     move |res| {
                         println!("UI_IPC_STATUS={res}");
                         let _ = p.send_event(UserEvent::Quit);
@@ -286,7 +283,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 }
 
-/// Handle messages posted by the injected updater panel.
+/// Handle messages posted by the app's updater tab (crates/server/static/updater.js).
 fn handle_ipc(body: &str, data_dir: &std::path::Path, proxy: &EventLoopProxy<UserEvent>) {
     let value: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -303,6 +300,7 @@ fn handle_ipc(body: &str, data_dir: &std::path::Path, proxy: &EventLoopProxy<Use
                 "message": "Repo URL save karke 'Update App' dabao.",
                 "repo": cfg.repo,
                 "current": current,
+                "history": history_json(data_dir),
             })));
         }
         "save_repo" => {
@@ -319,6 +317,7 @@ fn handle_ipc(body: &str, data_dir: &std::path::Path, proxy: &EventLoopProxy<Use
                         "message": msg,
                         "repo": repo,
                         "current": current,
+                        "history": history_json(data_dir),
                     })));
                 }
                 None => {
@@ -326,9 +325,19 @@ fn handle_ipc(body: &str, data_dir: &std::path::Path, proxy: &EventLoopProxy<Use
                         "state": "error",
                         "message": "Repo URL galat hai. Format: owner/repo",
                         "current": current,
+                        "history": history_json(data_dir),
                     })));
                 }
             }
+        }
+        "clear_history" => {
+            let _ = updater::save_history(data_dir, &[]);
+            let _ = proxy.send_event(UserEvent::Status(json!({
+                "state": "info",
+                "message": "Update history clear ho gayi.",
+                "current": current,
+                "history": serde_json::Value::Array(Vec::new()),
+            })));
         }
         "update" => {
             let typed = value.get("repo").and_then(|v| v.as_str()).unwrap_or("");
@@ -341,6 +350,7 @@ fn handle_ipc(body: &str, data_dir: &std::path::Path, proxy: &EventLoopProxy<Use
                     "state": "error",
                     "message": "Pehle GitHub repo URL save karo.",
                     "current": current,
+                    "history": history_json(data_dir),
                 })));
                 return;
             };
@@ -354,7 +364,14 @@ fn handle_ipc(body: &str, data_dir: &std::path::Path, proxy: &EventLoopProxy<Use
     }
 }
 
+fn history_json(data_dir: &std::path::Path) -> serde_json::Value {
+    serde_json::to_value(updater::load_history(data_dir))
+        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+}
+
 fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf) {
+    let from = updater::current_version().to_string();
+
     let send = |state: &str, message: String, latest: Option<String>| {
         let _ = proxy.send_event(UserEvent::Status(json!({
             "state": state,
@@ -362,7 +379,22 @@ fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf)
             "repo": repo,
             "current": updater::current_version().to_string(),
             "latest": latest,
+            "history": history_json(&data_dir),
         })));
+    };
+
+    // Persist an attempt so the tab's history survives restarts.
+    let record = |status: &str, to: &str, message: &str| {
+        updater::append_history(
+            &data_dir,
+            updater::HistoryEntry {
+                time_ms: updater::now_ms(),
+                from: from.clone(),
+                to: to.to_string(),
+                status: status.to_string(),
+                message: message.to_string(),
+            },
+        );
     };
 
     send("busy", "GitHub se latest release check ho rahi hai...".into(), None);
@@ -370,6 +402,7 @@ fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf)
     let release = match updater::fetch_latest(&repo) {
         Ok(r) => r,
         Err(e) => {
+            record("error", "-", &e);
             send("error", e, None);
             return;
         }
@@ -377,6 +410,7 @@ fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf)
 
     let current = updater::current_version();
     if release.version <= current {
+        record("info", &release.tag, "Already up to date");
         send(
             "info",
             format!("Already up to date (v{current})."),
@@ -398,12 +432,14 @@ fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf)
             "repo": repo,
             "current": updater::current_version().to_string(),
             "latest": release.tag,
+            "history": history_json(&data_dir),
         })));
     };
 
     let staging = match updater::download_and_stage(&data_dir, &release, &progress) {
         Ok(s) => s,
         Err(e) => {
+            record("error", &release.tag, &format!("Update failed: {e}"));
             send("error", format!("Update failed: {e}"), Some(release.tag));
             return;
         }
@@ -412,6 +448,7 @@ fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf)
     let install_dir = match std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
         Some(d) => d,
         None => {
+            record("error", &release.tag, "install dir resolve nahi hua");
             send("error", "install dir resolve nahi hua".into(), Some(release.tag));
             return;
         }
@@ -425,9 +462,11 @@ fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf)
 
     match updater::apply_and_restart(&staging, &install_dir) {
         Ok(()) => {
+            record("ok", &release.tag, "Update apply ho gaya - app restart ho raha hai");
             let _ = proxy.send_event(UserEvent::Quit);
         }
         Err(e) => {
+            record("error", &release.tag, &format!("Apply failed: {e}"));
             send("error", format!("Apply failed: {e}"), Some(release.tag));
         }
     }

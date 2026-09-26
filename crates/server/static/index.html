@@ -29,6 +29,7 @@
       <button class="tab-btn" data-tab="rtstats" title="Realtime Market Trade Stats - executed-trades report for the Realtime Trading Engine (real orders)">Realtime Market Trade Stats</button>
       <button class="tab-btn" data-tab="paperstats" title="Trade Stats - executed-trades report across the paper engines (simulated fills)">Trade Stats</button>
       <button class="tab-btn" data-tab="backup" title="Backup &amp; Restore - complete algo system backup (all tabs, engine settings, templates, strategies, P&amp;L records, monitor lists)">Backup &amp; Restore</button>
+      <button class="tab-btn" data-tab="updater" title="App Update - manual GitHub Releases updater with live log and history (desktop app only)">App Update</button>
     </div>
   </div>
 
@@ -228,6 +229,7 @@
         </div>
       </div>
     </div>
+    <div class="tab-content" id="tab-updater"></div>
     <div class="tab-content" id="tab-placeholder">
       <div class="ind-empty">This tab will be built in a later Rust phase.</div>
     </div>
@@ -244,7 +246,9 @@
   import { bootRtStats } from "./rtstats.js?v=5";
   import { bootBackup } from "./backup.js?v=3";
   import { bootAccount } from "./account.js?v=2";
+  import { bootUpdater } from "./updater.js?v=1";
   bootConnection();
+  bootUpdater();
   // Generic tab switcher: clicking a tab button activates its matching
   // .tab-content pane and notifies modules so they can refresh.
   document.querySelectorAll(".tab-btn[data-tab]").forEach((btn) => {
