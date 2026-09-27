@@ -97,6 +97,26 @@ pub struct OcSubSec {
     pub exchange_segment: String,
 }
 
+/// Testing-only "Manual Strike Select" picker request: the operator-chosen
+/// underlying (and optionally a specific expiry). Returns the expiry ladder plus
+/// a wide strike window with CE/PE LTP so a strike can be picked by hand.
+#[derive(Deserialize)]
+pub struct ManualStrikeReq {
+    #[serde(default)]
+    pub security_id: i64,
+    #[serde(default)]
+    pub exchange_segment: String,
+    #[serde(default)]
+    pub symbol_name: String,
+    #[serde(default)]
+    pub expiry: String,
+    #[serde(default)]
+    pub spot: f64,
+    /// Strikes to show on each side of ATM (default 30, clamped 1..=60).
+    #[serde(default)]
+    pub window: i64,
+}
+
 // ---------------------------------------------------------------------------
 // In-memory chain cache + Dhan rate-limit cooldown
 // ---------------------------------------------------------------------------
@@ -895,6 +915,103 @@ pub async fn option_chain(
         "partial": true,
         "instrument": instrument_json(&name, lot, &tsym),
     })))
+    .into_response()
+}
+
+/// Testing-only Manual Strike Select picker: for a chosen underlying (and,
+/// optionally, a specific expiry) return the expiry ladder plus a wide strike
+/// window centred on ATM, each row carrying the CE/PE security id and LTP. The
+/// returned legs are registered with the live feed so their LTP streams while the
+/// operator picks. Engine-agnostic - the real and paper tabs share it.
+pub async fn manual_strike_chain(
+    State(st): State<DhanState>,
+    Json(req): Json<ManualStrikeReq>,
+) -> impl IntoResponse {
+    let name = underlying_name(req.security_id, &req.symbol_name);
+    let (lot, tsym) = resolve_lot(&name, req.security_id, &req.exchange_segment);
+    if market::commodity_has_options(req.security_id) == Some(false) {
+        return no_options_response(&name).into_response();
+    }
+    let Some(sc) = scrip::get() else {
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "loading",
+                "message": "Scrip master loading - retry in a moment",
+                "instrument": instrument_json(&name, lot, &tsym),
+            })),
+        )
+            .into_response();
+    };
+    let prefix = scrip::fno_underlying(&name);
+    let exch = scrip::scrip_exch(&req.exchange_segment);
+    let expiries: Vec<String> = sc.expiries_for(&prefix, exch).unwrap_or_default();
+    // Honour an explicit, still-listed expiry; otherwise take the nearest one.
+    let expiry = if !req.expiry.trim().is_empty() && expiries.iter().any(|e| e == req.expiry.trim()) {
+        req.expiry.trim().to_string()
+    } else {
+        expiries.first().cloned().unwrap_or_default()
+    };
+    if expiry.is_empty() {
+        return no_options_response(&name).into_response();
+    }
+    let Some(bucket) = sc.bucket(exch, &prefix, &expiry) else {
+        return no_options_response(&name).into_response();
+    };
+    let strikes: Vec<i64> = bucket.keys().copied().collect();
+    if strikes.is_empty() {
+        return no_options_response(&name).into_response();
+    }
+    let spot = known_spot(&st, req.security_id, &req.exchange_segment, req.spot);
+    let atm = if spot > 0.0 {
+        let mut best = 0usize;
+        let mut best_d = f64::MAX;
+        for (i, sk) in strikes.iter().enumerate() {
+            let d = ((*sk as f64 / 100.0) - spot).abs();
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+        }
+        best
+    } else {
+        strikes.len() / 2
+    };
+    let w = if req.window <= 0 { 30 } else { req.window.clamp(1, 60) } as usize;
+    let lo = atm.saturating_sub(w);
+    let hi = (atm + w + 1).min(strikes.len());
+    let seg = option_seg(&req.exchange_segment);
+    let mut rows: Vec<bs::ChainRow> = Vec::with_capacity(hi - lo);
+    for sk in &strikes[lo..hi] {
+        let Some(ent) = bucket.get(sk) else { continue };
+        rows.push(bs::ChainRow {
+            strike: *sk as f64 / 100.0,
+            ce: ent
+                .ce
+                .as_ref()
+                .map(|(sid, _)| quote_leg(&st.market, *sid, seg))
+                .unwrap_or_default(),
+            pe: ent
+                .pe
+                .as_ref()
+                .map(|(sid, _)| quote_leg(&st.market, *sid, seg))
+                .unwrap_or_default(),
+        });
+    }
+    // Arm the live feed + seed previous close / LTP / OI for the whole window.
+    register_chain(&st, &rows, &req.exchange_segment, req.security_id, &expiry, spot, lot).await;
+    let data: Vec<Value> = rows.iter().map(|r| r.to_json()).collect();
+    Json(json!({
+        "status": "success",
+        "symbol_name": name,
+        "trading_symbol": tsym,
+        "lot_size": lot,
+        "expiry": expiry,
+        "expiries": expiries,
+        "spot": spot,
+        "count": data.len(),
+        "data": data,
+    }))
     .into_response()
 }
 

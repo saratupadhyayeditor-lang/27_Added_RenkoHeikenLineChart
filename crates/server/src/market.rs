@@ -519,6 +519,60 @@ pub async fn commodities() -> impl IntoResponse {
     axum::Json(json!({ "status": "success", "data": commodities_json() }))
 }
 
+/// Grouped instrument catalogue for the testing-only "Manual Strike Select"
+/// picker: cash indices, F&O underlyings and MCX commodities that have listed
+/// options. Engine-agnostic, so the real and paper tabs share the exact lists.
+pub async fn instruments() -> impl IntoResponse {
+    let sc = crate::scrip::get();
+    let has_options = |name: &str, seg: &str| -> bool {
+        match sc.as_ref() {
+            Some(s) => {
+                let prefix = crate::scrip::fno_underlying(name);
+                !prefix.is_empty() && s.has_options(&prefix, crate::scrip::scrip_exch(seg)) != Some(false)
+            }
+            // Master still warming: list everything and let the chain endpoint
+            // answer "no options" for the rare non-derivative index.
+            None => true,
+        }
+    };
+    let cat: RawCatalog = serde_json::from_str(catalog_str()).unwrap_or(RawCatalog {
+        symbols: Vec::new(),
+        watchlists: HashMap::new(),
+    });
+    let mut indices: Vec<Value> = Vec::new();
+    let mut fno: Vec<Value> = Vec::new();
+    for row in &cat.symbols {
+        let Some(arr) = row.as_array() else { continue };
+        let name = arr.first().and_then(|v| v.as_str()).unwrap_or("");
+        let sid = arr.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+        let seg = arr.get(2).and_then(|v| v.as_str()).unwrap_or("NSE_EQ");
+        if name.is_empty() || sid <= 0 || !has_options(name, seg) {
+            continue;
+        }
+        let item = json!({ "name": name, "security_id": sid, "exchange_segment": seg });
+        if arr.iter().any(|v| v.as_str() == Some("Indices")) {
+            indices.push(item);
+        } else if seg == "NSE_EQ" || seg == "BSE_EQ" {
+            fno.push(item);
+        }
+    }
+    let mut commodities: Vec<Value> = Vec::new();
+    for c in commodity_rows() {
+        if c.has_options {
+            commodities.push(json!({
+                "name": c.name,
+                "security_id": c.security_id,
+                "exchange_segment": "MCX_COMM",
+                "lot": c.lot,
+            }));
+        }
+    }
+    axum::Json(json!({
+        "status": "success",
+        "data": { "indices": indices, "fno": fno, "commodities": commodities }
+    }))
+}
+
 pub async fn quotes_post(
     State(st): State<DhanState>,
     axum::Json(req): axum::Json<QuoteReq>,

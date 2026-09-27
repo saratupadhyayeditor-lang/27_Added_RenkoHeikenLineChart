@@ -187,6 +187,8 @@ async fn main() {
         .route("/api/auto_strikes", post(optionchain::auto_strikes))
         .route("/api/option_security", post(optionchain::option_security))
         .route("/api/oc/subscribe", post(optionchain::oc_subscribe))
+        .route("/api/manual_strikes/chain", post(optionchain::manual_strike_chain))
+        .route("/api/instruments", get(market::instruments))
         .route("/api/lot_sizes", get(optionchain::lot_sizes))
         .route("/ws", get(market::ws_handler))
         .route("/api/connect", post(broker::connect))

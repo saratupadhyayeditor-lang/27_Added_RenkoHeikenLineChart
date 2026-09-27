@@ -1088,6 +1088,22 @@ function shell() {
         <label class="rtom-f">Fastest-Rising Strikes <input type="number" data-set="fastestCount" min="1" step="1" style="width:56px"></label>
       </div>
 
+      <div class="rt-engine-row" id="rtManualStrikeRow" style="align-items:flex-start;border-color:#4a3a0a">
+        <label class="rtom-f" style="color:#ffd700;font-weight:bold" title="Testing only: ON hone par engine ATM / Execute-Trade-In / Number of Strikes / +green / fastest-rising ki jagah sirf neeche add kiye strikes par option leg resolve karega.">
+          <input type="checkbox" data-set="manualStrikesEnabled" id="rtManualStrikeCb"> Manual Strike Select (Testing only)
+        </label>
+        <span id="rtManualStrikeHint" style="font-size:8px;color:#888">ON karo, phir instrument + strike pick karke Add dabao. Ye real market me order place + trail SL test karne ke liye hai.</span>
+        <div id="rtManualStrikeBox" style="flex-basis:100%;display:none;flex-wrap:wrap;gap:8px;align-items:center;margin-top:4px">
+          <label class="rtom-f">Instrument <select id="rtManualInstrument" style="min-width:280px"><option value="">-- loading --</option></select></label>
+          <label class="rtom-f">Expiry <select id="rtManualExpiry" style="width:130px"></select></label>
+          <label class="rtom-f">Strike <select id="rtManualStrikePick" style="min-width:230px"></select></label>
+          <label class="rtom-f">Side <select id="rtManualSide" style="width:130px"><option value="both">Both CE &amp; PE</option><option value="CE">CE only</option><option value="PE">PE only</option></select></label>
+          <button class="btn-action" id="rtManualStrikeAdd" style="width:auto;padding:3px 12px;margin:0">+ Add Strike</button>
+          <span id="rtManualStrikeStatus" style="font-size:9px;color:#888"></span>
+          <div id="rtManualStrikeList" style="flex-basis:100%;display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:9px;color:#ccc;margin-top:2px"></div>
+        </div>
+      </div>
+
       <div class="rt-engine-row">
         <label class="rtom-f" style="color:#ffd700;font-weight:bold"><input type="checkbox" data-set="premiumOnly"> Premium chart only (run + trade)</label>
         <span style="font-size:9px;color:#888">Strategies run AND trades execute on the option premium chart for all instruments.</span>
@@ -1174,7 +1190,7 @@ function shell() {
 
       <div class="rt-engine-row" id="rtStrikesSection">
         <b class="rt-cap">Picked Strikes:</b>
-        <span style="font-size:8px;color:#666">Option strikes the engine picked to execute (auto-shown while Top Movers / NIFTY Trend Follow is ON)</span>
+        <span id="rtStrikesNote" style="font-size:8px;color:#666">Option strikes the engine picked to execute (auto-shown while Top Movers / NIFTY Trend Follow is ON)</span>
       </div>
       <div id="rtStrikesList" style="display:none;margin-top:2px;font-size:9px;color:#ccc;background:#0e1626;border:1px solid #2d2d50;border-radius:4px;padding:6px 8px"></div>
 
@@ -1611,6 +1627,9 @@ function settingsFromDom() {
   // [data-set]), so carry them over from the last snapshot instead of letting a
   // generic settings save erase them.
   s.tradeSessions = (STATE && STATE.settings && STATE.settings.tradeSessions) || [];
+  // Manual Strike Select list is edited by its own row (not via [data-set]), so
+  // carry it over from the last snapshot instead of letting a generic save drop it.
+  s.manualStrikes = (STATE && STATE.settings && STATE.settings.manualStrikes) || [];
   return s;
 }
 
@@ -1799,6 +1818,22 @@ function wire() {
       API.settings(settingsFromDom()).then(refresh);
     };
   });
+
+  // Manual Strike Select (testing): the checkbox is a normal [data-set] setting
+  // (the generic handler above saves it; syncInterlocks hides/shows the box and
+  // fades the automatic strike controls). These handlers drive the picker.
+  const msCb = document.getElementById("rtManualStrikeCb");
+  if (msCb) {
+    msCb.addEventListener("change", () => {
+      if (msCb.checked) manualLoadInstruments(false);
+    });
+  }
+  const msInst = document.getElementById("rtManualInstrument");
+  if (msInst) msInst.onchange = () => manualLoadChain();
+  const msExp = document.getElementById("rtManualExpiry");
+  if (msExp) msExp.onchange = () => manualLoadChain();
+  const msAdd = document.getElementById("rtManualStrikeAdd");
+  if (msAdd) msAdd.onclick = () => addManualStrike();
 
   document.querySelectorAll("#tab-realtime [data-act]").forEach((b) => {
     const act = b.getAttribute("data-act");
@@ -2145,7 +2180,7 @@ async function loadScanners() {
   // populated regardless of the master toggle.
   try {
     const m = await API.movers();
-    if (ml && cfg.moversOn) {
+    if (ml && cfg.moversOn && !cfg.manualStrikesEnabled) {
       ml.style.display = "block";
       const chip = (r) =>
         `<span style="display:inline-flex;align-items:center;gap:3px;background:#16163a;border:1px solid #2d2d50;border-radius:8px;padding:1px 4px;margin:1px">` +
@@ -2168,7 +2203,7 @@ async function loadScanners() {
     }
 
     const t = await API.trend();
-    if (tl && cfg.niftyTrendOn) {
+    if (tl && cfg.niftyTrendOn && !cfg.manualStrikesEnabled) {
       tl.style.display = "block";
       const dirTxt =
         t && t.dir
@@ -2276,6 +2311,222 @@ function renderAllChips() {
   renderChips("moversIndices", "rtMoversIndicesList", "index");
   renderChips("niftyTrendConfInds", "rtNiftyTrendConfIndList", "indicator");
   renderChips("commodityList", "rtCommodityChips", "commodity");
+  renderManualStrikes();
+}
+
+// ---------------------------------------------------------------------------
+// Manual Strike Select (testing only): pick an underlying + strike by hand and
+// the engine resolves its option leg to that contract instead of the automatic
+// ATM selection. Instrument + strike lists come from the engine-agnostic
+// /api/instruments + /api/manual_strikes/chain endpoints; the picked list is a
+// normal setting, so the real and paper tabs keep independent lists.
+// ---------------------------------------------------------------------------
+let MANUAL_INSTRUMENTS = null;
+let MANUAL_CHAIN = null;
+let MANUAL_LOADING = false;
+
+function manualOptKey(sec) {
+  return String(sec.security_id) + "|" + String(sec.exchange_segment || "");
+}
+
+function manualFindInstrument(key) {
+  if (!key || !MANUAL_INSTRUMENTS) return null;
+  const d = MANUAL_INSTRUMENTS.data || {};
+  const all = [].concat(d.indices || [], d.fno || [], d.commodities || []);
+  return all.find((it) => manualOptKey(it) === key) || null;
+}
+
+function manualFillInstruments() {
+  const sel = document.getElementById("rtManualInstrument");
+  if (!sel) return;
+  const keep = sel.value;
+  const d = (MANUAL_INSTRUMENTS && MANUAL_INSTRUMENTS.data) || {};
+  const mk = (arr) => (arr || []).map((it) => `<option value="${esc(manualOptKey(it))}">${esc(it.name)}</option>`).join("");
+  let html = '<option value="">-- pick instrument --</option>';
+  if ((d.indices || []).length) html += '<optgroup label="Indices">' + mk(d.indices) + "</optgroup>";
+  if ((d.fno || []).length) html += '<optgroup label="F&amp;O Stocks">' + mk(d.fno) + "</optgroup>";
+  if ((d.commodities || []).length) html += '<optgroup label="Commodities (MCX)">' + mk(d.commodities) + "</optgroup>";
+  sel.innerHTML = html;
+  if (keep) sel.value = keep;
+}
+
+async function manualLoadInstruments(force) {
+  const sel = document.getElementById("rtManualInstrument");
+  if (!sel) return;
+  if (MANUAL_INSTRUMENTS && !force) {
+    manualFillInstruments();
+    return;
+  }
+  if (MANUAL_LOADING) return;
+  MANUAL_LOADING = true;
+  sel.innerHTML = '<option value="">-- loading --</option>';
+  try {
+    MANUAL_INSTRUMENTS = await get("/api/instruments");
+  } catch (e) {
+    MANUAL_LOADING = false;
+    sel.innerHTML = '<option value="">-- load failed --</option>';
+    return;
+  }
+  MANUAL_LOADING = false;
+  manualFillInstruments();
+}
+
+function manualFillStrikes() {
+  const sel = document.getElementById("rtManualStrikePick");
+  if (!sel) return;
+  const rows = (MANUAL_CHAIN && MANUAL_CHAIN.data) || [];
+  if (!rows.length) {
+    sel.innerHTML = '<option value="">-- no strikes --</option>';
+    return;
+  }
+  sel.innerHTML = rows
+    .map((r) => {
+      const k = num(r.Strike);
+      const ce = num(r["CE LTP"]);
+      const pe = num(r["PE LTP"]);
+      const label = k + "  CE " + (ce > 0 ? ce.toFixed(2) : "-") + "  PE " + (pe > 0 ? pe.toFixed(2) : "-");
+      return `<option value="${k}">${esc(label)}</option>`;
+    })
+    .join("");
+}
+
+async function manualLoadChain() {
+  const instKey = (document.getElementById("rtManualInstrument") || {}).value || "";
+  const strikeSel = document.getElementById("rtManualStrikePick");
+  const expSel = document.getElementById("rtManualExpiry");
+  const status = document.getElementById("rtManualStrikeStatus");
+  const inst = manualFindInstrument(instKey);
+  MANUAL_CHAIN = null;
+  if (!inst) {
+    if (strikeSel) strikeSel.innerHTML = "";
+    if (expSel) expSel.innerHTML = "";
+    if (status) status.textContent = "";
+    return;
+  }
+  if (strikeSel) strikeSel.innerHTML = '<option value="">-- loading strikes --</option>';
+  if (status) status.textContent = "loading strikes...";
+  const wantExpiry = expSel ? expSel.value : "";
+  // Best-effort spot so the strike window centres on the live price. Without a
+  // session this stays 0 and the backend centres on the middle of the ladder.
+  let spot = 0;
+  try {
+    const q = await post("/api/quotes", {
+      securities: [{ security_id: inst.security_id, exchange_segment: inst.exchange_segment }],
+    });
+    const key = inst.exchange_segment === "IDX_I" ? "IDX_I:" + inst.security_id : String(inst.security_id);
+    spot = num(q && q.data && q.data[key] ? q.data[key].ltp : 0);
+  } catch (e) {
+    spot = 0;
+  }
+  let j;
+  try {
+    j = await post("/api/manual_strikes/chain", {
+      security_id: inst.security_id,
+      exchange_segment: inst.exchange_segment,
+      symbol_name: inst.name,
+      expiry: wantExpiry,
+      spot: spot,
+    });
+  } catch (e) {
+    if (status) status.textContent = "chain load failed";
+    return;
+  }
+  if (!j || j.status === "loading") {
+    if (status) status.textContent = "scrip master loading - retrying...";
+    setTimeout(manualLoadChain, 1500);
+    return;
+  }
+  MANUAL_CHAIN = j;
+  if (expSel) {
+    const exps = MANUAL_CHAIN.expiries || [];
+    expSel.innerHTML = exps.map((e) => `<option value="${esc(e)}">${esc(e)}</option>`).join("");
+    if (MANUAL_CHAIN.expiry) expSel.value = MANUAL_CHAIN.expiry;
+  }
+  manualFillStrikes();
+  if (status) status.textContent = (MANUAL_CHAIN.count || 0) + " strikes (spot " + num(MANUAL_CHAIN.spot).toFixed(2) + ")";
+}
+
+function manualStrikeList() {
+  return (STATE && STATE.settings && STATE.settings.manualStrikes) || [];
+}
+
+function renderManualStrikes() {
+  const host = document.getElementById("rtManualStrikeList");
+  if (!host) return;
+  const rows = manualStrikeList();
+  if (!rows.length) {
+    host.innerHTML = '<span style="color:#666">No manual strikes added yet.</span>';
+    return;
+  }
+  host.innerHTML = rows
+    .map((m, i) => {
+      const col = String(m.optionType).toUpperCase() === "CE" ? "#00d4aa" : "#ef5350";
+      return (
+        `<span style="display:inline-flex;align-items:center;gap:4px;background:#12122a;border:1px solid #2d2d50;border-radius:4px;padding:2px 6px">` +
+        `<b style="color:${col}">${esc(m.symbolName)} ${esc(m.expiry)} ${num(m.strike)} ${esc(m.optionType)}</b>` +
+        `<button data-ms-remove="${i}" title="Remove" style="background:none;border:none;color:#ef5350;cursor:pointer;font-size:12px;padding:0 2px;line-height:1">\u00d7</button>` +
+        `</span>`
+      );
+    })
+    .join("");
+  host.querySelectorAll("[data-ms-remove]").forEach((b) => {
+    b.onclick = (e) => {
+      e.preventDefault();
+      const arr = manualStrikeList().slice();
+      arr.splice(num(b.getAttribute("data-ms-remove")), 1);
+      API.settings({ manualStrikes: arr }).then(refresh);
+    };
+  });
+}
+
+function addManualStrike() {
+  const status = document.getElementById("rtManualStrikeStatus");
+  const inst = manualFindInstrument((document.getElementById("rtManualInstrument") || {}).value || "");
+  if (!inst || !MANUAL_CHAIN) {
+    if (status) status.textContent = "pick an instrument first";
+    return;
+  }
+  const strike = num((document.getElementById("rtManualStrikePick") || {}).value);
+  const side = (document.getElementById("rtManualSide") || {}).value || "both";
+  const row = (MANUAL_CHAIN.data || []).find((r) => Math.abs(num(r.Strike) - strike) < 0.001);
+  if (!row) {
+    if (status) status.textContent = "pick a strike first";
+    return;
+  }
+  const list = manualStrikeList().slice();
+  const sides = side === "both" ? ["CE", "PE"] : [side];
+  let added = 0;
+  for (const s of sides) {
+    if (num(row[s + " SID"]) <= 0) continue;
+    const dup = list.some(
+      (m) =>
+        m.symbolName === inst.name &&
+        m.expiry === MANUAL_CHAIN.expiry &&
+        Math.abs(num(m.strike) - strike) < 0.001 &&
+        String(m.optionType).toUpperCase() === s
+    );
+    if (dup) continue;
+    list.push({
+      symbolName: inst.name,
+      securityId: inst.security_id,
+      exchangeSegment: inst.exchange_segment,
+      expiry: MANUAL_CHAIN.expiry,
+      strike: strike,
+      optionType: s,
+      lot: num(MANUAL_CHAIN.lot_size),
+    });
+    added++;
+  }
+  if (!added) {
+    if (status) status.textContent = "already added";
+    return;
+  }
+  if (list.length > 20) {
+    if (status) status.textContent = "max 20 strikes";
+    return;
+  }
+  if (status) status.textContent = "added " + added;
+  API.settings({ manualStrikes: list }).then(refresh);
 }
 
 // "Picked Strikes": the CE/PE option contracts the engine resolved for the live
@@ -2285,13 +2536,23 @@ function renderStrikes() {
   if (!host) return;
   const cfg = (STATE && STATE.settings) || {};
   const rows = (STATE && STATE.strikes) || [];
-  if (!cfg.niftyTrendOn && !cfg.moversOn && !cfg.commodityOn) {
+  const manualOn = !!cfg.manualStrikesEnabled;
+  const note = document.getElementById("rtStrikesNote");
+  if (note) {
+    note.textContent = manualOn
+      ? "Manual Strike Select ON - only these manual contracts run/trade; Top Movers & NIFTY Trend are inactive"
+      : "Option strikes the engine picked to execute (auto-shown while Top Movers / NIFTY Trend Follow is ON)";
+  }
+  if (!manualOn && !cfg.niftyTrendOn && !cfg.moversOn && !cfg.commodityOn) {
     host.style.display = "none";
     return;
   }
   host.style.display = "block";
   if (!rows.length) {
-    host.innerHTML = `<span style="color:#666">No option strikes resolved yet - waiting for live Dhan quotes on the Top Movers / NIFTY Trend picks.</span>`;
+    host.innerHTML = manualOn
+      ? `<span style="color:#666">Manual Strike Select ON - add strikes in the Manual Strike list above; only these will run/trade.</span>`
+      : `<span style="color:#666">No option strikes resolved yet - waiting for live Dhan quotes on the Top Movers / NIFTY Trend picks.</span>`;
+    renderScannerRemoved();
     return;
   }
   host.innerHTML = rows
@@ -2299,14 +2560,18 @@ function renderStrikes() {
       const bull = String(r.side || "").toUpperCase() === "CE";
       const col = bull ? "#00d4aa" : "#ef5350";
       const uid = num(r.underlyingSecurityId);
-      const rm = uid > 0
+      const isManual = manualOn || String(r.source || "") === "Manual";
+      const rm = !isManual && uid > 0
         ? `<button data-sc-remove="${uid}" data-sc-name="${esc(r.underlying)}" title="Remove - engine will not pick/trade this" style="background:none;border:none;color:#ef5350;cursor:pointer;font-size:12px;padding:0 3px;line-height:1">\u00d7</button>`
+        : "";
+      const spot = num(r.spot) > 0
+        ? `<span style="color:#888">spot ${num(r.spot).toFixed(2)} &middot; ${num(r.changePct).toFixed(2)}%</span>`
         : "";
       return (
         `<div style="display:flex;gap:8px;align-items:center;padding:1px 0">` +
         `<span style="color:${col};font-weight:700;min-width:70px">${esc(r.underlying)} ${esc(r.side)}</span>` +
         `<span style="color:#fff">${esc(r.tradingSymbol)}</span>` +
-        `<span style="color:#888">spot ${num(r.spot).toFixed(2)} &middot; ${num(r.changePct).toFixed(2)}%</span>` +
+        spot +
         `<span style="color:#555;margin-left:auto">${esc(r.source || "")}</span>` +
         rm +
         `</div>`
@@ -2907,12 +3172,14 @@ function syncInterlocks() {
   renderTradesStatus();
 
   // --- Strike pool: ATM / fastest-rising fade the normal count; fastest fades
-  //     the redundant "+green only" box and enables its own count. ---
+  //     the redundant "+green only" box and enables its own count. Manual Strike
+  //     Select (testing) fades the whole automatic pool. ---
+  const manualOn = checked("manualStrikesEnabled");
   const atm = val("strikeMode") === "atm";
   const fastOn = checked("fastestRising");
   const cnt = q("strikeCount");
   if (cnt) {
-    const dis = atm || fastOn;
+    const dis = atm || fastOn || manualOn;
     cnt.disabled = dis;
     cnt.style.opacity = dis ? "0.35" : "1";
     cnt.style.pointerEvents = dis ? "none" : "";
@@ -2921,20 +3188,40 @@ function syncInterlocks() {
   }
   const fc = q("fastestCount");
   if (fc) {
-    fc.disabled = !fastOn;
-    fc.style.opacity = fastOn ? "1" : "0.35";
-    fc.style.pointerEvents = fastOn ? "" : "none";
+    const on = fastOn && !manualOn;
+    fc.disabled = !on;
+    fc.style.opacity = on ? "1" : "0.35";
+    fc.style.pointerEvents = on ? "" : "none";
     const w = fc.closest("label");
-    if (w) { w.style.opacity = fastOn ? "1" : "0.5"; w.style.pointerEvents = fastOn ? "" : "none"; }
+    if (w) { w.style.opacity = on ? "1" : "0.5"; w.style.pointerEvents = on ? "" : "none"; }
   }
   const pos = q("onlyPositive");
   if (pos) {
-    pos.disabled = fastOn;
-    pos.style.opacity = fastOn ? "0.5" : "1";
-    pos.style.pointerEvents = fastOn ? "none" : "";
+    const dis = fastOn || manualOn;
+    pos.disabled = dis;
+    pos.style.opacity = dis ? "0.5" : "1";
+    pos.style.pointerEvents = dis ? "none" : "";
     const w = pos.closest("label");
-    if (w) { w.style.opacity = fastOn ? "0.6" : "1"; w.style.pointerEvents = fastOn ? "none" : ""; }
+    if (w) { w.style.opacity = dis ? "0.6" : "1"; w.style.pointerEvents = dis ? "none" : ""; }
   }
+  fadeControl(q("optionSide"), manualOn);
+  fadeControl(q("strikeMode"), manualOn);
+  fadeControl(q("fastestRising"), manualOn);
+  const msBox = document.getElementById("rtManualStrikeBox");
+  if (msBox) msBox.style.display = manualOn ? "flex" : "none";
+  const msHint = document.getElementById("rtManualStrikeHint");
+  if (msHint) msHint.style.opacity = manualOn ? "1" : "0.6";
+  if (manualOn && !MANUAL_INSTRUMENTS) manualLoadInstruments(false);
+  // Manual Strike Select freezes the automatic scanner masters (Top Movers /
+  // NIFTY Trend / Commodities). Their toggle label + disabled state is set in
+  // syncAstToggles; here we dim the whole row so an inactive universe reads as
+  // inactive. Their persisted settings are untouched and resume when the mode
+  // is switched off.
+  ["rtMoversToggle", "rtNiftyTrendToggle", "rtCommodityToggle"].forEach((id) => {
+    const b = document.getElementById(id);
+    const row = b && b.closest ? b.closest(".rt-engine-row") : null;
+    if (row) row.style.opacity = manualOn ? "0.45" : "1";
+  });
 
   // --- Premium-only lock: the run-in / trade-in selectors are engine-pinned ---
   const prem = checked("premiumOnly");
@@ -3034,24 +3321,32 @@ function applySettingsToDom(s) {
 // Reflect engine toggles (Top Movers / NIFTY Trend / Commodities)
 // on their button labels, matching the old AST master buttons.
 function syncAstToggles(s) {
+  const manualOn = !!s.manualStrikesEnabled;
   const set = (id, on, label, blocked) => {
     const b = document.getElementById(id);
     if (!b) return;
     b.textContent = label;
+    b.disabled = !!blocked;
+    b.style.pointerEvents = blocked ? "none" : "";
+    b.style.cursor = blocked ? "not-allowed" : "";
     b.style.background = blocked ? "#666" : on ? "#124a2a" : "";
     b.style.color = blocked ? "#ccc" : on ? "#7CFFB2" : "";
-    b.style.opacity = blocked ? "0.6" : "1";
+    b.style.opacity = blocked ? "0.5" : "1";
   };
+  // Manual Strike Select makes every automatic scanner universe inactive, so the
+  // three master toggles are frozen (their persisted state is kept and resumes
+  // the moment the mode is switched off).
+  const suffix = manualOn ? " (inactive)" : "";
   const trendOn = !!s.niftyTrendOn;
   const commOn = !!s.commodityOn;
   set(
     "rtMoversToggle",
     !!s.moversOn,
-    "Top Movers: " + (s.moversOn ? "ON" : "OFF"),
-    false
+    "Top Movers: " + (s.moversOn ? "ON" : "OFF") + suffix,
+    manualOn
   );
-  set("rtNiftyTrendToggle", trendOn, "Trend Follow: " + (trendOn ? "ON" : "OFF"), false);
-  set("rtCommodityToggle", commOn, "Commodities: " + (commOn ? "ON" : "OFF"));
+  set("rtNiftyTrendToggle", trendOn, "Trend Follow: " + (trendOn ? "ON" : "OFF") + suffix, manualOn);
+  set("rtCommodityToggle", commOn, "Commodities: " + (commOn ? "ON" : "OFF") + suffix, manualOn);
 }
 
 function filterIsBull(k) {
@@ -3200,7 +3495,14 @@ function renderRunning(s) {
   // `s.strategies`, so surface the struck contracts here: picked option strike +
   // the ticked indicator filters that gate that side.
   const strikes = s.strikes || [];
-  const scannerOn = !!(settings.filterMode || settings.moversOn || settings.niftyTrendOn || settings.commodityOn);
+  const manualMode = !!settings.manualStrikesEnabled;
+  const scannerOn = !!(
+    settings.filterMode ||
+    settings.moversOn ||
+    settings.niftyTrendOn ||
+    settings.commodityOn ||
+    manualMode
+  );
 
   const runStrat = document.getElementById("rtRunStrategies");
   if (runStrat) {
@@ -3246,6 +3548,7 @@ function renderRunning(s) {
         strikes
           .map((r) => {
             const bull = String(r.side || "").toUpperCase() === "CE";
+            const isManualRow = manualMode || String(r.source || "") === "Manual";
             const pos = positions.filter((p) => String(p.securityId) === String(r.securityId));
             const pnl = pos.reduce((a, p) => a + num(p.pnl), 0);
             const filt = filtName(bull);
@@ -3254,6 +3557,8 @@ function renderRunning(s) {
               ? `<span style="color:${num(pnl) >= 0 ? "#00d4aa" : "#ef5350"}">${pos.length} trade · ${num(pnl).toFixed(2)}</span>`
               : filt.length
               ? `<span style="color:#ffd700" title="${esc(filt.join(", "))}">waiting · ${filt.length} filter${names ? " (" + esc(names) + ")" : ""}</span>`
+              : isManualRow
+              ? `<span style="color:#888">manual strike · waiting</span>`
               : `<span style="color:#666">waiting</span>`;
             // The scanner pick carries both charts: the underlying it is
             // ANALYSED on (Run) and the option premium it TRADES on. Showing

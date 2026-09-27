@@ -261,6 +261,14 @@ impl DhanState {
         self.session.read().await.is_some()
     }
 
+    /// True while the broker websocket is actually streaming (the first packet
+    /// has been seen). The realtime engine uses the false -> true edge to detect
+    /// a reconnect and resync its book with the broker, so a trade whose native
+    /// stop leg fired - or a manual fill - while we were blind is not missed.
+    pub fn feed_up(&self) -> bool {
+        self.health.lock().map(|g| g.feed_up).unwrap_or(false)
+    }
+
     /// Serialised, rate-limited Dhan REST call gate (shared with the chart).
     /// This is the QUOTE slot (marketfeed quote / ltp) at ~1/s.
     pub async fn dhan_throttle(&self) {

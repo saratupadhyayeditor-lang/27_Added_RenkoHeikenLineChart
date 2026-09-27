@@ -70,6 +70,30 @@ fn gen_id(prefix: &str) -> String {
     format!("{prefix}_{}", now_ms())
 }
 
+/// Group Manual Strike Select picks into `(underlying security id, has CE, has
+/// PE)` so the synthetic scanner universe can be rebuilt from them: one side per
+/// option type the operator actually picked. Pure and order-stable.
+fn manual_target_specs(strikes: &[ManualStrike]) -> Vec<(i64, bool, bool)> {
+    let mut map: std::collections::BTreeMap<i64, (bool, bool)> = std::collections::BTreeMap::new();
+    for m in strikes {
+        if m.security_id <= 0 {
+            continue;
+        }
+        let ce = m.option_type.eq_ignore_ascii_case("CE");
+        let pe = m.option_type.eq_ignore_ascii_case("PE");
+        if !ce && !pe {
+            continue;
+        }
+        let e = map.entry(m.security_id).or_insert((false, false));
+        if ce {
+            e.0 = true;
+        } else {
+            e.1 = true;
+        }
+    }
+    map.into_iter().map(|(sid, (ce, pe))| (sid, ce, pe)).collect()
+}
+
 /// Dhan's order `correlationId` must be a short, unique token: the engine's
 /// internal strategy ids (`scan:12345:CE`, `rtstrat_1789...`) carry `:` / `_`
 /// and repeat on every entry, which Dhan rejects with
@@ -140,6 +164,44 @@ impl Default for TradeSession {
     }
 }
 
+/// One operator-picked option contract for the testing-only "Manual Strike
+/// Select" mode. When the mode is on, the engine resolves a strategy's option
+/// leg to one of these contracts (matching underlying + side) instead of the
+/// automatic ATM / ITM / OTM selection. Only the underlying identity + the
+/// strike intent are stored; the exact option contract id is resolved from the
+/// scrip master at entry time (so a rolled contract id can never go stale).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ManualStrike {
+    /// UI symbol name of the underlying, e.g. `NIFTY 50`, `RELIANCE`, `CRUDEOIL`.
+    pub symbol_name: String,
+    /// Underlying (cash/index/futures) security id, used for matching + display.
+    pub security_id: i64,
+    /// Underlying exchange segment, e.g. `IDX_I`, `NSE_EQ`, `MCX_COMM`.
+    pub exchange_segment: String,
+    /// Option expiry `YYYY-MM-DD`.
+    pub expiry: String,
+    pub strike: f64,
+    /// `CE` | `PE`.
+    pub option_type: String,
+    /// Lot size for the underlying (display only; the engine re-resolves it).
+    pub lot: f64,
+}
+
+impl Default for ManualStrike {
+    fn default() -> Self {
+        Self {
+            symbol_name: String::new(),
+            security_id: 0,
+            exchange_segment: String::new(),
+            expiry: String::new(),
+            strike: 0.0,
+            option_type: String::new(),
+            lot: 0.0,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Universal settings
 // ---------------------------------------------------------------------------
@@ -201,6 +263,12 @@ pub struct Settings {
     pub only_positive: bool,
     pub fastest_rising: bool,
     pub fastest_count: i64,
+    /// Testing-only "Manual Strike Select": when on, the ATM / strike-mode /
+    /// count / +green / fastest-rising preferences are ignored and the engine
+    /// trades only the operator-picked contracts in `manual_strikes`.
+    pub manual_strikes_enabled: bool,
+    /// Operator-picked option contracts for Manual Strike Select.
+    pub manual_strikes: Vec<ManualStrike>,
     pub premium_only: bool,
     pub run_index: String,
     pub run_fno: String,
@@ -401,6 +469,8 @@ impl Default for Settings {
             only_positive: true,
             fastest_rising: false,
             fastest_count: 3,
+            manual_strikes_enabled: false,
+            manual_strikes: Vec::new(),
             premium_only: false,
             run_index: "both".into(),
             run_fno: "spot".into(),
@@ -1013,6 +1083,13 @@ pub struct RealtimeState {
     /// Last broker fill-reconciliation poll (ms), so the order book is not
     /// fetched every 100ms loop tick.
     last_fills: Arc<AtomicI64>,
+    /// Last post-reconnect broker resync (ms), so a websocket that flaps does
+    /// not re-issue the order-book / positions fetch on every blip.
+    last_reconnect: Arc<AtomicI64>,
+    /// Previous Dhan connection / feed-up flag, used to fire `reconcile_reconnect`
+    /// on the false -> true edge (a fresh Connect, or a feed that came back).
+    was_conn: Arc<AtomicBool>,
+    was_feed: Arc<AtomicBool>,
     last_sig: Arc<Mutex<HashMap<String, i64>>>,
     /// Cached ATR per `security:segment:instrument:timeframe` `(at_ms, atr)`.
     /// AI SL/TP/trail reuse a recent ATR instead of paying a throttled Dhan
@@ -1153,6 +1230,9 @@ impl RealtimeState {
             last_funds: Arc::new(AtomicI64::new(0)),
             last_ltp: Arc::new(AtomicI64::new(0)),
             last_fills: Arc::new(AtomicI64::new(0)),
+            last_reconnect: Arc::new(AtomicI64::new(0)),
+            was_conn: Arc::new(AtomicBool::new(false)),
+            was_feed: Arc::new(AtomicBool::new(false)),
             last_sig: Arc::new(Mutex::new(HashMap::new())),
             atr_cache: Arc::new(Mutex::new(HashMap::new())),
             pool_cache: Arc::new(Mutex::new((0, Value::Null))),
@@ -1604,9 +1684,22 @@ impl RealtimeState {
                 // Both the real and paper engines behave identically here; each
                 // engine owns its own settings/toggles, so an idle tab only fetches
                 // for scanners the operator enabled on that tab.
-                self.refresh_movers().await;
-                self.refresh_nifty_trend().await;
-                self.refresh_nifty_scan().await;
+                let manual_mode = self
+                    .doc()
+                    .map(|d| d.settings.manual_strikes_enabled)
+                    .unwrap_or(false);
+                if manual_mode {
+                    // Manual Strike Select (testing): the scanner universes are
+                    // inactive, and the Picked Strikes readout is the manual list.
+                    self.refresh_manual_picked();
+                } else {
+                    // Leaving manual mode: drop any leftover manual rows so the
+                    // scanner readouts own the list again.
+                    self.update_picked("Manual", Vec::new());
+                    self.refresh_movers().await;
+                    self.refresh_nifty_trend().await;
+                    self.refresh_nifty_scan().await;
+                }
                 self.sync_auto_side();
                 // Broker account (funds/positions/holdings) and open-position LTP
                 // refresh regardless of run/arm, so the Account view is live
@@ -1614,6 +1707,9 @@ impl RealtimeState {
                 // demand, independent of the engine run state).
                 self.refresh().await;
                 self.reconcile_fills().await;
+                // Resync the broker book on the reconnect edge so a stop leg that
+                // fired (or a manual fill) while the feed was down is never lost.
+                self.reconcile_reconnect().await;
                 let force = self.force_tick.swap(false, Ordering::Relaxed);
                 if force {
                     if let Some(mut d) = self.doc() {
@@ -1692,7 +1788,10 @@ impl RealtimeState {
                     _ = notify.notified() => {}
                     _ = tick.tick() => {}
                 }
-                let on = self.doc().map(|d| d.settings.nifty_trend_on).unwrap_or(false);
+                let on = self
+                    .doc()
+                    .map(|d| d.settings.nifty_trend_on && !d.settings.manual_strikes_enabled)
+                    .unwrap_or(false);
                 if on {
                     self.refresh_nifty_flip().await;
                 }
@@ -2563,7 +2662,7 @@ impl RealtimeState {
     /// saved settings, which override the manual gate/filter set for this entry.
     fn template_for_direction(&self, settings: &Settings, strat: &Strategy) -> Option<Settings> {
         let mut name = String::new();
-        if settings.movers_on {
+        if settings.movers_on && !settings.manual_strikes_enabled {
             let b = self.mover_bias.load(Ordering::Relaxed);
             if b > 0 {
                 name = settings.mover_bull_template.clone();
@@ -2638,6 +2737,69 @@ impl RealtimeState {
         if let Ok(mut g) = self.picked_strikes.lock() {
             g.1.retain(|r| js(r, "source") != source);
             g.1.extend(rows);
+            g.0 = now_ms();
+        }
+    }
+
+    /// Resolve a Manual Strike Select pick to its concrete option contract
+    /// (security id, trading symbol, execution segment, instrument). Re-read from
+    /// the scrip master on every pass so a rolled/re-issued contract id is never
+    /// stale.
+    fn manual_contract(&self, m: &ManualStrike) -> Option<(i64, String, String, String)> {
+        let sc = scrip::get()?;
+        let ot = m.option_type.to_uppercase();
+        if !(ot == "CE" || ot == "PE") || m.strike <= 0.0 {
+            return None;
+        }
+        let res = sc.resolve(&m.symbol_name, &m.expiry, m.strike, &ot, &m.exchange_segment)?;
+        let exch = scrip::scrip_exch(&m.exchange_segment);
+        let seg = fno_segment(exch).to_string();
+        let prefix = scrip::fno_underlying(&m.symbol_name);
+        let inst = if scrip::is_index_prefix(&prefix) { "OPTIDX" } else { "OPTSTK" }.to_string();
+        Some((res.security_id, res.trading_symbol, seg, inst))
+    }
+
+    /// "Picked Strikes" rows for Manual Strike Select: the operator's explicit
+    /// contracts, in the exact shape the scanner readout uses. The snapshot feeds
+    /// these into the UI `strikes` array, so Picked Strikes - and the Running view
+    /// - show the manual selection and nothing else while the mode is on.
+    fn manual_picked_rows(&self, settings: &Settings) -> Vec<Value> {
+        let mut rows: Vec<Value> = Vec::new();
+        for m in &settings.manual_strikes {
+            let Some((sid, symbol, seg, inst)) = self.manual_contract(m) else { continue };
+            let (underlying, useg, uinst) = crate::market::symbol_meta(m.security_id)
+                .unwrap_or_else(|| (m.symbol_name.clone(), m.exchange_segment.clone(), String::new()));
+            rows.push(json!({
+                "securityId": sid,
+                "underlying": underlying,
+                "side": m.option_type.to_uppercase(),
+                "tradingSymbol": symbol,
+                "segment": seg,
+                "instrument": inst,
+                "spot": 0.0,
+                "changePct": 0.0,
+                "strike": m.strike,
+                "expiry": m.expiry,
+                "source": "Manual",
+                "runMode": run_mode_for(&seg, &inst, settings),
+                "underlyingSecurityId": m.security_id,
+                "underlyingSegment": useg,
+                "underlyingInstrument": uinst,
+            }));
+        }
+        rows
+    }
+
+    /// In Manual Strike Select the Picked Strikes readout is the manual list, not
+    /// the scanner resolution. Replaces every row instead of merging a source.
+    fn refresh_manual_picked(&self) {
+        let settings = match self.doc() {
+            Some(d) => d.settings.clone(),
+            None => return,
+        };
+        let rows = self.manual_picked_rows(&settings);
+        if let Ok(mut g) = self.picked_strikes.lock() {
+            g.1 = rows;
             g.0 = now_ms();
         }
     }
@@ -2750,6 +2912,24 @@ impl RealtimeState {
 
         let mut out: Vec<Strategy> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Manual Strike Select (testing): the tradeable universe is the operator's
+        // explicit picks instead of the Top Movers / NIFTY-trend / commodity
+        // scanners. Each picked underlying becomes a synthetic strategy on the
+        // side(s) the operator chose, so the ticked Indicator filters gate entries
+        // on the manual strikes exactly like the normal Indicator-filters mode -
+        // the engine still only ever executes the manual contracts.
+        if settings.manual_strikes_enabled {
+            for (sid, has_ce, has_pe) in manual_target_specs(&settings.manual_strikes) {
+                if has_ce {
+                    add(&mut out, &mut seen, sid, Some(true), allow_bull, allow_bear);
+                }
+                if has_pe {
+                    add(&mut out, &mut seen, sid, Some(false), allow_bull, allow_bear);
+                }
+            }
+            return out;
+        }
 
         // Commodities (MCX): the operator's list, else the default near-month set.
         if settings.commodity_on {
@@ -3710,6 +3890,360 @@ impl RealtimeState {
         }
     }
 
+    /// Post-reconnect broker resync.
+    ///
+    /// The durable engine book survives a Dhan socket/network drop, so a running
+    /// trade's SL / trail / target keeps evaluating from memory and never loses
+    /// its levels. What can drift while the feed is down is the *broker* side: the
+    /// native Super-Order stop leg can fire, a manual trade can appear, an exit
+    /// can be rejected, or a partial exit can settle. This pass runs once on every
+    /// false -> true edge of "connected" / "feed streaming" and re-aligns the two
+    /// books:
+    ///   * book a trade the broker already closed (native SL leg / manual exit),
+    ///   * align a trade whose broker qty is smaller (a partial exit while offline),
+    ///   * adopt an untracked broker position so SL / trail protect it,
+    ///   * re-adopt an exposure whose exit order never filled.
+    /// It never overwrites the operator's SL / trail / target values, so after a
+    /// reconnect a running trade's protection is exactly what it was before.
+    async fn reconcile_reconnect(&self) {
+        if self.paper {
+            return;
+        }
+        // Fire only on the false -> true edge, so a fresh Connect and every
+        // websocket recovery trigger exactly one resync.
+        let conn = self.dhan.is_connected().await;
+        let up = self.dhan.feed_up();
+        let was_conn = self.was_conn.swap(conn, Ordering::Relaxed);
+        let was_feed = self.was_feed.swap(up, Ordering::Relaxed);
+        if !((conn && !was_conn) || (up && !was_feed)) {
+            return;
+        }
+        // A flapping socket must not hammer Dhan's order / portfolio APIs.
+        let now = now_ms();
+        if now - self.last_reconnect.load(Ordering::Relaxed) < 5_000 {
+            return;
+        }
+        self.last_reconnect.store(now, Ordering::Relaxed);
+
+        let Some(client) = self.dhan.session_client().await else { return };
+        self.dhan.dhan_order_throttle().await;
+        let book = match client.order_book().await {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        self.dhan.dhan_acct_throttle().await;
+        let rows = match client.positions().await {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        // Broker net signed qty + average entry per (security, segment).
+        struct BrokerPos {
+            net: i64,
+            avg: f64,
+            symbol: String,
+        }
+        let mut broker: HashMap<(i64, String), BrokerPos> = HashMap::new();
+        for r in &rows {
+            let sid = r.security_id.parse::<i64>().unwrap_or(0);
+            if sid <= 0 || r.net_qty == 0 {
+                continue;
+            }
+            let long = r.position_type.eq_ignore_ascii_case("LONG");
+            let avg = if long { r.buy_avg } else { r.sell_avg };
+            let avg = if avg > 0.0 { avg } else { r.cost_price };
+            let key = (sid, r.exchange_segment.to_uppercase());
+            let e = broker.entry(key).or_insert(BrokerPos {
+                net: 0,
+                avg,
+                symbol: r.trading_symbol.clone(),
+            });
+            e.net += r.net_qty;
+            if avg > 0.0 {
+                e.avg = avg;
+            }
+            if e.symbol.is_empty() {
+                e.symbol = r.trading_symbol.clone();
+            }
+        }
+
+        // A filled order on the security in the position's exit direction is hard
+        // evidence the broker closed (or partly closed) the trade while the feed
+        // was down. Newest update_time wins.
+        let exit_fill = |sid: i64, side: &str| -> Option<f64> {
+            let want = if side == "BUY" { "SELL" } else { "BUY" };
+            book.iter()
+                .filter(|o| {
+                    o.security_id == sid.to_string()
+                        && o.transaction_type.eq_ignore_ascii_case(want)
+                        && o.filled_qty > 0
+                        && o.average_traded_price > 0.0
+                })
+                .max_by(|a, b| a.update_time.cmp(&b.update_time))
+                .map(|o| o.average_traded_price)
+        };
+
+        let (positions, settings, method) = {
+            let Some(d) = self.doc() else { return };
+            (d.positions.clone(), d.settings.clone(), d.method.clone())
+        };
+        if positions.is_empty() && broker.is_empty() {
+            return;
+        }
+
+        // 1. Book trades the broker already closed while we were blind.
+        let mut skip: std::collections::HashSet<(i64, String)> = std::collections::HashSet::new();
+        let mut to_close: Vec<(String, String, f64)> = Vec::new();
+        for p in &positions {
+            if js(p, "status").eq_ignore_ascii_case("closing") {
+                continue;
+            }
+            let sid = ji(p, "securityId");
+            if sid <= 0 {
+                continue;
+            }
+            let key = (sid, js(p, "exchangeSegment").to_uppercase());
+            if broker.get(&key).map(|b| b.net).unwrap_or(0) != 0 {
+                continue;
+            }
+            // Too fresh to judge: the entry may still be in transit.
+            let opened = ji(p, "openedAt");
+            if opened > 0 && now - opened < 5_000 {
+                skip.insert(key);
+                continue;
+            }
+            let entry_filled = jb(p, "reconciled")
+                || ji(p, "filledQty") > 0
+                || jarr(p, "orderIds").iter().any(|id| {
+                    id.as_str()
+                        .map(|s| book.iter().any(|o| o.order_id == s && o.filled_qty > 0))
+                        .unwrap_or(false)
+                });
+            if !entry_filled {
+                skip.insert(key);
+                continue;
+            }
+            let side = js(p, "side");
+            let fill = exit_fill(sid, &side);
+            if fill.is_none() && rows.is_empty() {
+                // No exit order visible and the portfolio answered empty: could be
+                // a flaky empty response. Never book a close on a hunch.
+                self.log_throttled(
+                    "rt-recon-ambiguous",
+                    30_000,
+                    "warn",
+                    &format!(
+                        "reconnect: {} not seen at the broker yet; keeping the trade and retrying",
+                        js(p, "tradingSymbol")
+                    ),
+                );
+                skip.insert(key);
+                continue;
+            }
+            let px = fill.unwrap_or_else(|| {
+                let l = self.ltp_of(sid, &js(p, "exchangeSegment"));
+                if l > 0.0 { l } else { jf(p, "ltp") }
+            });
+            let px = if px > 0.0 { px } else { jf(p, "fillPrice").max(jf(p, "entry")) };
+            let reason = if fill.is_some() { "SL_LEG_FILLED" } else { "BROKER_CLOSED" };
+            to_close.push((js(p, "id"), reason.to_string(), px));
+        }
+        for (id, reason, px) in &to_close {
+            if self.close_position_ex(id, reason, *px, Some(Vec::new())).await.is_ok() {
+                self.log(
+                    "warn",
+                    &format!("reconnect: booked broker-side exit for {id} ({reason}) @ {px:.2}"),
+                );
+            }
+        }
+
+        // 2. Align engine qty when the broker shows a smaller same-side net (a
+        //    partial exit while offline). A single engine leg is the normal case.
+        let engine_net: HashMap<(i64, String), i64> = {
+            let Some(d) = self.doc() else { return };
+            let mut m: HashMap<(i64, String), i64> = HashMap::new();
+            for p in &d.positions {
+                if js(p, "status").eq_ignore_ascii_case("closing") {
+                    continue;
+                }
+                let sid = ji(p, "securityId");
+                if sid <= 0 {
+                    continue;
+                }
+                let q = ji(p, "qty");
+                let signed = if js(p, "side") == "BUY" { q } else { -q };
+                *m.entry((sid, js(p, "exchangeSegment").to_uppercase())).or_insert(0) += signed;
+            }
+            m
+        };
+        for (key, b) in &broker {
+            if skip.contains(key) {
+                continue;
+            }
+            let e = engine_net.get(key).copied().unwrap_or(0);
+            if e == 0 || (e > 0) != (b.net > 0) || b.net.abs() >= e.abs() {
+                continue;
+            }
+            let ids: Vec<String> = {
+                let Some(d) = self.doc() else { continue };
+                d.positions
+                    .iter()
+                    .filter(|p| {
+                        !js(p, "status").eq_ignore_ascii_case("closing")
+                            && ji(p, "securityId") == key.0
+                            && js(p, "exchangeSegment").eq_ignore_ascii_case(&key.1)
+                    })
+                    .map(|p| js(p, "id"))
+                    .collect()
+            };
+            if ids.len() == 1 {
+                let remain = b.net.abs();
+                if let Some(mut d) = self.doc() {
+                    if let Some(p) = d.positions.iter_mut().find(|p| js(p, "id") == ids[0]) {
+                        p["qty"] = json!(remain);
+                        let lot = jf(p, "lotSize");
+                        if lot > 0.0 {
+                            p["lots"] = json!((remain as f64 / lot).round());
+                        }
+                        p["mismatch"] = json!(true);
+                    }
+                }
+                self.log(
+                    "warn",
+                    &format!(
+                        "reconnect: broker shows a partial exit on security {}; engine qty aligned to the open {} so the exit cannot flip the position",
+                        key.0, remain
+                    ),
+                );
+                self.save();
+            } else if ids.len() > 1 {
+                skip.insert(key.clone());
+                self.log_throttled(
+                    "rt-recon-split",
+                    30_000,
+                    "warn",
+                    &format!(
+                        "reconnect: broker net {} differs from the engine book for security {}; please review manually",
+                        b.net, key.0
+                    ),
+                );
+            }
+        }
+
+        // 3. Adopt broker exposure the engine does not fully track so it is
+        //    protected by the configured SL / trail instead of sitting naked.
+        let covered: HashMap<(i64, String), i64> = {
+            let Some(d) = self.doc() else { return };
+            let mut m: HashMap<(i64, String), i64> = HashMap::new();
+            for p in &d.positions {
+                if js(p, "status").eq_ignore_ascii_case("closing") {
+                    continue;
+                }
+                let sid = ji(p, "securityId");
+                if sid <= 0 {
+                    continue;
+                }
+                let q = ji(p, "qty");
+                let signed = if js(p, "side") == "BUY" { q } else { -q };
+                *m.entry((sid, js(p, "exchangeSegment").to_uppercase())).or_insert(0) += signed;
+            }
+            m
+        };
+        let mut adopted: Vec<Value> = Vec::new();
+        let mut adopted_keys: Vec<(i64, String, bool)> = Vec::new();
+        for (key, b) in &broker {
+            if skip.contains(key) {
+                continue;
+            }
+            let e = covered.get(key).copied().unwrap_or(0);
+            let delta = reconnect_delta(e, b.net);
+            if delta == 0 {
+                continue;
+            }
+            let seg = key.1.clone();
+            let avg = if b.avg > 0.0 { b.avg } else { self.ltp_of(key.0, &seg) };
+            if avg <= 0.0 {
+                self.log_throttled(
+                    "rt-recon-noavg",
+                    30_000,
+                    "warn",
+                    &format!("reconnect: no entry price for broker position {}; not adopting", key.0),
+                );
+                continue;
+            }
+            let side = if delta > 0 { "BUY" } else { "SELL" };
+            let qty = delta.abs();
+            let (sl, tp, trail, trail_tp, point_trail) =
+                levels_for(&settings, &json!({}), side, avg, 0.0, 0.0, 0.0);
+            let protected = sl > 0.0 || tp > 0.0 || trail > 0.0 || trail_tp > 0.0 || point_trail > 0.0;
+            adopted.push(json!({
+                "id": gen_id("rtadopt"),
+                "strategyId": "recovered",
+                "strategyName": "Recovered (broker)",
+                "method": method,
+                "securityId": key.0,
+                "exchangeSegment": seg,
+                "instrument": "",
+                "tradingSymbol": b.symbol,
+                "underlying": underlying_of(&b.symbol, &seg),
+                "side": side,
+                "qty": qty,
+                "lots": 0.0,
+                "lotSize": 0.0,
+                "filledQty": qty,
+                "entry": round2(avg),
+                "fillPrice": round2(avg),
+                "ltp": round2(avg),
+                "sl": round2(sl),
+                "overallSl": round2(sl),
+                "tp": round2(tp),
+                "trail": round2(trail),
+                "pointTrail": round2(point_trail),
+                "trailTp": round2(trail_tp),
+                "peakProfit": 0.0,
+                "best": round2(avg),
+                "orderIds": [],
+                "superOrders": [],
+                "broker": true,
+                "reconciled": true,
+                "adopted": true,
+                "status": "running",
+                "orderType": "MARKET",
+                "limitPrice": 0.0,
+                "openedAt": now,
+                "log": [{ "t": now, "msg": "recovered from the broker after a reconnect" }],
+            }));
+            adopted_keys.push((key.0, key.1.clone(), protected));
+        }
+        if !adopted.is_empty() {
+            let n = adopted.len();
+            if let Some(mut d) = self.doc() {
+                for p in adopted {
+                    d.positions.push(p);
+                }
+            }
+            for (sid, seg, protected) in &adopted_keys {
+                self.dhan.subscribe_options(&[(*sid, seg.clone())]).await;
+                if *protected {
+                    self.log(
+                        "warn",
+                        &format!("reconnect: adopted broker position {} ({}) so SL / trail protect it", sid, seg),
+                    );
+                } else {
+                    self.log(
+                        "warn",
+                        &format!(
+                            "reconnect: adopted broker position {} ({}) but no SL / trail / target is configured - set one to protect it",
+                            sid, seg
+                        ),
+                    );
+                }
+            }
+            self.save();
+            self.log("info", &format!("reconnect: broker resync adopted {n} position(s)"));
+        }
+    }
+
     fn position_ltp(&self, id: &str) -> f64 {
         let (sid, exch) = self
             .doc()
@@ -3722,12 +4256,110 @@ impl RealtimeState {
     // Entry / exit
     // -----------------------------------------------------------------------
 
+    /// The one CE/PE side a strategy should trade: the "Run Strategy In" override
+    /// wins over the Option Type dropdown (old AST `forcedSide`), else the
+    /// dropdown, else the live scanner direction, else the strategy's own
+    /// bullish/bearish category. Shared by the automatic leg resolver and the
+    /// testing-only Manual Strike Select so both always agree on the side.
+    fn target_option_side(&self, strat: &Strategy, settings: &Settings) -> &'static str {
+        if let Some(side) = self.effective_run_in_side(settings) {
+            return side;
+        }
+        match settings.option_side.to_uppercase().as_str() {
+            "CE" => "CE",
+            "PE" => "PE",
+            _ => {
+                // Manual Strike Select keeps the scanner direction out of the
+                // decision: the operator's explicit picks plus the strategy's own
+                // bullish/bearish side decide (an explicit run-in always wins).
+                if !settings.manual_strikes_enabled {
+                    if let Some(side) = self.auto_option_side(settings) {
+                        return side;
+                    }
+                }
+                if strategy_is_bull(strat) {
+                    "CE"
+                } else {
+                    "PE"
+                }
+            }
+        }
+    }
+
+    /// Testing-only Manual Strike Select: when enabled and the operator has
+    /// picked at least one contract for the strategy's underlying, return that
+    /// contract instead of the automatic ATM / strike-mode resolution. Prefers a
+    /// pick whose side matches `target_option_side` (nearest to spot when several
+    /// exist) and falls back to the nearest pick of either side. Returns `None`
+    /// when the mode is off, the list is empty, or no pick matches the strategy's
+    /// underlying - callers then keep the normal resolution.
+    fn resolve_manual_strike(&self, strat: &Strategy, spot: f64, settings: &Settings) -> Option<Strategy> {
+        if !settings.manual_strikes_enabled || settings.manual_strikes.is_empty() {
+            return None;
+        }
+        let sc = scrip::get()?;
+        let prefix = scrip::fno_underlying(&strat.trading_symbol);
+        if prefix.is_empty() {
+            return None;
+        }
+        let want = self.target_option_side(strat, settings);
+        let mut matching: Vec<&ManualStrike> = settings
+            .manual_strikes
+            .iter()
+            .filter(|m| {
+                m.strike > 0.0
+                    && (m.option_type.eq_ignore_ascii_case("CE") || m.option_type.eq_ignore_ascii_case("PE"))
+                    && scrip::fno_underlying(&m.symbol_name) == prefix
+            })
+            .collect();
+        if matching.is_empty() {
+            return None;
+        }
+        // Prefer the wanted side; if the operator only picked the other side, use
+        // it anyway (manual mode is an explicit testing override, not a filter).
+        let side_match: Vec<&ManualStrike> = matching
+            .iter()
+            .copied()
+            .filter(|m| m.option_type.eq_ignore_ascii_case(want))
+            .collect();
+        if !side_match.is_empty() {
+            matching = side_match;
+        }
+        let pick = if spot > 0.0 {
+            matching
+                .iter()
+                .copied()
+                .min_by(|a, b| {
+                    (a.strike - spot)
+                        .abs()
+                        .partial_cmp(&(b.strike - spot).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        } else {
+            matching.first().copied()
+        }?;
+        let ot = pick.option_type.to_uppercase();
+        let res = sc.resolve(&pick.symbol_name, &pick.expiry, pick.strike, &ot, &pick.exchange_segment)?;
+        let exch = scrip::scrip_exch(&pick.exchange_segment);
+        let seg = fno_segment(exch);
+        let mut out = strat.clone();
+        out.security_id = res.security_id;
+        out.exchange_segment = seg.to_string();
+        out.instrument = if scrip::is_index_prefix(&prefix) { "OPTIDX" } else { "OPTSTK" }.to_string();
+        out.trading_symbol = res.trading_symbol;
+        Some(out)
+    }
+
     /// Resolve an index/underlying strategy into a concrete option contract:
     /// nearest expiry, ATM/ITM/OTM strike from the scrip master, CE for bullish
     /// (or BUY) and PE for bearish (or SELL). Mirrors the old engine's option
     /// selection. Returns `None` when the scrip master cannot resolve it.
     fn resolve_option_strategy(&self, strat: &Strategy, spot: f64, settings: &Settings) -> Option<Strategy> {
         let sc = scrip::get()?;
+        // Manual Strike Select (testing) wins over every automatic preference.
+        if let Some(m) = self.resolve_manual_strike(strat, spot, settings) {
+            return Some(m);
+        }
         if spot <= 0.0 {
             return None;
         }
@@ -3752,34 +4384,7 @@ impl RealtimeState {
                 idx = i;
             }
         }
-        let cat = strat.category.to_uppercase();
-        let is_bull = if cat == "BULLISH" {
-            true
-        } else if cat == "BEARISH" {
-            false
-        } else {
-            strat.side.eq_ignore_ascii_case("BUY")
-        };
-        // "Run Strategy In" override wins over the Option Type dropdown (old AST
-        // forcedSide) - it forces the traded CE/PE leg regardless of the
-        // strategy's own bullish/bearish category.
-        let ot = if let Some(side) = self.effective_run_in_side(settings) {
-            side
-        } else {
-            match settings.option_side.to_uppercase().as_str() {
-                "CE" => "CE",
-                "PE" => "PE",
-                _ => {
-                    if let Some(side) = self.auto_option_side(settings) {
-                        side
-                    } else if is_bull {
-                        "CE"
-                    } else {
-                        "PE"
-                    }
-                }
-            }
-        };
+        let ot = self.target_option_side(strat, settings);
         let mode = settings.option_type.to_uppercase();
         let depth = settings.strike_count.max(1) as i64;
         let mut off = 0i64;
@@ -4662,6 +5267,20 @@ impl RealtimeState {
     }
 
     async fn close_position(&self, id: &str, reason: &str, exit_price: f64) -> Result<(), String> {
+        self.close_position_ex(id, reason, exit_price, None).await
+    }
+
+    /// Close a trade on the broker (`recovered = None`) or book an exit the broker
+    /// already settled while we were disconnected (`recovered = Some(exit ids)`):
+    /// the recovered path sends no new order and never leaves the row "pending".
+    /// Both paths share the whole bookkeeping tail.
+    async fn close_position_ex(
+        &self,
+        id: &str,
+        reason: &str,
+        exit_price: f64,
+        recovered: Option<Vec<String>>,
+    ) -> Result<(), String> {
         let (pos, settings, cfg_map, method) = {
             let Some(mut d) = self.doc() else { return Err("state lock".into()) };
             let Some(idx) = d.positions.iter().position(|p| js(p, "id") == id) else {
@@ -4715,8 +5334,15 @@ impl RealtimeState {
         // Send the exit order. Square-off by the operator is always allowed,
         // even if the engine was disarmed after the entry. Paper mode books the
         // exit locally at `exit_price` and never touches the broker.
+        //
+        // A recovered exit is the exception: the broker already flattened this
+        // trade while the feed was down (the native Super-Order stop leg fired,
+        // or it was closed manually), so we book it as-is and send nothing - a
+        // new order here would flip the account into the opposite position.
         let mut exit_order_ids: Vec<String> = Vec::new();
-        if !self.paper {
+        if let Some(recovered) = recovered {
+            exit_order_ids = recovered;
+        } else if !self.paper {
         if let Some(client) = self.dhan.session_client().await {
             let client_id = self.dhan.session_client_id().await.unwrap_or_default();
             if broker {
@@ -6994,6 +7620,24 @@ fn levels_for(
     (sl.max(0.0), tp.max(0.0), trail, trail_tp_pct, point_trail)
 }
 
+/// Post-reconnect exposure the engine must adopt for one security from the
+/// broker's signed net minus the engine's signed net:
+///   * `0`   the two books agree (nothing to do),
+///   * `0` also when the broker net is merely smaller than an engine leg - that
+///     is a partial exit, handled by aligning the engine qty, not by adopting an
+///     opposite position,
+///   * otherwise the extra broker exposure (same direction), or the whole book
+///     when the engine holds nothing on the security.
+fn reconnect_delta(engine_signed: i64, broker_signed: i64) -> i64 {
+    if engine_signed == 0 {
+        broker_signed
+    } else if (engine_signed > 0) == (broker_signed > 0) && broker_signed.abs() > engine_signed.abs() {
+        broker_signed - engine_signed
+    } else {
+        0
+    }
+}
+
 fn price_off(price: f64, side: &str, frac: f64) -> f64 {
     let d = price * frac;
     if side == "BUY" {
@@ -7443,7 +8087,9 @@ fn snap_of(rt: &RealtimeState) -> Value {
                     None => (s.security_id, s.exchange_segment.clone()),
                 };
                 let spot = rt.ltp_of(spot_sid, &spot_seg);
-                if spot > 0.0 {
+                // Manual Strike Select resolves from the scrip master alone, so it
+                // can still name the contract before any live quote arrives.
+                if spot > 0.0 || d.settings.manual_strikes_enabled {
                     if let Some(base) = rt.resolve_option_strategy(s, spot, &d.settings) {
                         let leg = json!({
                             "securityId": base.security_id,
@@ -9848,6 +10494,55 @@ mod gate_tests {
         assert!(!s.fastest_rising);
         assert_eq!(s.fastest_count, 3);
         assert_eq!(s.option_side, "both");
+        // Manual Strike Select (testing) is off until the operator turns it on.
+        assert!(!s.manual_strikes_enabled);
+        assert!(s.manual_strikes.is_empty());
+    }
+
+    #[test]
+    fn manual_strike_settings_round_trip_uses_camel_case() {
+        let mut s = Settings::default();
+        s.manual_strikes_enabled = true;
+        s.manual_strikes.push(ManualStrike {
+            symbol_name: "NIFTY 50".into(),
+            security_id: 13,
+            exchange_segment: "IDX_I".into(),
+            expiry: "2026-09-25".into(),
+            strike: 24500.0,
+            option_type: "CE".into(),
+            lot: 75.0,
+        });
+        let v = serde_json::to_value(&s).unwrap();
+        // The UI reads/writes these exact camelCase keys.
+        assert_eq!(v["manualStrikesEnabled"], serde_json::json!(true));
+        assert_eq!(v["manualStrikes"][0]["symbolName"], serde_json::json!("NIFTY 50"));
+        assert_eq!(v["manualStrikes"][0]["optionType"], serde_json::json!("CE"));
+        assert_eq!(v["manualStrikes"][0]["strike"], serde_json::json!(24500.0));
+        let back: Settings = serde_json::from_value(v).unwrap();
+        assert!(back.manual_strikes_enabled);
+        assert_eq!(back.manual_strikes.len(), 1);
+        assert_eq!(back.manual_strikes[0].symbol_name, "NIFTY 50");
+    }
+
+    #[test]
+    fn manual_target_specs_group_sides_per_underlying() {
+        // In Manual Strike Select the scanner universe is rebuilt from the picks:
+        // one synthetic side per option type the operator actually chose, and a
+        // single entry per underlying even when CE + PE (or duplicates) are added.
+        let mk = |sid: i64, ot: &str| ManualStrike {
+            security_id: sid,
+            option_type: ot.to_string(),
+            ..Default::default()
+        };
+        let specs = manual_target_specs(&[
+            mk(13, "CE"),
+            mk(13, "PE"),
+            mk(13, "CE"), // duplicate CE collapses
+            mk(2885, "CE"),
+            mk(-1, "PE"), // invalid id ignored
+            mk(9999, "xx"), // unknown option type ignored
+        ]);
+        assert_eq!(specs, vec![(13, true, true), (2885, true, false)]);
     }
 
     #[test]
@@ -10161,5 +10856,24 @@ mod account_tests {
         // No price anywhere: falls back to avg cost => 0 P&L, never a fake loss.
         assert_eq!(h[2]["ltp"], json!(50.0));
         assert_eq!(h[2]["pnl"], json!(0.0));
+    }
+
+    #[test]
+    fn reconnect_delta_only_adopts_broker_exposure_the_engine_misses() {
+        // Both books agree -> nothing to adopt.
+        assert_eq!(reconnect_delta(75, 75), 0);
+        assert_eq!(reconnect_delta(-75, -75), 0);
+        // Engine flat, broker holds -> adopt the whole broker net.
+        assert_eq!(reconnect_delta(0, 75), 75);
+        assert_eq!(reconnect_delta(0, -40), -40);
+        // Broker holds more in the same direction -> adopt only the extra.
+        assert_eq!(reconnect_delta(75, 100), 25);
+        assert_eq!(reconnect_delta(-75, -100), -25);
+        // Broker holds less (partial exit) -> never adopt an opposite leg; the
+        // engine qty is aligned to the open qty instead.
+        assert_eq!(reconnect_delta(75, 40), 0);
+        assert_eq!(reconnect_delta(-75, -40), 0);
+        // Opposite signs -> no blind guess.
+        assert_eq!(reconnect_delta(75, -75), 0);
     }
 }
