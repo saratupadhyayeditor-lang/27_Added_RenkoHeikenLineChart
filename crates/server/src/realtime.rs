@@ -291,10 +291,6 @@ pub struct Settings {
     pub nifty_trend_on: bool,
     pub nifty_trend_pct_on: bool,
     pub nifty_trend_pct: f64,
-    pub nifty_trend_topn: bool,
-    pub nifty_trend_topn_count: i64,
-    pub nifty_trend_indices: bool,
-    pub nifty_trend_index_list: Vec<i64>,
     pub nifty_trend_conf_inds: Vec<String>,
     // --- Commodities ---
     pub commodity_on: bool,
@@ -488,10 +484,6 @@ impl Default for Settings {
             nifty_trend_on: false,
             nifty_trend_pct_on: true,
             nifty_trend_pct: 2.5,
-            nifty_trend_topn: false,
-            nifty_trend_topn_count: 5,
-            nifty_trend_indices: false,
-            nifty_trend_index_list: Vec::new(),
             nifty_trend_conf_inds: Vec::new(),
             commodity_on: false,
             commodity_list: Vec::new(),
@@ -1765,7 +1757,11 @@ impl RealtimeState {
                     // market tick; the 50ms poll is enough to notice arming.
                     tick.tick().await;
                 }
-                if self.doc.lock().map(|d| d.engine_on).unwrap_or(false) {
+                // Exits (SL / TP / trail) are managed only while the live feed is
+                // streaming, so a stale mark can never book a fake fill.
+                if self.doc.lock().map(|d| d.engine_on).unwrap_or(false)
+                    && self.dhan.feed_live()
+                {
                     self.manage_positions().await;
                 }
             }
@@ -1872,9 +1868,14 @@ impl RealtimeState {
         if !self.dhan.is_connected().await {
             return;
         }
+        // Yield Dhan's single data slot while the operator is interacting
+        // (chart / option chain / quotes); the 100ms engine tick retries.
+        if self.dhan.user_active() {
+            return;
+        }
         let now = now_ms();
         let last_ltp = self.last_ltp.load(Ordering::Relaxed);
-        if now - last_ltp >= 1500 {
+        if now - last_ltp >= 3000 {
             self.last_ltp.store(now, Ordering::Relaxed);
             let open: Vec<(i64, String)> = {
                 self.doc()
@@ -1918,7 +1919,7 @@ impl RealtimeState {
         }
 
         let last_acct = self.last_acct.load(Ordering::Relaxed);
-        if now - last_acct >= 4000 {
+        if now - last_acct >= 8000 {
             self.last_acct.store(now, Ordering::Relaxed);
             if let Some(client) = self.dhan.session_client().await {
                 self.dhan.dhan_acct_throttle().await;
@@ -1935,7 +1936,7 @@ impl RealtimeState {
         }
 
         let last_funds = self.last_funds.load(Ordering::Relaxed);
-        if now - last_funds >= 15000 {
+        if now - last_funds >= 30000 {
             self.last_funds.store(now, Ordering::Relaxed);
             if let Some(client) = self.dhan.session_client().await {
                 self.dhan.dhan_acct_throttle().await;
@@ -2249,7 +2250,7 @@ impl RealtimeState {
 
     async fn refresh_movers(&self) {
         let now = now_ms();
-        if now - self.last_movers.load(Ordering::Relaxed) < 15000 {
+        if now - self.last_movers.load(Ordering::Relaxed) < 25000 {
             return;
         }
         let (enabled, gain_n, lose_n, indices) = self
@@ -2262,6 +2263,11 @@ impl RealtimeState {
             return;
         }
         if !self.dhan.is_connected().await {
+            return;
+        }
+        // Yield Dhan's single data slot while the operator is interacting; the
+        // next engine tick retries (last_movers is deliberately left untouched).
+        if self.dhan.user_active() {
             return;
         }
         self.last_movers.store(now, Ordering::Relaxed);
@@ -2349,33 +2355,6 @@ impl RealtimeState {
         }
     }
 
-    /// Live Top Gainers / Top Losers for the NIFTY-trend engine: the shared Top
-    /// Movers scan when it is running, else a fresh scan of the same universe.
-    async fn nifty_mover_lists(&self, topn: bool, topn_n: i64, inc_idx: bool, idx_list: &[i64]) -> (Vec<Value>, Vec<Value>) {
-        let payload = self.movers_cache.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
-        let gainers: Vec<Value> = jarr(&payload, "gainers").to_vec();
-        let losers: Vec<Value> = jarr(&payload, "losers").to_vec();
-        if !gainers.is_empty() || !losers.is_empty() {
-            return (gainers, losers);
-        }
-        // Top Movers is off: rank the same universe ourselves so the NIFTY-trend
-        // side still has a Top Gainer / Top Loser set to trade.
-        let commodity_on = self.doc().map(|d| d.settings.commodity_on).unwrap_or(false);
-        let mut univ = self.scan_universe(inc_idx, commodity_on);
-        if inc_idx {
-            univ.extend(index_legs(idx_list));
-        }
-        univ.sort();
-        univ.dedup();
-        let rows = self.quote_rows(&univ).await;
-        let mut g = rows.clone();
-        g.sort_by(|a, b| jf(b, "changePct").partial_cmp(&jf(a, "changePct")).unwrap_or(std::cmp::Ordering::Equal));
-        let mut l = rows.clone();
-        l.sort_by(|a, b| jf(a, "changePct").partial_cmp(&jf(b, "changePct")).unwrap_or(std::cmp::Ordering::Equal));
-        let take = if topn { topn_n.max(1) as usize } else { usize::MAX };
-        (g.into_iter().take(take).collect(), l.into_iter().take(take).collect())
-    }
-
     /// NIFTY trend pass #1 - REST-backed direction refresh. Computes every
     /// selected straight-line indicator on the NIFTY candles at the same
     /// timeframe the operator ticked for the charts (`1 min` / `5 min`; both =
@@ -2384,7 +2363,7 @@ impl RealtimeState {
     /// [`refresh_nifty_flip`] then tracks the forming bar between refreshes.
     async fn refresh_nifty_trend(&self) {
         let now = now_ms();
-        if now - self.last_trend.load(Ordering::Relaxed) < 1_000 {
+        if now - self.last_trend.load(Ordering::Relaxed) < 2_500 {
             return;
         }
         let (enabled, tf, conf) = self
@@ -2534,28 +2513,21 @@ impl RealtimeState {
 
     /// NIFTY trend pass #2 - pick + assignment. Top Gainers are gated by the
     /// bullish straight-line filters and resolve to CE legs; Top Losers are
-    /// gated by the bearish filters and resolve to PE legs. When only one side
-    /// is selected only that side trades; when both are selected both filter
-    /// lists run, each strictly on its own side.
+    /// gated by the bearish filters and resolve to PE legs. Both legs come from
+    /// the Top Movers scanner lists - NIFTY trend never ranks its own universe,
+    /// so with Top Movers off there is nothing to trade. When only one side is
+    /// selected only that side trades; when both are selected both filter lists
+    /// run, each strictly on its own side.
     async fn refresh_nifty_scan(&self) {
         let now = now_ms();
-        if now - self.last_nifty_scan.load(Ordering::Relaxed) < 15_000 {
+        if now - self.last_nifty_scan.load(Ordering::Relaxed) < 25_000 {
             return;
         }
-        let (enabled, topn, topn_n, inc_idx, idx_list, settings) = self
+        let (enabled, movers_on, settings) = self
             .doc()
-            .map(|d| {
-                (
-                    d.settings.nifty_trend_on,
-                    d.settings.nifty_trend_topn,
-                    d.settings.nifty_trend_topn_count.max(1),
-                    d.settings.nifty_trend_indices,
-                    d.settings.nifty_trend_index_list.clone(),
-                    d.settings.clone(),
-                )
-            })
-            .unwrap_or((false, true, 5, false, Vec::new(), Settings::default()));
-        if !enabled {
+            .map(|d| (d.settings.nifty_trend_on, d.settings.movers_on, d.settings.clone()))
+            .unwrap_or((false, false, Settings::default()));
+        if !enabled || !movers_on {
             self.update_picked("NIFTY trend", Vec::new());
             if let Ok(mut g) = self.nifty_picks.lock() {
                 *g = (now, Value::Null);
@@ -2563,6 +2535,11 @@ impl RealtimeState {
             return;
         }
         if !self.dhan.is_connected().await {
+            return;
+        }
+        // Yield Dhan's single data slot while the operator is interacting; the
+        // next engine tick retries (last_nifty_scan is deliberately untouched).
+        if self.dhan.user_active() {
             return;
         }
         self.last_nifty_scan.store(now, Ordering::Relaxed);
@@ -2573,7 +2550,11 @@ impl RealtimeState {
             self.update_picked("NIFTY trend", Vec::new());
             return;
         }
-        let (gainers, losers) = self.nifty_mover_lists(topn, topn_n, inc_idx, &idx_list).await;
+        // The tradeable universe is exactly the Top Movers scanner lists -
+        // NIFTY trend follows the operator's selected Top Gainers / Top Losers.
+        let payload = self.movers_cache.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
+        let gainers: Vec<Value> = jarr(&payload, "gainers");
+        let losers: Vec<Value> = jarr(&payload, "losers");
         let mut legs: Vec<Value> = Vec::new();
         for (side, list, active) in [("CE", &gainers, bull_on), ("PE", &losers, bear_on)] {
             if !active {
@@ -2987,7 +2968,11 @@ impl RealtimeState {
     // Signal scan
     // -----------------------------------------------------------------------
 
-    async fn scan_signals(&self) {        if !self.dhan.is_connected().await {
+    async fn scan_signals(&self) {
+        // Entries only while Dhan is connected AND the live feed is streaming a
+        // fresh tick: a silent / closed / disconnected feed must not trade on a
+        // stale mark (which would produce fake results).
+        if !self.dhan.is_connected().await || !self.dhan.feed_live() {
             return;
         }
         let (mut strategies, selected, trade_limit, trade_limit_count, ai_trades, movers_on, settings0) = {

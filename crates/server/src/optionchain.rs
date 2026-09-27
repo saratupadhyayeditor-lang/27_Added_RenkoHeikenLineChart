@@ -650,6 +650,8 @@ fn instrument_json(name: &str, lot: f64, trading_symbol: &str) -> Value {
 }
 
 pub async fn expiries(State(st): State<DhanState>, Json(req): Json<OcReq>) -> impl IntoResponse {
+    // Operator-facing request: make the background pollers yield the Dhan data slot.
+    st.mark_user_activity();
     let name = underlying_name(req.security_id, &req.symbol_name);
     let (lot, tsym) = resolve_lot(&name, req.security_id, &req.exchange_segment);
     let key = expiry_key(req.security_id, &req.exchange_segment);
@@ -819,6 +821,8 @@ pub async fn option_chain(
     State(st): State<DhanState>,
     Json(req): Json<OcReq>,
 ) -> impl IntoResponse {
+    // Operator-facing request: make the background pollers yield the Dhan data slot.
+    st.mark_user_activity();
     let name = underlying_name(req.security_id, &req.symbol_name);
     let (lot, tsym) = resolve_lot(&name, req.security_id, &req.exchange_segment);
     if req.expiry.trim().is_empty() {
@@ -927,6 +931,8 @@ pub async fn manual_strike_chain(
     State(st): State<DhanState>,
     Json(req): Json<ManualStrikeReq>,
 ) -> impl IntoResponse {
+    // Operator-facing request: make the background pollers yield the Dhan data slot.
+    st.mark_user_activity();
     let name = underlying_name(req.security_id, &req.symbol_name);
     let (lot, tsym) = resolve_lot(&name, req.security_id, &req.exchange_segment);
     if market::commodity_has_options(req.security_id) == Some(false) {
@@ -1019,6 +1025,8 @@ pub async fn option_chain_all(
     State(st): State<DhanState>,
     Json(req): Json<OcReq>,
 ) -> impl IntoResponse {
+    // Operator-facing request: make the background pollers yield the Dhan data slot.
+    st.mark_user_activity();
     let name = underlying_name(req.security_id, &req.symbol_name);
     let (lot, tsym) = resolve_lot(&name, req.security_id, &req.exchange_segment);
     if market::commodity_has_options(req.security_id) == Some(false) {

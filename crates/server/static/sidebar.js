@@ -444,39 +444,11 @@ export function bootSidebar(api) {
     window.dispatchEvent(new CustomEvent("chartselection", { detail: window.__chartSelection }));
   }
 
-  // Wipe every live number the sidebar paints (symbol dropdown, market watch,
-  // commodity watch, chart P&L). Called when the link monitor reports the feed
-  // down, so a frozen LTP can never be mistaken for a live one.
-  function clearLiveQuotes() {
-    const sel = $("symbolSelect");
-    if (sel) {
-      for (let _i = 0; _i < sel.options.length; _i++) {
-        const opt = sel.options[_i];
-        opt.textContent = opt.getAttribute("data-symbol-name") || opt.textContent.split("  ")[0];
-      }
-    }
-    document
-      .querySelectorAll(
-        "#marketWatch .mw-ltp, #marketWatch .mw-chg, #commodityWatch .mw-ltp, #commodityWatch .mw-chg"
-      )
-      .forEach((el) => {
-        el.textContent = "--";
-        el.classList.remove("up", "down");
-      });
-    const pnl = $("chartPnL");
-    if (pnl) pnl.innerHTML = "";
-    const tp = $("chartTradePnl");
-    if (tp) tp.innerHTML = "";
-    if (window.__chartSelection) window.__chartSelection.ltp = 0;
-  }
-
   function render() {
-    // While the Dhan link is down the server may still re-push its last cached
-    // quote; ignore it and keep the panels blank instead of painting stale data.
-    if (window.__feedDown) {
-      clearLiveQuotes();
-      return;
-    }
+    // While the feed is not live, keep the last fetched LTP / day-change frozen
+    // on screen (no repaint from cached, REST or daily-candle data). Painting
+    // resumes on the next tick once the link is live again.
+    if (window.__feedDown) return;
     const qm = state.quotes;
     publishSelection(qm);
     const sel = $("symbolSelect");
@@ -650,9 +622,7 @@ export function bootSidebar(api) {
     // The link monitor broadcasts every feed-state change. When it goes down the
     // panels are blanked immediately; a fresh /ws push repaints them once live.
     window.addEventListener("dhan-link", (ev) => {
-      const down = !!(ev.detail && ev.detail.alarm);
-      window.__feedDown = down;
-      if (down) clearLiveQuotes();
+      window.__feedDown = !(ev.detail && ev.detail.live);
     });
   }
 

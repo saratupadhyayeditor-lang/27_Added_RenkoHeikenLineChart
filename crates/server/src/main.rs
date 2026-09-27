@@ -70,6 +70,9 @@ async fn candles_post(
     State(st): State<DhanState>,
     Json(req): Json<CandleReq>,
 ) -> impl IntoResponse {
+    // Operator-facing request: let the background pollers stand down so the
+    // chart gets Dhan's single ~1/s data slot immediately.
+    st.mark_user_activity();
     let tf = if req.timeframe.is_empty() {
         "5min"
     } else {

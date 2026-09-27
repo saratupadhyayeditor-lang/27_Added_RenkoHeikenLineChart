@@ -31,6 +31,7 @@ const API = {
   final: () => get("/api/rt/final"),
   finalSet: (v) => post("/api/rt/final", v),
   container: () => get("/api/rt/container"),
+  stats: (range) => get("/api/rt/stats?range=" + encodeURIComponent(range || "today")),
   settings: (v) => post("/api/rt/settings", v),
   method: (v) => post("/api/rt/method", v),
   strategySave: (v) => post("/api/rt/strategies", v),
@@ -132,6 +133,13 @@ let closedLoadedAt = 0;
 // underlying data has not changed since the last paint.
 let closedRenderSig = "";
 let logRenderSig = "";
+// Day-scoped P&L summary for the engine panes: the summary strip shows TODAY
+// only, while the full history lives in the Trade Stats tabs. Loaded on a
+// throttle (and whenever a trade closes), never on the 1s poll.
+let DAY_STATS = null;
+let dayStatsAt = 0;
+let dayStatsSig = "";
+let dayStatsLoading = false;
 let scannerPollAt = 0;
 const CLOSED_SNAPSHOT_SLICE = 100;
 let CATALOG = { indicators: [], timeframes: [], symbols: [] };
@@ -1323,10 +1331,9 @@ function optField(x) {
 // row and is written to the enabled method's `order_cfg`, which `open_entry` reads.
 function methodChipHTML(m) {
   const isSel = m.key === activeMethod;
-  return `<label class="rtom-chip" data-key="${m.key}" title="${esc(m.desc)} (${esc(m.sdk)})"
+  return `<label class="rtom-chip${isSel ? " sel" : ""}" data-key="${m.key}" title="${esc(m.desc)} (${esc(m.sdk)})"
     style="display:flex;align-items:center;gap:7px;font-size:13px;font-weight:700;cursor:pointer;
-    border:1px solid ${isSel ? "#b39ddb" : "#2d2d50"};background:${isSel ? "#1a1a30" : "#101024"};
-    color:${isSel ? "#e6d8ff" : "#999"};border-radius:5px;padding:6px 12px">
+    border-radius:5px;padding:6px 12px">
     <input type="checkbox" class="rtom-enable" data-key="${m.key}"${isSel ? " checked" : ""} style="accent-color:#b39ddb;width:16px;height:16px"> ${esc(m.name)}
     <span style="font-size:10px;color:#777;font-weight:400">${esc(m.sdk)}</span></label>`;
 }
@@ -2097,30 +2104,34 @@ function renderSnapshot(s) {
   // apply settings to the engine-control checkboxes/inputs
   applySettingsToDom(s.settings);
 
-  // Smart P&L summary (old app `renderSummary`): live gross P&L, realized P&L,
-  // win rate, W/L counts and banked charges, read straight from the Rust-computed
-  // `stats` (full closed ledger, never the capped snapshot page), plus Reset.
+  // Smart P&L summary: the engine panes show TODAY ONLY - the full history lives
+  // in the Trade Stats tabs. `st` is the all-time closed book used only as a
+  // fallback until the day-scoped (`range=today`) stats land; once DAY_STATS is
+  // available it drives realized / win-rate / trade counts / charges. Live gross
+  // P&L stays today's realized plus the currently open (unrealized) book.
   const st = s.stats || {};
+  const day = DAY_STATS;
   const sum = document.getElementById("rtSummary");
   if (sum) {
-    const total = num(st.total);
-    const wins = num(st.wins);
-    const losses = Math.max(0, total - wins);
-    const live = num(st.net);
-    const realized = num(st.realized);
+    const total = day && day.n != null ? num(day.n) : num(st.total);
+    const wins = day && day.wins != null ? num(day.wins) : num(st.wins);
+    const losses = day && day.losses != null ? num(day.losses) : Math.max(0, total - wins);
+    const realized = day && day.net != null ? num(day.net) : num(st.realized);
+    const unrealized = num(st.unrealized);
+    const live = realized + unrealized;
     const wr = total ? (wins / total) * 100 : 0;
-    const charges = num(st.charges);
+    const charges = day && day.charges != null ? num(day.charges) : num(st.charges);
     const chOn = !!st.chargesOn;
     const card = (label, val, color) =>
       `<div style="flex:1;min-width:130px;border:1px solid #1e1e40;border-radius:4px;background:#12122a;padding:5px 9px">` +
       `<div style="font-size:9px;color:#888;white-space:nowrap">${label}</div>` +
       `<div style="font-size:14px;font-weight:700;color:${color};white-space:nowrap">${val}</div></div>`;
     sum.innerHTML = [
-      card("Smart Live P&L (gross)", (live >= 0 ? "+" : "-") + fmtMoney(Math.abs(live)), live >= 0 ? "#00d4aa" : "#ef5350"),
-      card("Smart Realized P&L", (realized >= 0 ? "+" : "-") + fmtMoney(Math.abs(realized)), realized >= 0 ? "#00d4aa" : "#ef5350"),
-      card("Smart Win Rate", wr.toFixed(2) + "%", wr >= 50 ? "#00d4aa" : "#ff9800"),
-      card("Smart Trades (W/L)", `${total} (${wins}W / ${losses}L)`, "#d0d0d0"),
-      card("Smart Charges", (chOn ? "-" : "") + fmtMoney(charges), "#ff9800"),
+      card("Smart Live P&L (Today)", (live >= 0 ? "+" : "-") + fmtMoney(Math.abs(live)), live >= 0 ? "#00d4aa" : "#ef5350"),
+      card("Smart Realized P&L (Today)", (realized >= 0 ? "+" : "-") + fmtMoney(Math.abs(realized)), realized >= 0 ? "#00d4aa" : "#ef5350"),
+      card("Today Win Rate", wr.toFixed(2) + "%", wr >= 50 ? "#00d4aa" : "#ff9800"),
+      card("Today Trades (W/L)", `${total} (${wins}W / ${losses}L)`, "#d0d0d0"),
+      card("Today Charges", (chOn ? "-" : "") + fmtMoney(charges), "#ff9800"),
       `<div style="flex:0 0 auto;display:flex;align-items:center;padding:2px">` +
         `<button class="btn-action warn" data-smartreset="1" style="width:auto;padding:7px 14px;margin:0;font-size:10px" ` +
         `title="Sab Smart P&L zero karo: closed trades + logs${PAPER ? " + open paper positions" : ""} clear ho jayenge. Undo nahi hoga.">Reset</button></div>`,
@@ -2149,6 +2160,9 @@ function renderSnapshot(s) {
   // old `!==` test re-fetched the whole multi-MB ledger every second whenever the
   // two briefly disagreed, which alone could freeze the pane.
   else if (closedTotal != null && (!CLOSED_CACHE || CLOSED_CACHE.length < closedTotal)) loadClosed();
+  // Keep the TODAY-only summary fresh: reload day stats whenever the closed
+  // count moves (or on the slow throttle inside loadDayStats).
+  loadDayStats(closedTotal);
   renderHoldings(s);
   loadPool();
   loadScanners();
@@ -3329,8 +3343,11 @@ function syncAstToggles(s) {
     b.disabled = !!blocked;
     b.style.pointerEvents = blocked ? "none" : "";
     b.style.cursor = blocked ? "not-allowed" : "";
-    b.style.background = blocked ? "#666" : on ? "#124a2a" : "";
-    b.style.color = blocked ? "#ccc" : on ? "#7CFFB2" : "";
+    b.classList.toggle("on", !blocked && on);
+    b.classList.toggle("off", !blocked && !on);
+    b.classList.toggle("blocked", !!blocked);
+    b.style.background = "";
+    b.style.color = "";
     b.style.opacity = blocked ? "0.5" : "1";
   };
   // Manual Strike Select makes every automatic scanner universe inactive, so the
@@ -4324,6 +4341,28 @@ async function loadClosed() {
   }
 }
 
+// Day-scoped stats (`range=today`) feeding the engine summary strip. Re-pulled
+// when the closed-trade count moves and at most every 15s otherwise, so the
+// summary stays "today only" without hammering the stats endpoint each second.
+async function loadDayStats(closedCount) {
+  const sig = String(num(closedCount));
+  if (dayStatsLoading) return;
+  if (DAY_STATS && sig === dayStatsSig && Date.now() - dayStatsAt < 15000) return;
+  dayStatsLoading = true;
+  dayStatsAt = Date.now();
+  try {
+    const r = await API.stats("today");
+    if (r && r.stats) {
+      DAY_STATS = r.stats;
+      dayStatsSig = sig;
+    }
+  } catch (e) {
+    console.warn("day stats load failed", e);
+  } finally {
+    dayStatsLoading = false;
+  }
+}
+
 function active() {
   const e = document.getElementById("tab-realtime");
   return !!e && e.classList.contains("active");
@@ -4484,9 +4523,14 @@ function applyLink(state, info) {
 
   // Let the sidebar blank its panels while the link is down (and stop repainting
   // them from the server's last cached quote).
-  window.__feedDown = isAlarm;
+  // Paint the sidebar while the feed is streaming (live) or the session is up
+  // but the exchange is shut (closed), so a closed market still shows each
+  // symbol's previous close / daily change. Offline / down / connecting freeze
+  // the last painted values instead.
+  const paintOk = state === "live" || state === "closed";
+  window.__feedDown = !paintOk;
   try {
-    window.dispatchEvent(new CustomEvent("dhan-link", { detail: { state, alarm: isAlarm, info } }));
+    window.dispatchEvent(new CustomEvent("dhan-link", { detail: { state, live: paintOk, alarm: isAlarm, info } }));
   } catch (e) {
     /* CustomEvent unavailable: non-fatal */
   }
@@ -4628,11 +4672,43 @@ function bootLinkMonitor() {
   });
 }
 
+// [accent, solid bg, edge, readable text] per section. Cycled across the engine
+// rows so every section gets its own flat colour, ribbon and text hue.
+const SECTION_COLORS = [
+  ["#38bdf8", "#0f2433", "#1f4a63", "#e6eaf5"],
+  ["#fbbf24", "#2a2314", "#57491f", "#e6eaf5"],
+  ["#34d399", "#0f2a20", "#215340", "#e6eaf5"],
+  ["#a78bfa", "#1b1830", "#3a3160", "#e6eaf5"],
+  ["#f472b6", "#2a1626", "#552a48", "#e6eaf5"],
+  ["#fb7185", "#2b1620", "#582936", "#e6eaf5"],
+  ["#22d3ee", "#0e2530", "#1f4c5e", "#e6eaf5"],
+  ["#a3e635", "#1f2a14", "#3c5228", "#e6eaf5"],
+  ["#fb923c", "#2b1d12", "#573a22", "#e6eaf5"],
+  ["#e879f9", "#271733", "#502c66", "#e6eaf5"],
+  ["#2dd4bf", "#0e2a26", "#1f544b", "#e6eaf5"],
+  ["#60a5fa", "#141d31", "#293a5a", "#e6eaf5"],
+];
+
+function paintSections() {
+  const rt = document.getElementById("tab-realtime");
+  if (!rt) return;
+  const paint = (el, i) => {
+    const c = SECTION_COLORS[i % SECTION_COLORS.length];
+    el.style.setProperty("--sec-accent", c[0]);
+    el.style.setProperty("--sec-bg", c[1]);
+    el.style.setProperty("--sec-edge", c[2]);
+    el.style.setProperty("--sec-text", c[3]);
+  };
+  rt.querySelectorAll(".rt-engine-row").forEach(paint);
+  rt.querySelectorAll(".account-section").forEach((sec, i) => paint(sec, i + 3));
+}
+
 export function bootRealtime() {
   if (booted) return;
   booted = true;
   style();
   shell();
+  paintSections();
   bootLinkMonitor();
   loadCatalog();
   refresh();

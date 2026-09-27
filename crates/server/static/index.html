@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Dhan Algo Trading System - Rust</title>
-<link rel="stylesheet" href="./app.css?v=3">
+<link rel="stylesheet" href="./app.css?v=13">
 </head>
 <body>
 <div class="app">
@@ -20,6 +20,11 @@
     <label class="conn-check" title="Automatically reset the feed when it stalls (no ticks for 45s)"><input type="checkbox" id="autoResetFeed"> Auto Reset</label>
     <span id="feedStatus" title="Live feed diagnostics"></span>
     <span id="status" class="error">Disconnected</span>
+    <label class="textsize-ctl" title="Text size: scroll the mouse wheel over the box, use the arrows, or type a value (60-200%). Scales the whole app.">
+      <span>Text</span>
+      <input type="number" id="textSizeInput" min="60" max="200" step="5" value="100" inputmode="numeric">
+      <span>%</span>
+    </label>
     <div class="tabs">
       <button class="tab-btn active" data-tab="chart">Candlestick Chart</button>
       <button class="tab-btn" data-tab="optionchain">Option Chain</button>
@@ -240,21 +245,26 @@
 <script src="./vendor/chart.umd.min.js"></script>
 <script type="module">
   import init, { select_symbol, update_oc_quotes, open_option_chart_by_sid, set_oi_trend_enabled, set_trade_lines, clear_trade_lines } from "./pkg/algo_web.js?v=55";
-  import { bootSidebar } from "./sidebar.js?v=16";
+  import { bootSidebar } from "./sidebar.js?v=18";
   import { bootConnection } from "./connection.js?v=9";
-  import { bootRealtime } from "./realtime.js?v=69";
+  import { bootRealtime } from "./realtime.js?v=79";
   import { bootRtStats } from "./rtstats.js?v=5";
   import { bootBackup } from "./backup.js?v=3";
   import { bootAccount } from "./account.js?v=2";
   import { bootUpdater } from "./updater.js?v=1";
+  import { bootTheme } from "./theme.js?v=4";
+  import { bootTextSize } from "./textsize.js?v=1";
   bootConnection();
   bootUpdater();
+  bootTheme();
+  bootTextSize();
   // Generic tab switcher: clicking a tab button activates its matching
   // .tab-content pane and notifies modules so they can refresh.
   document.querySelectorAll(".tab-btn[data-tab]").forEach((btn) => {
     btn.addEventListener("click", () => {
       if (btn.classList.contains("disabled")) return;
       const t = btn.getAttribute("data-tab");
+      document.body.setAttribute("data-tab", t);
       document.querySelectorAll(".tab-btn[data-tab]").forEach((b) =>
         b.classList.toggle("active", b === btn));
       document.querySelectorAll(".tab-content").forEach((c) =>
@@ -267,6 +277,9 @@
       document.dispatchEvent(new CustomEvent("tabshown", { detail: t }));
     });
   });
+  // Sync the accent colour to whichever tab is active on first load.
+  const bootTab = document.querySelector(".tab-btn.active[data-tab]");
+  if (bootTab) document.body.setAttribute("data-tab", bootTab.getAttribute("data-tab"));
   // Isolated paper panes (Paper Trade + Paper Trade Stats): load each on first
   // open so an unused paper engine costs nothing until the operator visits it.
   // Frames also self-gate their polling to real layout visibility, so a loaded

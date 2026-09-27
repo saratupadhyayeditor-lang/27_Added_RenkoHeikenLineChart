@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Trade Stats - Dhan Algo</title>
-<link rel="stylesheet" href="./app.css?v=2">
+<link rel="stylesheet" href="./app.css?v=13">
 <style>
   body { display: flex; flex-direction: column; height: 100%; }
   .paper-banner {
@@ -18,7 +18,7 @@
   #tab-rtstats { overflow-y: auto; }
 </style>
 </head>
-<body>
+<body data-tab="paperstats">
 <div class="paper-banner">
   <b>Trade Stats</b>
   <span>Executed-trades report for the paper engines: every entry/exit here is a simulated fill booked locally - no real orders are ever sent.</span>
@@ -54,7 +54,11 @@
 </script>
 <script type="module">
   import { bootRtStats } from "./rtstats.js?v=5";
+  import { bootTheme } from "./theme.js?v=4";
+  import { bootTextSize } from "./textsize.js?v=1";
   bootRtStats();
+  bootTheme();
+  bootTextSize();
   const head = document.querySelector("#tab-rtstats .rs-toolbar h3");
   if (head) head.textContent = "Paper Trade Executed Trades Report";
   const desc = document.querySelector("#tab-rtstats .rs-toolbar span");

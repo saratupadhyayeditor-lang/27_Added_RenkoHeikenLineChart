@@ -131,6 +131,13 @@ pub struct DhanState {
     /// importantly, lets a transient Dhan error (DH-906 token refresh / 429
     /// rate limit) serve the previous bars instead of blanking the chart.
     candle_cache: Arc<Mutex<HashMap<String, (Instant, Vec<Candle>)>>>,
+    /// Monotonic time of the last operator-facing data request (chart candles,
+    /// option chain, sidebar quotes). Every Dhan call shares one ~1/s slot, so
+    /// the background pollers (account / movers / NIFTY scan / prev-close seeds)
+    /// read this and skip their cycle while it is fresh - the operator's click
+    /// then waits at most for the one in-flight call instead of queueing behind
+    /// a wall of scanner fetches.
+    last_user: Arc<Mutex<Instant>>,
 }
 
 impl DhanState {
@@ -150,6 +157,7 @@ impl DhanState {
             feed_tx: Arc::new(Mutex::new(None)),
             closes: Arc::new(Mutex::new(HashMap::new())),
             candle_cache: Arc::new(Mutex::new(HashMap::new())),
+            last_user: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
         };
         st.spawn_daily_fill();
         st.spawn_seed_prev_close();
@@ -269,6 +277,40 @@ impl DhanState {
         self.health.lock().map(|g| g.feed_up).unwrap_or(false)
     }
 
+    /// True only while the broker socket is streaming AND a tick landed within
+    /// the last 15s. This is the single gate the sidebar refresh, the previous
+    /// close backfill and the trading engine use, so cached / REST / historical
+    /// values can never be acted on while the live feed is silent, closed or
+    /// disconnected.
+    pub fn feed_live(&self) -> bool {
+        let Ok(g) = self.health.lock() else {
+            return false;
+        };
+        g.feed_up
+            && g.last_tick
+                .map(|t| t.elapsed().as_secs_f64() < 15.0)
+                .unwrap_or(false)
+    }
+
+    /// Record an operator-facing data request (chart candles / option chain /
+    /// sidebar quotes) so the background pollers yield Dhan's single data slot
+    /// to it for the next moment.
+    pub fn mark_user_activity(&self) {
+        if let Ok(mut g) = self.last_user.lock() {
+            *g = Instant::now();
+        }
+    }
+
+    /// True while an operator-facing data request arrived within the last
+    /// ~1.8s. Background pollers return early while this holds; the 100ms engine
+    /// tick re-checks, so they resume the instant the operator goes quiet.
+    pub fn user_active(&self) -> bool {
+        self.last_user
+            .lock()
+            .map(|g| g.elapsed() < Duration::from_millis(1800))
+            .unwrap_or(false)
+    }
+
     /// Serialised, rate-limited Dhan REST call gate (shared with the chart).
     /// This is the QUOTE slot (marketfeed quote / ltp) at ~1/s.
     pub async fn dhan_throttle(&self) {
@@ -321,8 +363,10 @@ impl DhanState {
             inst.to_uppercase()
         );
         // A just-fetched series serves the chart, the engine scanners and the
-        // data pool without a second Dhan call.
-        if let Some(fresh) = self.cached_candles(&key, Duration::from_secs(2)) {
+        // data pool without a second Dhan call. 4s window so a symbol switch
+        // back and forth (and the chart's own reload) reuses the last bars
+        // instead of spending another 1/s data slot.
+        if let Some(fresh) = self.cached_candles(&key, Duration::from_secs(4)) {
             return Ok(fresh);
         }
         let client = self.client().await.ok_or(DhanError::NotConnected)?;
@@ -791,8 +835,17 @@ impl DhanState {
         // 12s) so most symbols are already filled and we never flood Dhan.
         tokio::time::sleep(Duration::from_secs(12)).await;
         loop {
+            // Seed as long as a Dhan session exists - a closed market must still
+            // show each symbol's previous close / daily change. A disconnected
+            // (no-session) state stops this, so nothing is seeded while offline.
             if self.client().await.is_none() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            // Yield Dhan's single data slot while the operator is interacting
+            // (chart / option chain / quotes), then resume this pass.
+            if self.user_active() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
             let mut list = self.watch.lock().map(|g| g.clone()).unwrap_or_default();
@@ -913,8 +966,16 @@ impl DhanState {
         // Let the session settle before the first call.
         tokio::time::sleep(Duration::from_secs(3)).await;
         loop {
+            // Refresh the previous close as long as a Dhan session exists, so a
+            // closed market still shows history. Offline (no session) stops it.
             if self.client().await.is_none() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            // Yield Dhan's single data slot while the operator is interacting
+            // (chart / option chain / quotes), then resume this pass.
+            if self.user_active() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
             let mut list = self.watch.lock().map(|g| g.clone()).unwrap_or_default();

@@ -51,6 +51,15 @@
   #status.ok { color: var(--green); }
   #status.warn { color: #ff9800; }
   #status.error { color: var(--red); }
+  .textsize-ctl {
+    display: inline-flex; align-items: center; gap: 3px; margin-left: auto;
+    font-size: 10px; color: var(--muted); white-space: nowrap;
+  }
+  .textsize-ctl input {
+    width: 52px; background: #0b0b1a; border: 1px solid var(--border2);
+    color: var(--fg); border-radius: 3px; padding: 2px 4px; font-size: 11px;
+    text-align: center; cursor: ns-resize;
+  }
   .conn-check {
     font-size: 10px; color: var(--muted); white-space: nowrap; cursor: pointer;
     display: inline-flex; align-items: center; gap: 3px;
@@ -376,4 +385,317 @@
     letter-spacing: 1px; text-align: center; padding: 16px;
   }
   #rtLinkVeil.show { display: flex; }
+
+  /* =================================================================== */
+  /* Colorful theme: every tab and its sections get their own accent      */
+  /* =================================================================== */
+  :root {
+    --tab-accent: #a78bfa;
+    --c-sky: #38bdf8;
+    --c-teal: #2dd4bf;
+    --c-emerald: #34d399;
+    --c-violet: #a78bfa;
+    --c-fuchsia: #e879f9;
+    --c-pink: #f472b6;
+    --c-rose: #fb7185;
+    --c-amber: #fbbf24;
+    --c-orange: #fb923c;
+    --c-cyan: #22d3ee;
+    --c-lime: #a3e635;
+  }
+
+  /* --- One colour per tab button --- */
+  .tabs { gap: 6px; }
+  .tab-btn {
+    background: #101024; color: var(--tc, #a9a9c8);
+    border-color: #24244a; border-left: 3px solid var(--tc, #2d2d50);
+    transition: background .15s, color .15s, box-shadow .15s, transform .06s;
+  }
+  .tab-btn:hover { background: #1a1a38; color: #fff; box-shadow: 0 0 10px -3px var(--tc); }
+  .tab-btn:active { transform: translateY(1px); }
+  .tab-btn.active {
+    background: var(--tc, #2d2d5e); color: #0a0a18; font-weight: 700;
+    border-color: var(--tc, #3d3d7e); border-left-color: var(--tc, #3d3d7e);
+    box-shadow: 0 0 14px -2px var(--tc);
+  }
+  .tab-btn[data-tab="chart"]       { --tc: var(--c-sky); }
+  .tab-btn[data-tab="optionchain"] { --tc: var(--c-teal); }
+  .tab-btn[data-tab="account"]     { --tc: var(--c-amber); }
+  .tab-btn[data-tab="realtime"]    { --tc: var(--c-violet); }
+  .tab-btn[data-tab="papertrade"]  { --tc: var(--c-fuchsia); }
+  .tab-btn[data-tab="rtstats"]     { --tc: var(--c-rose); }
+  .tab-btn[data-tab="paperstats"]  { --tc: var(--c-cyan); }
+  .tab-btn[data-tab="backup"]      { --tc: var(--c-emerald); }
+  .tab-btn[data-tab="updater"]     { --tc: var(--c-orange); }
+
+  /* --- Active pane accent --- */
+  body[data-tab="chart"]       { --tab-accent: var(--c-sky); }
+  body[data-tab="optionchain"] { --tab-accent: var(--c-teal); }
+  body[data-tab="account"]     { --tab-accent: var(--c-amber); }
+  body[data-tab="realtime"]    { --tab-accent: var(--c-violet); }
+  body[data-tab="papertrade"]  { --tab-accent: var(--c-fuchsia); }
+  body[data-tab="rtstats"]     { --tab-accent: var(--c-rose); }
+  body[data-tab="paperstats"]  { --tab-accent: var(--c-cyan); }
+  body[data-tab="backup"]      { --tab-accent: var(--c-emerald); }
+  body[data-tab="updater"]     { --tab-accent: var(--c-orange); }
+
+  .tab-content.active { border-top: 2px solid var(--tab-accent); }
+
+  /* --- Section headings adopt the tab accent --- */
+  body #tab-realtime .rt-title,
+  body #tab-account .account-section h3,
+  body #tab-backup h3, body #tab-backup h4 { color: var(--tab-accent); }
+
+  /* --- Realtime engine rows: per-section ribbon + accent cap --- */
+  #tab-realtime div.rt-engine-row {
+    box-shadow: inset 3px 0 0 0 var(--sec-accent, #2d2d50);
+  }
+  #tab-realtime div.rt-engine-row b.rt-cap { color: var(--sec-accent, #ffd700); }
+  body #tab-realtime div.rt-strip { border-left: 3px solid var(--tab-accent); }
+
+  /* --- Account tab cards --- */
+  .account-cards .acard:nth-child(1) { border-top: 3px solid var(--c-sky); }
+  .account-cards .acard:nth-child(2) { border-top: 3px solid var(--c-amber); }
+  .account-cards .acard:nth-child(3) { border-top: 3px solid var(--c-violet); }
+  .account-cards .acard:nth-child(4) { border-top: 3px solid var(--c-emerald); }
+
+  /* --- Option chain header accent --- */
+  #tab-optionchain table thead th { border-bottom-color: var(--tab-accent); }
+
+  /* --- Buttons glow with the active tab accent --- */
+  .btn-action:hover { filter: brightness(1.15); box-shadow: 0 0 10px -3px var(--tab-accent); }
+
+  /* =================================================================== */
+  /* Refined theme: cohesive dark neutral base + one accent per tab, with  */
+  /* a subtle colour-tinted surface per section and high-contrast text.     */
+  /* theme.js assigns --sec-*; realtime.js paints each engine row.          */
+  /* =================================================================== */
+  :root {
+    --bg: #0a0d15; --panel: #111725; --panel2: #161d2e;
+    --border: #222b40; --border2: #33405c;
+    --fg: #e6eaf5; --muted: #94a0bd; --green: #34d399; --red: #f26b6b;
+    --tab-accent: #60a5fa; --tab-bg: #141d31; --tab-edge: #293a5a; --tab-text: #e6eaf5;
+  }
+  body[data-tab="chart"]       { --tab-accent:#38bdf8; --tab-bg:#0f2433; --tab-edge:#1f4a63; --tab-text:#e6eaf5; }
+  body[data-tab="optionchain"] { --tab-accent:#2dd4bf; --tab-bg:#0e2a26; --tab-edge:#1f544b; --tab-text:#e6eaf5; }
+  body[data-tab="account"]     { --tab-accent:#fbbf24; --tab-bg:#2a2314; --tab-edge:#57491f; --tab-text:#e6eaf5; }
+  body[data-tab="realtime"]    { --tab-accent:#a78bfa; --tab-bg:#1b1830; --tab-edge:#3a3160; --tab-text:#e6eaf5; }
+  body[data-tab="papertrade"]  { --tab-accent:#e879f9; --tab-bg:#271733; --tab-edge:#502c66; --tab-text:#e6eaf5; }
+  body[data-tab="rtstats"]     { --tab-accent:#fb7185; --tab-bg:#2b1620; --tab-edge:#582936; --tab-text:#e6eaf5; }
+  body[data-tab="paperstats"]  { --tab-accent:#22d3ee; --tab-bg:#0e2530; --tab-edge:#1f4c5e; --tab-text:#e6eaf5; }
+  body[data-tab="backup"]      { --tab-accent:#34d399; --tab-bg:#0f2a20; --tab-edge:#215340; --tab-text:#e6eaf5; }
+  body[data-tab="updater"]     { --tab-accent:#fb923c; --tab-bg:#2b1d12; --tab-edge:#573a22; --tab-text:#e6eaf5; }
+
+  /* --- App shell + topbar --- */
+  html, body { background: var(--bg) !important; color: var(--fg) !important; }
+  .app { background: var(--bg) !important; }
+  .topbar { background: #0e1320 !important; border-bottom: 1px solid var(--tab-edge) !important; }
+  .topbar .brand { color: var(--tab-accent) !important; }
+
+  /* --- Surfaces: subtle colour-tinted dark + high-contrast text --- */
+  #sidebar, .ind-section, .account-section, .monitor-toolbar, #rtOrderMethods,
+  .chart-toolbar, .oc-toolbar, .account-toolbar, #oc-chart-container, .pane-box,
+  .oc-all-block, .mw-cat, .acard, .widget, .card, .pane-head, .mw-head, .mw-subhead,
+  .ind-section-head, .oc-all-head, .pane-alertbox, .rs-chart, .rt-strip, .paper-banner {
+    background: var(--sec-bg, var(--tab-bg)) !important;
+    color: var(--sec-text, var(--tab-text)) !important;
+    border-color: var(--sec-edge, var(--tab-edge)) !important;
+  }
+  .ind-menu, .ind-settings, #rtDialog, #rtSummary > div, #rtMarginBar {
+    background: var(--panel) !important; color: var(--fg) !important;
+    border-color: var(--border) !important;
+  }
+  .chart-toolbar, .oc-toolbar, .account-toolbar { border-bottom: 1px solid var(--sec-edge, var(--tab-edge)) !important; }
+
+  /* --- Titles: bright per-section accent colour --- */
+  h1, h2, h3, h4, h5, h6,
+  .rt-title, .oc-all-head, .pane-head .pane-name, .mw-head, .rs-chart-title,
+  .ind-section-title, #sidebar h3, .acard .label {
+    color: var(--sec-accent, var(--tab-accent)) !important;
+  }
+  /* --- Structural labels: high-contrast light text (never faded) --- */
+  .account-status, .oc-ts, #ocInstrumentInfo, .oc-status, .oc-upd, .oc-empty,
+  .ind-section-hint, .legend-note, .set-row, .rtom-f, .leg-item, .leg-val,
+  .leg-name, .mw-name, .mw-ltp, .ind-item, .rt-log, .rt-dialog-title, .rt-dialog-msg,
+  .conn-label, #feedStatus, .account-empty, .acard .value.white,
+  .paper-banner b, .paper-banner span {
+    color: var(--sec-text, var(--fg)) !important;
+  }
+
+  /* --- Lift dim inline greys to readable light text --- */
+  body [style*="color:#666"], body [style*="color:#888"], body [style*="color:#aaa"],
+  body [style*="color:#555"], body [style*="color:#777"], body [style*="color:#bbb"],
+  body [style*="color:#ccc"], body [style*="color:#d0d0d0"], body [style*="color:#e0e0e0"],
+  body [style*="color:#cfcfe6"], body [style*="color:#9a9ac0"], body [style*="color:#8888b8"],
+  body [style*="color:#c9c9e0"], body [style*="color:#8aa0c0"], body [style*="color:#8ab4ff"],
+  body [style*="color:#c4a9ff"], body [style*="color:#b39ddb"], body [style*="color:#66ccff"],
+  body [style*="color:#eaeaf5"], body [style*="color:#d3d3ee"], body [style*="color:#9aa3b2"],
+  body [style*="color:#c8a0ff"], body [style*="color:#b8b8c8"], body [style*="color:#bfbfd8"],
+  body [style*="color:#c0c0d8"], body [style*="color:#e6e6ff"] {
+    color: var(--sec-text, var(--fg)) !important;
+  }
+
+  /* --- Tables --- */
+  .account-table th, table.oc-table thead th, #tab-rtstats .rs-table th {
+    background: rgba(255,255,255,.05) !important;
+    color: var(--sec-accent, var(--tab-accent)) !important;
+    border-bottom: 1px solid var(--sec-edge, var(--tab-edge)) !important; }
+  .account-table td, table.oc-table td { border-bottom-color: rgba(255,255,255,.08) !important; color: inherit; }
+  .account-table tbody tr:nth-child(even), table.oc-table tbody tr:nth-child(even),
+  #tab-rtstats .rs-table tbody tr:nth-child(even) { background: rgba(255,255,255,.03) !important; }
+  .account-table tr:hover td, table.oc-table tr:hover td { background: rgba(255,255,255,.07) !important; }
+  table.oc-table tr.atm { background: rgba(255,255,255,.09) !important; }
+  table.oc-table td.strike { background: rgba(255,255,255,.06) !important; color: var(--sec-accent, var(--tab-accent)) !important; }
+  .mw-row:hover { background: rgba(255,255,255,.07) !important; }
+  .mw-row.sel { background: var(--sec-bg, var(--tab-bg)) !important; color: var(--sec-text, var(--fg)) !important; }
+
+  /* --- Inputs / selects / checkboxes --- */
+  input:not([type=checkbox]):not([type=color]):not([type=range]), select, textarea {
+    background: #0e1422 !important; border: 1px solid var(--border2) !important;
+    color: var(--fg) !important; border-radius: 6px; }
+  input:not([type=checkbox]):not([type=color]):not([type=range]):focus,
+  select:focus, textarea:focus {
+    outline: none !important; border-color: var(--sec-accent, var(--tab-accent)) !important;
+    box-shadow: 0 0 0 2px rgba(96,165,250,.20); }
+  input[type=checkbox], input[type=range] { accent-color: var(--sec-accent, var(--tab-accent)); }
+
+  /* --- Realtime engine rows: tinted surface + accent ribbon --- */
+  #tab-realtime div.rt-engine-row {
+    background: var(--sec-bg, var(--tab-bg)) !important;
+    color: var(--sec-text, var(--fg)) !important;
+    border-color: var(--sec-edge, var(--tab-edge)) !important;
+    box-shadow: inset 3px 0 0 0 var(--sec-accent, var(--tab-accent)); }
+  #tab-realtime div.rt-engine-row b.rt-cap { color: var(--sec-accent, var(--tab-accent)) !important; }
+  #tab-realtime .rt-scroll { border-color: var(--sec-edge, var(--tab-edge)) !important; }
+
+  /* --- Pills / chips / badges --- */
+  .rt-pill { background: rgba(255,255,255,.08) !important; border: 1px solid var(--border2) !important; color: var(--sec-text, var(--fg)) !important; }
+  .rt-pill.on { background: #14532d !important; border-color: #16a34a !important; color: #86efac !important; }
+  .rt-pill.off { background: #4c1111 !important; border-color: #b91c1c !important; color: #fca5a5 !important; }
+  .rt-pill.armed { background: #4a3410 !important; border-color: #d97706 !important; color: #fcd34d !important; }
+  .rt-badge { background: rgba(255,255,255,.08) !important; color: var(--sec-accent, var(--tab-accent)) !important; }
+  .mw-count, .mw-subcount { background: rgba(255,255,255,.08) !important; color: var(--sec-accent, var(--tab-accent)) !important; }
+  .oc-lot { color: #fcd34d !important; }
+
+  /* --- Controls: understated buttons, accent on hover --- */
+  .btn-action, .tf-btn, .mw-mini-btn, .set-btn, .oc-chart-btn, #goAtmBtn,
+  #btnBestCombo, .rs-chip, .set-btn.muted {
+    background: rgba(255,255,255,.06) !important; border: 1px solid var(--border2) !important;
+    color: var(--fg) !important; border-radius: 6px;
+    transition: background .15s, border-color .15s, color .15s; }
+  .btn-action:hover, .tf-btn:hover, .mw-mini-btn:hover, .set-btn:hover,
+  #goAtmBtn:hover, .rs-chip:hover {
+    background: rgba(255,255,255,.12) !important;
+    border-color: var(--sec-accent, var(--tab-accent)) !important;
+    color: var(--sec-accent, var(--tab-accent)) !important; }
+  .btn-action.warn { background: #4c1111 !important; border-color: #b91c1c !important; color: #fca5a5 !important; }
+  .tf-btn.active { background: var(--sec-accent, var(--tab-accent)) !important; color: #0a0d15 !important; border-color: var(--sec-accent, var(--tab-accent)) !important; }
+  .btn-connect { background: #14532d !important; color: #86efac !important; border-color: #16a34a !important; }
+  .btn-reset { background: #4c1111 !important; color: #fca5a5 !important; border-color: #b91c1c !important; }
+
+  /* --- Tab buttons: dark tinted, accent underline, accent active --- */
+  .tab-btn { background: var(--tab-bg) !important; color: var(--fg) !important; border-color: transparent !important; }
+  .tab-btn[data-tab] { border-left: 3px solid var(--tc, var(--tab-edge)) !important; }
+  .tab-btn:hover { background: var(--panel2) !important; color: var(--tc, var(--tab-accent)) !important; }
+  .tab-btn.active { background: var(--tc, var(--tab-accent)) !important; color: #0a0d15 !important; border-color: var(--tc, var(--tab-accent)) !important; }
+
+  /* --- Legend + small labels --- */
+  .leg-name:hover, .leg-btn:hover, .mw-head:hover { color: var(--tab-accent) !important; }
+
+  /* =================================================================== */
+  /* Solid multicolor buttons. Every control gets a solid fill from a     */
+  /* curated palette; toggle buttons show a distinct ON vs OFF colour.    */
+  /* =================================================================== */
+  :root {
+    --b-sky:#38bdf8; --b-teal:#2dd4bf; --b-emerald:#34d399; --b-violet:#a78bfa;
+    --b-fuchsia:#e879f9; --b-amber:#fbbf24; --b-orange:#fb923c; --b-rose:#fb7185;
+    --b-cyan:#22d3ee; --b-lime:#a3e635; --b-red:#ef4444; --b-green:#22c55e;
+    --b-on:#16a34a; --b-off:#dc2626; --b-armed:#d97706; --b-slate:#64748b;
+    --btn-ink:#0a1020;
+  }
+
+  /* --- Base solid fill --- */
+  .btn-action, .set-btn, .mw-mini-btn, .oc-chart-btn, #goAtmBtn, #btnBestCombo,
+  .rs-chip, .rtom-chip {
+    background: var(--btn-c, var(--b-sky)) !important;
+    color: var(--btn-ink) !important;
+    border: 1px solid rgba(0,0,0,.28) !important;
+    font-weight: 700 !important;
+    border-radius: 6px;
+    box-shadow: 0 1px 0 rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.20);
+    transition: filter .12s, transform .06s, box-shadow .12s;
+  }
+  .btn-action:hover, .set-btn:hover, .mw-mini-btn:hover, .oc-chart-btn:hover,
+  #goAtmBtn:hover, #btnBestCombo:hover, .rs-chip:hover, .rtom-chip:hover {
+    filter: brightness(1.14) saturate(1.08);
+    box-shadow: 0 0 12px -2px var(--btn-c, var(--b-sky));
+  }
+  .btn-action:active, .set-btn:active, .mw-mini-btn:active, .oc-chart-btn:active,
+  #goAtmBtn:active, #btnBestCombo:active, .rs-chip:active, .rtom-chip:active {
+    transform: translateY(1px); filter: brightness(.94);
+  }
+  /* Dark ink for anything nested inside a solid button, so labels stay legible
+     on bright fills (the theme's "lift dim greys" rule would otherwise lighten
+     them). The stat chip keeps its coloured net value. */
+  body .btn-action, body .btn-action *, body .set-btn *, body .mw-mini-btn *,
+  body .oc-chart-btn *, body .rtom-chip *, body #goAtmBtn *, body #btnBestCombo * {
+    color: var(--btn-ink) !important;
+  }
+  body .rs-chip span[style*="color:#888"] { color: var(--btn-ink) !important; }
+
+  /* --- Per-class defaults --- */
+  .set-btn { --btn-c: var(--b-violet); }
+  .mw-mini-btn { --btn-c: var(--b-cyan); }
+  .oc-chart-btn { --btn-c: var(--b-amber); }
+  #goAtmBtn { --btn-c: var(--b-teal); }
+  #btnBestCombo { --btn-c: var(--b-emerald); }
+  .rs-chip { --btn-c: var(--b-fuchsia); }
+  .rtom-chip { --btn-c: var(--b-lime); }
+
+  /* --- btn-action rotates through the palette within each toolbar --- */
+  .btn-action:nth-of-type(10n+1) { --btn-c: var(--b-sky); }
+  .btn-action:nth-of-type(10n+2) { --btn-c: var(--b-violet); }
+  .btn-action:nth-of-type(10n+3) { --btn-c: var(--b-emerald); }
+  .btn-action:nth-of-type(10n+4) { --btn-c: var(--b-amber); }
+  .btn-action:nth-of-type(10n+5) { --btn-c: var(--b-fuchsia); }
+  .btn-action:nth-of-type(10n+6) { --btn-c: var(--b-teal); }
+  .btn-action:nth-of-type(10n+7) { --btn-c: var(--b-orange); }
+  .btn-action:nth-of-type(10n+8) { --btn-c: var(--b-rose); }
+  .btn-action:nth-of-type(10n+9) { --btn-c: var(--b-cyan); }
+  .btn-action:nth-of-type(10n+10){ --btn-c: var(--b-lime); }
+
+  /* --- Semantic colours win over the palette rotation --- */
+  .btn-action.warn, .set-btn.warn, .mw-mini-btn.warn, .btn-reset { --btn-c: var(--b-red); }
+  .set-btn.muted { --btn-c: var(--b-slate); color: #f1f5f9 !important; }
+  .btn-connect { --btn-c: var(--b-green); }
+  .btn-action.warn, .btn-reset { color: #fff5f5 !important; }
+
+  /* --- Toggle buttons: solid ON vs OFF --- */
+  .btn-action.on, .rtom-chip.sel {
+    --btn-c: var(--b-green) !important; color: #04130a !important;
+    box-shadow: 0 0 10px -2px var(--b-green);
+  }
+  .btn-action.off { --btn-c: var(--b-off) !important; color: #fff1f1 !important; }
+  .btn-action.blocked { --btn-c: var(--b-slate) !important; color: #e2e8f0 !important; }
+
+  /* --- Timeframe buttons: OFF slate, ON active-tab accent --- */
+  .tf-btn {
+    background: #334155 !important; color: #e2e8f0 !important;
+    border: 1px solid #475569 !important; font-weight: 700 !important; border-radius: 6px;
+  }
+  .tf-btn:hover { background: #41526b !important; color: #fff !important; }
+  .tf-btn.active {
+    background: var(--sec-accent, var(--b-teal)) !important; color: var(--btn-ink) !important;
+    border-color: transparent !important; box-shadow: 0 0 10px -2px var(--sec-accent, var(--b-teal));
+  }
+
+  /* --- Status pills: solid slate / green ON / red OFF / amber armed --- */
+  .rt-pill { background: #334155 !important; border: 1px solid #475569 !important; color: #e2e8f0 !important; font-weight: 700 !important; }
+  .rt-pill.on { background: var(--b-on) !important; border-color: var(--b-green) !important; color: #f0fdf4 !important; }
+  .rt-pill.off { background: var(--b-off) !important; border-color: var(--b-red) !important; color: #fef2f2 !important; }
+  .rt-pill.armed { background: var(--b-armed) !important; border-color: #f59e0b !important; color: #fffbeb !important; }
+
+
+
+
 
