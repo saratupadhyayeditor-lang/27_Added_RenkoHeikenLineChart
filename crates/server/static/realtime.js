@@ -1183,11 +1183,12 @@ function shell() {
         <button class="btn-action" data-toggle="moversOn" id="rtMoversToggle" style="width:auto;padding:3px 10px;margin:0;font-size:10px">Top Movers: OFF</button>
         <label class="rtom-f">Top gainers <input type="number" data-set="moversGainers" min="0" step="1" style="width:56px"></label>
         <label class="rtom-f">Top losers <input type="number" data-set="moversLosers" min="0" step="1" style="width:56px"></label>
-        <label class="rtom-f">Indices
+        <label class="rtom-f">Indices (set CE/PE leg)
           <select id="rtMoversIndicesSelect" style="min-width:150px"><option value="">-- pick index --</option></select>
         </label>
         <button class="btn-action" id="rtMoversIndicesAdd" style="width:auto;padding:3px 10px;margin:0">Add more</button>
         <span id="rtMoversIndicesList" style="font-size:9px;color:#ccc;display:flex;flex-wrap:wrap;gap:4px;align-items:center"></span>
+        <span style="font-size:8px;color:#666;flex-basis:100%">Each index trades only its selected CE/PE leg. No leg = skipped (index trading needs an explicit trend call).</span>
         <input type="hidden" data-list="moversIndices">
       </div>
       <div id="rtMoversList" style="display:none;margin-top:4px;font-size:9px;color:#ccc;background:#12122a;border:1px solid #2d2d50;border-radius:4px;padding:6px 8px"></div>
@@ -1688,6 +1689,9 @@ function settingsFromDom() {
   // Manual Strike Select list is edited by its own row (not via [data-set]), so
   // carry it over from the last snapshot instead of letting a generic save drop it.
   s.manualStrikes = (STATE && STATE.settings && STATE.settings.manualStrikes) || [];
+  // Top Movers index legs are edited by each index chip's own CE/PE select (not
+  // via [data-set]), so carry them over too.
+  s.moversIndexLegs = (STATE && STATE.settings && STATE.settings.moversIndexLegs) || [];
   return s;
 }
 
@@ -2473,6 +2477,8 @@ function listValues(key) {
   return inp ? String(inp.value || "").split(",").map((x) => x.trim()).filter(Boolean) : [];
 }
 function renderChips(key, containerId, kind) {
+  // Index chips carry their own CE/PE leg selector, so they render specially.
+  if (kind === "index") { renderIndexChips(); return; }
   const box = document.getElementById(containerId);
   if (!box) return;
   const vals = listValues(key);
@@ -2487,6 +2493,68 @@ function renderChips(key, containerId, kind) {
       if (!inp) return;
       inp.value = vals.filter((x) => x !== id).join(", ");
       API.settings(settingsFromDom()).then(() => renderChips(key, containerId, kind));
+    };
+  });
+}
+// ---- Top Movers "Indices" chips + per-index CE/PE leg selector --------------
+// An added index trades ONLY the leg the operator picks here (CE = bullish view,
+// PE = bearish view). With no leg chosen the index is skipped by the engine -
+// index trading needs an explicit trend call, never an automatic side.
+function indexLegValue(id) {
+  const arr = (STATE && STATE.settings && STATE.settings.moversIndexLegs) || [];
+  const hit = arr.find((x) => num(x && x.securityId) === num(id));
+  const s = hit ? String(hit.side || "").toUpperCase() : "";
+  return s === "CE" || s === "PE" ? s : "";
+}
+function setIndexLeg(id, side) {
+  const cur = (((STATE && STATE.settings && STATE.settings.moversIndexLegs) || []).slice())
+    .map((x) => ({ securityId: num(x && x.securityId), side: String((x && x.side) || "") }));
+  const i = cur.findIndex((x) => x.securityId === num(id));
+  if (side === "CE" || side === "PE") {
+    if (i >= 0) cur[i] = { securityId: num(id), side: side };
+    else cur.push({ securityId: num(id), side: side });
+  } else if (i >= 0) {
+    cur.splice(i, 1);
+  }
+  STATE.settings = Object.assign({}, (STATE && STATE.settings) || {}, { moversIndexLegs: cur });
+  API.settings(settingsFromDom()).then(refresh);
+}
+function renderIndexChips() {
+  const box = document.getElementById("rtMoversIndicesList");
+  if (!box) return;
+  const vals = listValues("moversIndices");
+  if (!vals.length) {
+    box.innerHTML = `<span style="color:#666">None added.</span>`;
+    return;
+  }
+  box.innerHTML = vals.map((v) => {
+    const leg = indexLegValue(v);
+    const opts = [["", "leg: none (skip)"], ["CE", "CE"], ["PE", "PE"]]
+      .map(([o, label]) => `<option value="${o}"${o === leg ? " selected" : ""}>${label}</option>`)
+      .join("");
+    const border = leg ? "#2d6b50" : "#6b3a3a";
+    return `<span style="display:inline-flex;align-items:center;gap:4px;background:#16163a;border:1px solid ${border};border-radius:8px;padding:1px 4px;margin:1px">${esc(indexName(v))}`
+      + `<select data-idx-leg="${esc(String(v))}" title="Leg this index trades. CE = bullish view, PE = bearish view. No leg = the index is skipped (index trading needs an explicit trend call)." style="background:#0e1626;color:#00d4aa;border:1px solid #2d2d50;border-radius:4px;font-size:9px;font-weight:700;padding:1px 2px">${opts}</select>`
+      + `<button data-chip-key="moversIndices" data-chip-id="${esc(String(v))}" title="Remove this index" style="background:none;border:none;color:#ef5350;cursor:pointer;font-size:11px;padding:0 2px;line-height:1">\u00d7</button></span>`;
+  }).join("");
+  box.querySelectorAll("[data-idx-leg]").forEach((sel) => {
+    sel.onchange = (e) => {
+      e.stopPropagation();
+      setIndexLeg(sel.getAttribute("data-idx-leg"), sel.value);
+    };
+  });
+  box.querySelectorAll("[data-chip-id]").forEach((b) => {
+    b.onclick = (e) => {
+      e.preventDefault();
+      const id = b.getAttribute("data-chip-id");
+      const inp = document.querySelector(`#tab-realtime [data-list="moversIndices"]`);
+      if (!inp) return;
+      inp.value = listValues("moversIndices").filter((x) => x !== id).join(", ");
+      // Drop the removed index's assigned leg too, then persist both edits.
+      const cur = (((STATE && STATE.settings && STATE.settings.moversIndexLegs) || []).slice())
+        .filter((x) => num(x && x.securityId) !== num(id));
+      STATE.settings = Object.assign({}, (STATE && STATE.settings) || {}, { moversIndexLegs: cur });
+      API.settings(settingsFromDom()).then(() => renderIndexChips());
     };
   });
 }

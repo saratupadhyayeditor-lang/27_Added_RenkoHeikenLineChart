@@ -202,6 +202,31 @@ impl Default for ManualStrike {
     }
 }
 
+/// Operator-assigned option leg for one Top Movers index (`movers_index_legs`).
+/// An index only trades the side the operator explicitly picked - a bullish
+/// view runs CE, a bearish view PE - and an index with no entry is skipped
+/// entirely, because index trading requires the operator's own trend call
+/// rather than an automatic guess. The assigned leg is authoritative: it wins
+/// over the NIFTY straight-line lock, the "Run Strategy In" override and the
+/// Top Movers auto bias for that index only.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MoversIndexLeg {
+    /// Index security id, e.g. `13` (NIFTY 50).
+    pub security_id: i64,
+    /// `CE` | `PE`.
+    pub side: String,
+}
+
+impl Default for MoversIndexLeg {
+    fn default() -> Self {
+        Self {
+            security_id: 0,
+            side: String::new(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Universal settings
 // ---------------------------------------------------------------------------
@@ -309,6 +334,10 @@ pub struct Settings {
     pub movers_gainers: i64,
     pub movers_losers: i64,
     pub movers_indices: Vec<i64>,
+    /// Operator-assigned CE/PE leg per Top Movers index. An index in
+    /// `movers_indices` with no entry here is skipped (index trading needs an
+    /// explicit trend call); with an entry it trades ONLY that leg.
+    pub movers_index_legs: Vec<MoversIndexLeg>,
     // --- NIFTY Trend Following ---
     pub nifty_trend_on: bool,
     pub nifty_trend_pct_on: bool,
@@ -523,6 +552,7 @@ impl Default for Settings {
             movers_gainers: 5,
             movers_losers: 5,
             movers_indices: Vec::new(),
+            movers_index_legs: Vec::new(),
             nifty_trend_on: false,
             nifty_trend_pct_on: true,
             nifty_trend_pct: 2.5,
@@ -2477,6 +2507,12 @@ impl RealtimeState {
             }
             for r in list.iter() {
                 let sid = ji(r, "securityId");
+                // An operator index with an explicit leg is shown once, from the
+                // dedicated indices pass below - never doubled up (possibly on
+                // the opposite side) by its coincidental top-N ranking.
+                if indices.contains(&sid) && movers_index_leg(&settings, sid).is_some() {
+                    continue;
+                }
                 let spot = jf(r, "last");
                 let Some((name, seg, inst)) = crate::market::symbol_meta(sid) else { continue };
                 if let Some(leg) = self.pick_leg(&settings, sid, &name, &seg, &inst, spot, side) {
@@ -2496,6 +2532,36 @@ impl RealtimeState {
                         "underlyingInstrument": inst,
                     }));
                 }
+            }
+        }
+        // Operator indices: each resolves to its explicitly assigned leg only.
+        // An index without an assigned leg contributes no pick (skipped), and the
+        // assigned leg is shown regardless of the live auto direction.
+        for id in &indices {
+            let Some(side) = movers_index_leg(&settings, *id) else { continue };
+            let Some((name, seg, inst)) = crate::market::symbol_meta(*id) else { continue };
+            let spot = self.ltp_of(*id, &seg);
+            let chg = rows
+                .iter()
+                .find(|r| ji(r, "securityId") == *id)
+                .map(|r| jf(r, "changePct"))
+                .unwrap_or(0.0);
+            if let Some(leg) = self.pick_leg(&settings, *id, &name, &seg, &inst, spot, side) {
+                legs.push(json!({
+                    "securityId": leg.security_id,
+                    "underlying": name,
+                    "side": side,
+                    "tradingSymbol": leg.trading_symbol,
+                    "segment": leg.exchange_segment,
+                    "instrument": leg.instrument,
+                    "spot": round2(spot),
+                    "changePct": chg,
+                    "source": "Top Movers",
+                    "runMode": run_mode_for(&seg, &inst, &settings),
+                    "underlyingSecurityId": *id,
+                    "underlyingSegment": seg,
+                    "underlyingInstrument": inst,
+                }));
             }
         }
         self.update_picked("Top Movers", legs);
@@ -3115,7 +3181,13 @@ impl RealtimeState {
                 add(&mut out, &mut seen, ji(&r, "securityId"), Some(false), allow_bull, allow_bear);
             }
             for id in &settings.movers_indices {
-                add(&mut out, &mut seen, *id, None, allow_bull, allow_bear);
+                // Only the operator-assigned leg runs; an index with no leg is
+                // skipped (index trading needs an explicit trend call). The
+                // assigned leg is authoritative, so it bypasses the global side
+                // gates (both allow flags are passed as true).
+                if let Some(bull) = index_target_side(settings, *id) {
+                    add(&mut out, &mut seen, *id, Some(bull), true, true);
+                }
             }
         }
 
@@ -7252,11 +7324,50 @@ fn per_strategy_side(settings: &Settings) -> bool {
 /// bearish ones PE. `None` when neither feature is on, so callers keep their
 /// normal multi-source resolution.
 fn routed_option_side(settings: &Settings, strat: &Strategy) -> Option<&'static str> {
+    // Operator index leg (Top Movers "Indices"): an explicitly assigned CE/PE is
+    // authoritative and wins over every other direction source - the NIFTY
+    // straight-line lock, the "Run Strategy In" override and the auto scanner
+    // bias - for that index only.
+    if is_index_strategy(strat) {
+        if let Some(side) = movers_index_leg(settings, strat.security_id) {
+            return Some(side);
+        }
+    }
     if per_strategy_side(settings) {
         Some(if strategy_is_bull(strat) { "CE" } else { "PE" })
     } else {
         None
     }
+}
+
+/// True when `strat` is a cash-index strategy. The Top Movers "Indices" picks
+/// are built from `crate::market::symbol_meta` with `IDX_I` / `INDEX`.
+fn is_index_strategy(strat: &Strategy) -> bool {
+    strat.exchange_segment.eq_ignore_ascii_case("IDX_I")
+        || strat.instrument.eq_ignore_ascii_case("INDEX")
+}
+
+/// The CE/PE leg the operator explicitly assigned to a Top Movers index
+/// (`movers_index_legs`). `None` when the index has no valid assignment, in
+/// which case it is skipped - index trading needs the operator's own trend
+/// call, never an automatic side.
+fn movers_index_leg(settings: &Settings, sid: i64) -> Option<&'static str> {
+    settings
+        .movers_index_legs
+        .iter()
+        .find(|l| l.security_id == sid)
+        .and_then(|l| match l.side.trim().to_uppercase().as_str() {
+            "CE" => Some("CE"),
+            "PE" => Some("PE"),
+            _ => None,
+        })
+}
+
+/// Bullish/bearish side an operator index contributes to the scanner universe:
+/// `Some(true)` = CE, `Some(false)` = PE, `None` = nothing (no leg assigned, so
+/// the index is skipped).
+fn index_target_side(settings: &Settings, sid: i64) -> Option<bool> {
+    movers_index_leg(settings, sid).map(|s| s == "CE")
 }
 
 /// A strike-quote candidate: `(security_id, trading_symbol, strike, ltp,
@@ -10280,6 +10391,68 @@ mod gate_tests {
         s.option_side = "PE".into();
         assert_eq!(routed_option_side(&s, &bull), Some("CE"));
         assert_eq!(routed_option_side(&s, &bear), Some("PE"));
+    }
+
+    #[test]
+    fn movers_index_leg_settings_round_trip_uses_camel_case() {
+        let mut s = Settings::default();
+        assert!(s.movers_index_legs.is_empty());
+        s.movers_index_legs.push(MoversIndexLeg { security_id: 13, side: "CE".into() });
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["moversIndexLegs"][0]["securityId"], serde_json::json!(13));
+        assert_eq!(v["moversIndexLegs"][0]["side"], serde_json::json!("CE"));
+        let back: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(back.movers_index_legs.len(), 1);
+        assert_eq!(back.movers_index_legs[0].security_id, 13);
+        assert_eq!(back.movers_index_legs[0].side, "CE");
+    }
+
+    #[test]
+    fn assigned_index_leg_wins_and_unassigned_is_skipped() {
+        let mut s = Settings::default();
+        // No assignment: the index is skipped and contributes no side.
+        assert_eq!(movers_index_leg(&s, 13), None);
+        assert_eq!(index_target_side(&s, 13), None);
+        s.movers_indices.push(13);
+        assert_eq!(index_target_side(&s, 13), None, "no leg => index is skipped");
+
+        // Assign CE: only the CE side runs and it is authoritative.
+        s.movers_index_legs.push(MoversIndexLeg { security_id: 13, side: "CE".into() });
+        assert_eq!(movers_index_leg(&s, 13), Some("CE"));
+        assert_eq!(index_target_side(&s, 13), Some(true));
+
+        // The assigned leg overrides the NIFTY lock / Run-Strategy-In / Option
+        // Type / filter-side routing for that index, even armed for the opposite
+        // side.
+        s.nifty_trend_on = true;
+        s.run_in_enabled = true;
+        s.run_in_side = "PE".into();
+        s.option_side = "PE".into();
+        s.filter_side_route = true;
+        let idx = Strategy {
+            exchange_segment: "IDX_I".into(),
+            instrument: "INDEX".into(),
+            security_id: 13,
+            category: "BEARISH".into(),
+            ..Default::default()
+        };
+        assert_eq!(routed_option_side(&s, &idx), Some("CE"), "assigned CE leg wins over every other source");
+
+        // A non-index strategy with the same security id is unaffected.
+        let stock = Strategy {
+            exchange_segment: "NSE_EQ".into(),
+            instrument: "EQUITY".into(),
+            security_id: 13,
+            category: "BEARISH".into(),
+            ..Default::default()
+        };
+        assert_eq!(routed_option_side(&s, &stock), Some("PE"), "filter-side routing still applies to stocks");
+
+        // Assign PE: flips to the PE leg; an invalid side value is ignored.
+        s.movers_index_legs[0] = MoversIndexLeg { security_id: 13, side: "PE".into() };
+        assert_eq!(index_target_side(&s, 13), Some(false));
+        s.movers_index_legs[0] = MoversIndexLeg { security_id: 13, side: "nonsense".into() };
+        assert_eq!(movers_index_leg(&s, 13), None, "invalid side is treated as no assignment");
     }
 
     #[test]
