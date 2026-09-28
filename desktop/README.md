@@ -118,7 +118,9 @@ hai.
 
 Updater tab ka data:
 
-- **Source**: GitHub repo URL (`owner/repo`) - disk par save hota hai.
+- **Source**: GitHub repo URL (`owner/repo`) - default distribution repo
+  pre-filled hota hai (`desktop/src/updater.rs` me `DEFAULT_REPO`), disk par save
+  hota hai.
 - **Live log**: is session ke saare updater steps (check/download/verify/apply).
 - **History**: har update attempt (time, `from -> to`, status, message) disk par
   `update_history.json` me save hoti hai, app restart ke baad bhi rehti hai.
@@ -148,6 +150,10 @@ Naya release kaise banao:
 scripts/build-desktop.sh
 # dist/algo-desktop-<os>-<arch>.zip + dist/SHA256SUMS ko GitHub Release me upload karo
 ```
+
+Automatic option: `.github/workflows/release.yml` tag push (`vX.Y.Z`) par teenon
+platform ke assets build karke release me upload kar deta hai, ya Actions se
+manually chalao (tag input ke saath).
 
 Repo private ho to: manual update ke waqt repo ko thodi der public karo,
 button dabao, phir wapas private. Automatic update nahi chahiye. Behtar option:

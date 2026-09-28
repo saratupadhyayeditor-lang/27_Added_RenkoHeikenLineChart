@@ -52,6 +52,22 @@ export function bootConnection() {
         localStorage.setItem(LS_AUTORESET, JSON.stringify(cb.checked));
       } catch (e) {}
     });
+
+    // A session may already exist on the server (page reload, second tab). Adopt
+    // it so the button/status reflect reality and the self-heal paths below stay
+    // active without a manual Connect tap.
+    fetch("/api/status")
+      .then((r) => r.json())
+      .then((s) => {
+        if (s && s.connected) {
+          const btn = $("connectBtn");
+          if (btn) btn.textContent = "Connected - Reconnect";
+          const rb = $("resetFeedBtn");
+          if (rb) rb.style.display = "";
+          setStatus("Connected - waiting for live feed...", "warn");
+        }
+      })
+      .catch(() => {});
   }
 
   function setStatus(text, cls) {

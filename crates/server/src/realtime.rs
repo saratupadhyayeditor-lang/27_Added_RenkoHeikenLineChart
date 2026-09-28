@@ -309,9 +309,17 @@ pub struct Settings {
     pub filter_mode: bool,
     // --- Entry gate modes ---
     pub all_in_one: bool,
-    pub fresh_meet: bool,
     pub dir_guard: bool,
     pub overall_dir: bool,
+    /// Multi-position mode A: when a position is already open, allow a new
+    /// position on the next fresh signal (the entry gate turning from not-met to
+    /// met). Concurrent positions are unlimited, so a signal that keeps
+    /// re-triggering stacks entries instead of waiting for the old one to close.
+    pub multi_fresh_on: bool,
+    /// Multi-position mode B: while the entry gate keeps holding, open a new
+    /// position on every scan cycle (no wait for a reset). Unlimited concurrent
+    /// positions; the orders/sec cap still bounds the fill rate.
+    pub multi_always_on: bool,
     pub brain_mode: String,
     pub brain_threshold: i64,
     /// Option side for index/underlying strategies: `both` | `CE` | `PE`.
@@ -490,9 +498,10 @@ impl Default for Settings {
             scanner_exclude: Vec::new(),
             filter_mode: false,
             all_in_one: false,
-            fresh_meet: false,
             dir_guard: false,
             overall_dir: true,
+            multi_fresh_on: true,
+            multi_always_on: false,
             brain_mode: "off".into(),
             brain_threshold: 65,
             option_side: "both".into(),
@@ -1083,6 +1092,11 @@ pub struct RealtimeState {
     was_conn: Arc<AtomicBool>,
     was_feed: Arc<AtomicBool>,
     last_sig: Arc<Mutex<HashMap<String, i64>>>,
+    /// Entry-gate edge detector for the multi-position "fresh signal" mode:
+    /// strategy id -> whether the entry gate held on the previous scan. A new
+    /// position is allowed only on the false -> true edge, so a gate that stays
+    /// true opens exactly one position instead of one every scan cycle.
+    sig_state: Arc<Mutex<HashMap<String, bool>>>,
     /// Cached ATR per `security:segment:instrument:timeframe` `(at_ms, atr)`.
     /// AI SL/TP/trail reuse a recent ATR instead of paying a throttled Dhan
     /// candle round-trip on every entry (that fetch was a 3-10s entry lag).
@@ -1226,6 +1240,7 @@ impl RealtimeState {
             was_conn: Arc::new(AtomicBool::new(false)),
             was_feed: Arc::new(AtomicBool::new(false)),
             last_sig: Arc::new(Mutex::new(HashMap::new())),
+            sig_state: Arc::new(Mutex::new(HashMap::new())),
             atr_cache: Arc::new(Mutex::new(HashMap::new())),
             pool_cache: Arc::new(Mutex::new((0, Value::Null))),
             pool_busy: Arc::new(AtomicBool::new(false)),
@@ -1528,6 +1543,28 @@ impl RealtimeState {
     fn locked_margin(&self) -> (f64, i64) {
         let positions = self.doc().map(|d| d.positions.clone()).unwrap_or_default();
         locked_margin_of(&positions)
+    }
+
+    /// Entry-gate edge state for the multi-position "fresh signal" mode: whether
+    /// the gate held on the previous scan for this strategy.
+    fn sig_state_is_set(&self, strategy_id: &str) -> bool {
+        self.sig_state
+            .lock()
+            .ok()
+            .and_then(|m| m.get(strategy_id).copied())
+            .unwrap_or(false)
+    }
+
+    /// Record the entry-gate result for the multi-position "fresh signal" edge
+    /// detector. `true` as soon as an entry is placed so a gate that stays true
+    /// does not stack another position until it resets and re-triggers.
+    fn set_sig_state(&self, strategy_id: &str, val: bool) {
+        if let Ok(mut m) = self.sig_state.lock() {
+            if m.len() > 5000 {
+                m.clear();
+            }
+            m.insert(strategy_id.to_string(), val);
+        }
     }
 
     /// Trades already taken for a strategy: open positions plus closed trades.
@@ -2039,6 +2076,22 @@ impl RealtimeState {
         None
     }
 
+    /// Strict NIFTY straight-line direction lock. While NIFTY Trend Following is
+    /// on and the straight lines have committed a net direction, ONLY that side
+    /// may trade: a bullish NIFTY can never open a PE trade and a bearish NIFTY
+    /// can never open a CE trade. `None` when the feature is off or the lines are
+    /// tied (no committed direction), so callers keep their normal resolution.
+    fn nifty_locked_side(&self, settings: &Settings) -> Option<&'static str> {
+        if !settings.nifty_trend_on {
+            return None;
+        }
+        match self.nifty_dir.load(Ordering::Relaxed) {
+            d if d > 0 => Some("CE"),
+            d if d < 0 => Some("PE"),
+            _ => None,
+        }
+    }
+
     /// "Run Strategy In" override side (old AST `effectiveRunInSide`): the manual
     /// CE/PE when the override is on, or the live scanner direction in Auto
     /// Select Mode (falling back to the manual side while no auto signal is
@@ -2543,9 +2596,13 @@ impl RealtimeState {
             return;
         }
         self.last_nifty_scan.store(now, Ordering::Relaxed);
-        let bull_on = self.nifty_bull_filters.lock().map(|g| !g.is_empty()).unwrap_or(false);
-        let bear_on = self.nifty_bear_filters.lock().map(|g| !g.is_empty()).unwrap_or(false);
-        // No line has read a direction yet: nothing to assign.
+        // Follow only the net straight-line direction: a bullish NIFTY builds CE
+        // legs, a bearish NIFTY PE legs. The opposite side is never armed, even
+        // when a single line reads against the majority.
+        let dir = self.nifty_dir.load(Ordering::Relaxed);
+        let bull_on = dir > 0 && self.nifty_bull_filters.lock().map(|g| !g.is_empty()).unwrap_or(false);
+        let bear_on = dir < 0 && self.nifty_bear_filters.lock().map(|g| !g.is_empty()).unwrap_or(false);
+        // No committed direction (or no line assigned yet): nothing to assign.
         if !bull_on && !bear_on {
             self.update_picked("NIFTY trend", Vec::new());
             return;
@@ -2814,11 +2871,17 @@ impl RealtimeState {
         let bull_side = settings.filters.iter().any(|(k, v)| *v && filter_is_bull(k));
         let bear_side = settings.filters.iter().any(|(k, v)| *v && filter_is_bear(k));
         // NIFTY-trend assignment: the bullish straight-line filters gate the Top
-        // Gainer legs, the bearish ones the Top Loser legs. Each side is allowed
-        // independently, so when both are assigned both run together.
+        // Gainer (CE) legs, the bearish ones the Top Loser (PE) legs. The engine
+        // follows ONLY the net straight-line direction, so a bullish NIFTY runs
+        // CE legs and a bearish NIFTY runs PE legs - never both at once. A single
+        // dissenting line must not arm the opposite side; a tie (net 0) has no
+        // committed direction, so no NIFTY-trend leg runs.
+        let nifty_dir = self.nifty_dir.load(Ordering::Relaxed);
         let nifty_allow_bull = settings.nifty_trend_on
+            && nifty_dir > 0
             && self.nifty_bull_filters.lock().map(|g| !g.is_empty()).unwrap_or(false);
         let nifty_allow_bear = settings.nifty_trend_on
+            && nifty_dir < 0
             && self.nifty_bear_filters.lock().map(|g| !g.is_empty()).unwrap_or(false);
         if !bull_side && !bear_side && !nifty_allow_bull && !nifty_allow_bear {
             return Vec::new();
@@ -3056,15 +3119,26 @@ impl RealtimeState {
                 Some((entry, _)) => entry.clone(),
                 None => engine_tf(&settings, &strat),
             };
-            // Never open a second position for the same strategy; the global
-            // orders/sec cap below bounds how fast new entries may fire.
+            // Strict NIFTY straight-line direction lock: while NIFTY Trend
+            // Following has committed a direction, ONLY that side may trade. A
+            // strategy whose bullish/bearish side disagrees with the locked side
+            // is skipped outright, independent of the "Overall Bullish/Bearish"
+            // toggle and of any Run-in override - so a bullish NIFTY can never
+            // open a PE trade (and vice versa).
+            if let Some(locked) = self.nifty_locked_side(&settings) {
+                if strategy_is_bull(&strat) != (locked == "CE") {
+                    continue;
+                }
+            }
+            // Multi-position support: count the strategy's open positions, kept
+            // for the legacy single-position fallback. The old hard stop ("never
+            // open a second position for the same strategy") is gone - the entry
+            // gate further down decides how many concurrent positions a strategy
+            // may hold, capped only by the global orders/sec limit.
             let running = self
                 .doc()
                 .map(|d| d.positions.iter().filter(|p| js(p, "strategyId") == strat.id).count())
                 .unwrap_or(0);
-            if running > 0 {
-                continue;
-            }
             let now = now_ms();
             // Tick-native: every strategy is evaluated on the LIVE forming bar at
             // the engine's ultrafast cadence. There is no closed-bar wait and no
@@ -3186,8 +3260,7 @@ impl RealtimeState {
                 let cond_ok = synth || conditions_met(&s.conditions, c, offset);
                 let fg = filter_gate(&gate_settings, s, c, offset);
                 let dg = direction_opposite(&gate_settings, s, c, offset);
-                let fm = gate_settings.fresh_meet && filter_gate(&gate_settings, s, c, offset + 1);
-                if !cond_ok || !fg || dg || fm {
+                if !cond_ok || !fg || dg {
                     if strat.synthetic {
                         let bull_s = strategy_is_bull(s);
                         let keys: Vec<String> = gate_settings
@@ -3201,7 +3274,7 @@ impl RealtimeState {
                         let arrow_on = keys.iter().any(|k| is_arrow_flag(k));
                         let arrow_pass = arrow_on
                             && keys.iter().any(|k| {
-                                is_arrow_flag(k) && filter_eval(k, c, offset).unwrap_or(true)
+                                is_arrow_flag(k) && filter_eval(k, c, offset).unwrap_or(false)
                             });
                         let failed: Vec<String> = keys
                             .iter()
@@ -3214,7 +3287,7 @@ impl RealtimeState {
                             &format!("gate:{}", strat.id),
                             60_000,
                             "info",
-                            &format!("scan gate fail {}: cond={cond_ok} filter={fg} dir={dg} fresh={fm} overallDir={} dirGuard={dir_expl} arrow=[{arrow_on}/{arrow_pass}] gate=[{gate_expl}] keys={keys:?} failed={failed:?}", strat.name, settings.overall_dir),
+                            &format!("scan gate fail {}: cond={cond_ok} filter={fg} dir={dg} overallDir={} dirGuard={dir_expl} arrow=[{arrow_on}/{arrow_pass}] gate=[{gate_expl}] keys={keys:?} failed={failed:?}", strat.name, settings.overall_dir),
                         );
                     }
                     all_pass = false;
@@ -3222,6 +3295,7 @@ impl RealtimeState {
                 }
             }
             if !all_pass {
+                self.set_sig_state(&strat.id, false);
                 continue;
             }
             // Multi-TF confirm: the higher ticked timeframe must also satisfy the
@@ -3247,8 +3321,25 @@ impl RealtimeState {
                     }
                 }
                 if !all_pass {
+                    self.set_sig_state(&strat.id, false);
                     continue;
                 }
+            }
+            // Multi-position entry gate (replaces the old single-position rule).
+            // Always-on stacks a position every scan while the gate holds; fresh
+            // fires only on the false -> true edge, so a gate that stays true
+            // opens exactly one. Concurrent positions are unlimited; the
+            // orders/sec cap below still bounds how fast fills go out. With both
+            // toggles off the legacy "one open position per strategy" applies.
+            let entry_allowed = if settings.multi_always_on {
+                true
+            } else if settings.multi_fresh_on {
+                !self.sig_state_is_set(&strat.id)
+            } else {
+                running == 0
+            };
+            if !entry_allowed {
+                continue;
             }
             // "Trade should be executed in": spot keeps the strategy's own
             // tradeable instrument; anything else executes the resolved option
@@ -3332,11 +3423,13 @@ impl RealtimeState {
             // branch is skipped entirely, so the real tab and a paper tab with
             // the box unticked keep behaving identically.
             if self.paper && settings.paper_exec_delay_on && settings.paper_exec_delay_ms > 0.0 {
+                self.set_sig_state(&strat.id, true);
                 self.queue_delayed_entry(&strat.id, &exec_strat, settings.paper_exec_delay_ms);
                 continue;
             }
             match self.open_entry(&exec_strat).await {
                 Ok(()) => {
+                    self.set_sig_state(&strat.id, true);
                     if strat.synthetic {
                         self.log_throttled(&format!("entry:{}", strat.id), 5_000, "info", &format!("scan ENTRY ok {} -> {} [{}]", strat.name, exec_strat.trading_symbol, exec_strat.instrument));
                     }
@@ -4241,12 +4334,17 @@ impl RealtimeState {
     // Entry / exit
     // -----------------------------------------------------------------------
 
-    /// The one CE/PE side a strategy should trade: the "Run Strategy In" override
-    /// wins over the Option Type dropdown (old AST `forcedSide`), else the
-    /// dropdown, else the live scanner direction, else the strategy's own
-    /// bullish/bearish category. Shared by the automatic leg resolver and the
-    /// testing-only Manual Strike Select so both always agree on the side.
+    /// The one CE/PE side a strategy should trade: the strict NIFTY
+    /// straight-line direction lock wins over everything (a bullish NIFTY only
+    /// trades CE, a bearish NIFTY only PE), then the "Run Strategy In" override
+    /// over the Option Type dropdown (old AST `forcedSide`), else the dropdown,
+    /// else the live scanner direction, else the strategy's own bullish/bearish
+    /// category. Shared by the automatic leg resolver and the testing-only
+    /// Manual Strike Select so both always agree on the side.
     fn target_option_side(&self, strat: &Strategy, settings: &Settings) -> &'static str {
+        if let Some(side) = self.nifty_locked_side(settings) {
+            return side;
+        }
         if let Some(side) = self.effective_run_in_side(settings) {
             return side;
         }
@@ -4456,8 +4554,12 @@ impl RealtimeState {
         }
         // Option Type "Both CE & PE" leaves the side open: the fastest positive
         // riser (or the nearest +green premium when fastest is off) decides.
-        // The "Run Strategy In" override collapses the pool to its forced side.
-        let sides: Vec<&'static str> = if let Some(side) = self.effective_run_in_side(settings) {
+        // The strict NIFTY direction lock and the "Run Strategy In" override both
+        // collapse the pool to their forced side, so the cross-side "fastest
+        // riser" scan can never pick the opposite leg while NIFTY is committed.
+        let sides: Vec<&'static str> = if let Some(side) = self.nifty_locked_side(settings) {
+            vec![side]
+        } else if let Some(side) = self.effective_run_in_side(settings) {
             vec![side]
         } else {
             match settings.option_side.to_uppercase().as_str() {
@@ -6816,8 +6918,8 @@ fn filter_eval_inner(
                     }
                 }
             }
-            let _ = computed;
-            Some(true)
+            // No pane pair could be computed: uncomputable, not a pass.
+            if computed { Some(true) } else { None }
         }
         "PaneIncUpAll" => pane_all_dirs(true, candles, offset),
         "PaneIncDownAll" => pane_all_dirs(false, candles, offset),
@@ -6833,8 +6935,7 @@ fn filter_eval_inner(
                     }
                 }
             }
-            let _ = computed;
-            Some(true)
+            if computed { Some(true) } else { None }
         }
         // "Crossed-above indicator pair still above (level)": the primary overlay
         // line (HMA 20) above its doubled-settings twin (HMA 40).
@@ -7172,14 +7273,16 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
     let arrow_pass = if arrow_keys.is_empty() {
         None
     } else {
-        Some(arrow_keys.iter().any(|k| filter_eval_inner(k, candles, offset, cons, sup, res).unwrap_or(true)))
+        // Fail-closed: an arrow that cannot be computed yet does not count as a
+        // trigger (previously `unwrap_or(true)` let an uncomputed arrow fire).
+        Some(arrow_keys.iter().any(|k| filter_eval_inner(k, candles, offset, cons, sup, res).unwrap_or(false)))
     };
     let mut f = GateFacts {
         total: norm_keys.len() + usize::from(arrow_pass.is_some()),
         ..Default::default()
     };
     for k in &norm_keys {
-        if filter_eval_inner(k, candles, offset, cons, sup, res).unwrap_or(true) {
+        if filter_eval_inner(k, candles, offset, cons, sup, res).unwrap_or(false) {
             f.pass += 1;
         }
     }
@@ -7199,24 +7302,25 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
             f.opposite += 1;
         }
     }
+    // Opposite-side confirmation veto: if a majority of the *opposite* side's
+    // enabled filters has actually met its condition, the chart is reading the
+    // other way and the trade must not fire - regardless of Brain mode. Without
+    // this, opposite indicators were only counted (never vetoed) unless Brain
+    // was set to AUTO, so a bearish chart could still fire a bullish entry.
+    if f.opp_total > 0 && f.opposite * 2 >= f.opp_total {
+        f.veto = true;
+        return (false, f);
+    }
     // "All together (strict AND)" requires every enabled filter on the
-    // strategy's side to pass. The Indicator-filters run mode alone does NOT
-    // force strict AND; without the checkbox a majority of the enabled filters
-    // drives the entry (Brain, when enabled, still layers on top below). With no
-    // enabled filters the gate is non-blocking.
+    // strategy's side to pass.
     f.strict = settings.all_in_one;
     if f.strict && f.pass != f.total {
         return (false, f);
     }
     // AI Brain AUTO layers on top of (never instead of) the strict/majority
-    // result: a strongly-opposite filter set vetoes outright, then the weighted
-    // confluence must clear the threshold.
+    // result: the weighted confluence must clear the threshold.
     f.brain = settings.brain_mode.eq_ignore_ascii_case("auto");
     if f.brain {
-        if f.opp_total > 0 && f.opposite * 2 >= f.opp_total {
-            f.veto = true;
-            return (false, f);
-        }
         if f.total > 0 && (f.pass as f64 / f.total as f64 * 100.0) < settings.brain_threshold as f64 {
             return (false, f);
         }
@@ -7226,7 +7330,10 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
         return (true, f);
     }
     if f.total == 0 {
-        return (true, f);
+        // No same-side filter is ticked. Non-blocking only when the operator has
+        // enabled no filters at all; if opposite filters are enabled there is no
+        // same-side confirmation, so the entry is blocked.
+        return (f.opp_total == 0, f);
     }
     // Not strict AND: a majority of the enabled filters must still agree.
     (f.pass * 2 > f.total, f)
@@ -9716,12 +9823,14 @@ mod gate_tests {
     }
 
     #[test]
-    fn unknown_filter_is_non_blocking() {
+    fn unknown_filter_blocks_fail_closed() {
         let c = ramp(60, 100.0, 1.0);
         assert_eq!(filter_eval("BullSomeUnimplementedThing", &c, 0), None);
         let mut s = Settings::default();
         s.filters.insert("BullSomeUnimplementedThing".into(), true);
-        assert!(filter_gate(&s, &bull_strategy(), &c, 0));
+        // An armed filter that cannot be computed no longer counts as a pass, so
+        // it blocks instead of firing against the chart.
+        assert!(!filter_gate(&s, &bull_strategy(), &c, 0));
     }
 
     #[test]
@@ -9730,9 +9839,11 @@ mod gate_tests {
         let mut s = Settings::default();
         s.filters.insert("BullIncUp".into(), true);
         assert!(filter_gate(&s, &bull_strategy(), &c, 0), "rising close passes BullIncUp");
-        assert!(filter_gate(&s, &bear_strategy(), &c, 0), "no bear filters armed => non-blocking");
+        // The armed bull filter is met while the strategy is bearish: the opposite
+        // agreement must veto the entry (it is no longer silently ignored).
+        assert!(!filter_gate(&s, &bear_strategy(), &c, 0), "met opposite filter vetoes");
         s.filters.insert("BearIncDown".into(), true);
-        assert!(!filter_gate(&s, &bear_strategy(), &c, 0), "strict AND fails with opposing down filter");
+        assert!(!filter_gate(&s, &bear_strategy(), &c, 0), "opposing down filter fails");
     }
 
     #[test]
@@ -9838,6 +9949,21 @@ mod gate_tests {
         s.filters.insert("BearIncDown".into(), true);
         s.brain_threshold = 50;
         assert!(filter_gate(&s, &bull_strategy(), &c, 0), "bear filter evaluates false so no veto");
+    }
+
+    #[test]
+    fn opposite_filter_vetoes_without_brain() {
+        let c = ramp(60, 100.0, 1.0);
+        let mut s = Settings::default();
+        s.filters.insert("BullIncUp".into(), true);
+        assert!(filter_gate(&s, &bull_strategy(), &c, 0), "own side passes => allowed");
+        s.filters.insert("BearIncDown".into(), true);
+        // On a rising ramp the bear filter is unmet, so it must not veto.
+        assert!(filter_gate(&s, &bull_strategy(), &c, 0), "unmet opposite does not veto");
+        // A met opposite filter (Elder Force always evaluates true) vetoes even
+        // with Brain off - the chart is reading the other way.
+        s.filters.insert("BearPbrElderforce".into(), true);
+        assert!(!filter_gate(&s, &bull_strategy(), &c, 0), "met opposite vetoes with brain off");
     }
 
     #[test]
@@ -10060,7 +10186,7 @@ mod gate_tests {
                 .filters
                 .iter()
                 .filter(|(k, v)| **v && !is_stream_flag(k) && (if bull_side { filter_is_bull(k) } else { filter_is_bear(k) }))
-                .all(|(k, _)| filter_eval(k, &candles, 0).unwrap_or(true));
+                .all(|(k, _)| filter_eval(k, &candles, 0).unwrap_or(false));
             assert_eq!(gate, strict, "gate verdict diverged from strict-AND");
         }
     }

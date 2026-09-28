@@ -1206,7 +1206,6 @@ function shell() {
         <b class="rt-cap">Indicator filters:</b>
         <div style="flex-basis:100%;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
           <label class="rtom-f"><input type="checkbox" data-set="allInOne"> All together (strict AND)</label>
-          <label class="rtom-f"><input type="checkbox" data-set="freshMeet"> Fresh-meet bar entry</label>
           <label class="rtom-f"><input type="checkbox" data-set="dirGuard"> Direction Guard (no trade on opposite)</label>
           <label class="rtom-f"><input type="checkbox" data-set="overallDir"> Overall Bullish/Bearish idea</label>
           <label class="rtom-f">AI Brain
@@ -1227,6 +1226,13 @@ function shell() {
           <input type="number" data-set="supStrength"><input type="number" data-set="supAtrPeriod"><input type="number" data-set="supMinPct"><input type="number" data-set="supTolMult"><input type="number" data-set="supLook"><input type="number" data-set="supFwd"><input type="checkbox" data-set="supFullSpan"><input type="text" data-set="supUpColor"><input type="text" data-set="supDownColor"><input type="number" data-set="supLineWidth">
           <input type="number" data-set="resStrength"><input type="number" data-set="resAtrPeriod"><input type="number" data-set="resMinPct"><input type="number" data-set="resTolMult"><input type="number" data-set="resLook"><input type="number" data-set="resFwd"><input type="checkbox" data-set="resFullSpan"><input type="text" data-set="resUpColor"><input type="text" data-set="resDownColor"><input type="number" data-set="resLineWidth">
         </div>
+      </div>
+
+      <div class="rt-engine-row" id="rtMultiPosRow" style="border-color:#ffa726">
+        <b class="rt-cap" style="color:#ffa726">Multi Position:</b>
+        <label class="rtom-f" style="color:#00d4aa" title="Nayi position sirf fresh signal par: entry gate false se true hote hi ek position. Signal lagataar true rahe to sirf ek; reset hone par agli fresh trigger par nayi position. Concurrent positions unlimited."><input type="checkbox" data-set="multiFreshOn" id="rtMultiFreshCb"> Fresh signal par position</label>
+        <label class="rtom-f" style="color:#ef5350" title="Condition true rahne tak har scan cycle (~100ms) par nayi position khulti rahegi. Unlimited concurrent positions; orders/sec cap fir bhi lagu rehta hai."><input type="checkbox" data-set="multiAlwaysOn" id="rtMultiAlwaysCb"> Condition true rahne tak baar-baar position</label>
+        <span style="font-size:8px;color:#888;flex-basis:100%">Dono OFF = purana rule (ek strategy me ek hi open position). Jo mode active hoga, algo usi ke hisaab se trade karega.</span>
       </div>
 
       <div class="rt-engine-row" id="rtRunInRow2" style="border-top:1px dashed #1e1e40">

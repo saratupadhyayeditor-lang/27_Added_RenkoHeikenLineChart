@@ -16,10 +16,27 @@ use sha2::{Digest, Sha256};
 const USER_AGENT: &str = "algo-desktop-updater";
 const API: &str = "https://api.github.com";
 
+/// Distribution repo the updater uses until the operator saves another one.
+/// GitHub Releases on this repo must publish `algo-desktop-<os>-<arch>.zip`
+/// assets (+ `SHA256SUMS`) - see `.github/workflows/release.yml`.
+pub const DEFAULT_REPO: &str =
+    "saratupadhyayeditor-lang/20_backup_Fixed_NiftyTrend_StrategyTradeExecutionOnOppositeSide";
+
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub struct UpdateConfig {
     #[serde(default)]
     pub repo: String,
+}
+
+impl UpdateConfig {
+    /// The configured repo, or the baked-in distribution repo when none is set.
+    pub fn effective_repo(&self) -> String {
+        if self.repo.trim().is_empty() {
+            DEFAULT_REPO.to_string()
+        } else {
+            self.repo.clone()
+        }
+    }
 }
 
 pub struct Release {
@@ -43,7 +60,12 @@ pub fn load_config(data_dir: &Path) -> UpdateConfig {
     std::fs::read_to_string(config_path(data_dir))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .map(|cfg: UpdateConfig| UpdateConfig {
+            repo: cfg.effective_repo(),
+        })
+        .unwrap_or_else(|| UpdateConfig {
+            repo: DEFAULT_REPO.to_string(),
+        })
 }
 
 pub fn save_config(data_dir: &Path, cfg: &UpdateConfig) -> std::io::Result<()> {

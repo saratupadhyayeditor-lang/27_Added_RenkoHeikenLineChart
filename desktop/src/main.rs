@@ -662,6 +662,9 @@ fn selftest() {
     if updater::parse_repo("nope").is_some() {
         failures.push("parse_repo should reject single token".into());
     }
+    if updater::parse_repo(updater::DEFAULT_REPO).as_deref() != Some(updater::DEFAULT_REPO) {
+        failures.push("DEFAULT_REPO not parseable".into());
+    }
 
     // version ordering.
     let a = semver::Version::parse("1.2.3").unwrap();

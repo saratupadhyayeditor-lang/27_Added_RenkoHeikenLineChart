@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Dhan Algo Trading System - Rust</title>
-<link rel="stylesheet" href="./app.css?v=13">
+<link rel="stylesheet" href="./app.css?v=14">
 </head>
 <body>
 <div class="app">
@@ -246,18 +246,20 @@
 <script type="module">
   import init, { select_symbol, update_oc_quotes, open_option_chart_by_sid, set_oi_trend_enabled, set_trade_lines, clear_trade_lines } from "./pkg/algo_web.js?v=55";
   import { bootSidebar } from "./sidebar.js?v=18";
-  import { bootConnection } from "./connection.js?v=9";
-  import { bootRealtime } from "./realtime.js?v=79";
+  import { bootConnection } from "./connection.js?v=10";
+  import { bootRealtime } from "./realtime.js?v=80";
   import { bootRtStats } from "./rtstats.js?v=5";
   import { bootBackup } from "./backup.js?v=3";
   import { bootAccount } from "./account.js?v=2";
   import { bootUpdater } from "./updater.js?v=1";
   import { bootTheme } from "./theme.js?v=4";
   import { bootTextSize } from "./textsize.js?v=1";
+  import { bootIndGroup } from "./indgroup.js?v=1";
   bootConnection();
   bootUpdater();
   bootTheme();
   bootTextSize();
+  bootIndGroup();
   // Generic tab switcher: clicking a tab button activates its matching
   // .tab-content pane and notifies modules so they can refresh.
   document.querySelectorAll(".tab-btn[data-tab]").forEach((btn) => {

@@ -1214,6 +1214,71 @@ impl DhanState {
             }
         });
     }
+
+    /// Automatic Dhan REST ("API") reconnect. The market *feed* healed itself on
+    /// its own, but the Dhan *session* was only ever (re)validated by the Connect
+    /// button, so a dropped or silently-rotated session kept the app "connected"
+    /// in the UI while every REST call (chart, option chain, orders) failed until
+    /// the user pressed Connect again.
+    ///
+    /// This watchdog re-runs the exact `profile()` authentication that Connect
+    /// uses - every 2s while the link is down during exchange hours - so a
+    /// transient disconnect heals with no user action. It never touches a feed
+    /// supervisor that is already alive (that one has its own capped backoff, and
+    /// forcing it would only re-trip Dhan's connection limit), and it honours the
+    /// `/api/feed/reset` park cooldown.
+    ///
+    /// Note: an *expired daily token* still needs a fresh paste - the app holds no
+    /// app-secret/TOTP, so it cannot mint a new token on its own.
+    pub fn spawn_api_reconnect(&self) {
+        let st = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_err: Option<String> = None;
+            loop {
+                tick.tick().await;
+                if st.park_active() || !market_open_now() {
+                    continue;
+                }
+                let Some(session) = st.session.read().await.clone() else {
+                    continue;
+                };
+                // Already streaming: nothing to reconnect.
+                let live = st
+                    .health
+                    .lock()
+                    .map(|g| {
+                        g.feed_up
+                            && g.last_tick
+                                .map(|t| t.elapsed() < Duration::from_secs(15))
+                                .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if live {
+                    continue;
+                }
+                match session.client.profile().await {
+                    Ok(_) => {
+                        st.set_auth_error(None);
+                        last_err = None;
+                        if !st.feed_running() {
+                            tracing::warn!("api auto-reconnect: session valid, restarting feed");
+                            st.spawn_feed_task(session).await;
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if last_err.as_deref() != Some(msg.as_str()) {
+                            tracing::warn!("api auto-reconnect failed: {msg}");
+                            last_err = Some(msg.clone());
+                        }
+                        st.set_auth_error(Some(msg));
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// True during the Indian exchange session (IST 09:15-23:30, Mon-Fri), which

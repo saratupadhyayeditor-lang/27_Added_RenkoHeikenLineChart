@@ -143,6 +143,13 @@
     color: #c8c8e0;
   }
   .ind-item:hover { background: #2d2d5e; color: #fff; }
+  .ind-group { display: flex; flex-direction: column; }
+  .ind-cat {
+    font-size: 10px; font-weight: 700; letter-spacing: .4px; text-transform: uppercase;
+    color: var(--tab-accent, #8ab4ff); margin: 7px 2px 3px; padding-top: 6px;
+    border-top: 1px solid var(--border);
+  }
+  .ind-cat:first-child { margin-top: 0; padding-top: 0; border-top: none; }
 
   .chart-wrap { flex: 1; min-height: 0; position: relative; }
   .chart-container { width: 100%; height: 100%; min-height: 260px; }

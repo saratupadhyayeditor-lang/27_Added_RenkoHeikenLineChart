@@ -15,6 +15,11 @@ import { istDateTime } from "./ist.js?v=1";
 
 const $ = (id) => document.getElementById(id);
 
+// Distribution repo baked into the desktop shell too (desktop/src/updater.rs).
+// Pre-filled so a fresh install can update with no manual repo setup.
+const DEFAULT_REPO =
+  "saratupadhyayeditor-lang/20_backup_Fixed_NiftyTrend_StrategyTradeExecutionOnOppositeSide";
+
 let booted = false;
 let logLines = [];
 let hasIpc = false;
@@ -64,7 +69,8 @@ function renderPane(pane) {
     '<div style="flex:1;min-width:320px;background:#0e0e24;border:1px solid #1e1e40;border-radius:4px;padding:12px">' +
     '<h4 style="font-size:11px;color:#d0d0d0;margin:0 0 8px">1 · Update source</h4>' +
     '<label style="font-size:10px;color:#888;display:block;margin-bottom:3px">GitHub repo URL / owner-repo</label>' +
-    '<input id="__updRepo" placeholder="https://github.com/owner/repo" spellcheck="false" ' +
+    '<input id="__updRepo" placeholder="https://github.com/' + DEFAULT_REPO + '" spellcheck="false" ' +
+    'value="' + DEFAULT_REPO + '" ' +
     'style="width:100%;box-sizing:border-box;padding:7px 9px;border-radius:4px;border:1px solid #2d2d50;background:#12122a;color:#d0d0d0;font-size:12px">' +
     '<div style="display:flex;gap:8px;margin-top:10px">' +
     '<button id="__updSave" class="btn-action" style="flex:1;padding:7px 12px;font-size:11px;width:auto;margin:0">Save</button>' +

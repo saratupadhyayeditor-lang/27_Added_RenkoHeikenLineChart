@@ -170,6 +170,7 @@ async fn main() {
     let market = MarketState::new();
     let dhan = DhanState::new(market.clone());
     dhan.spawn_watchdog();
+    dhan.spawn_api_reconnect();
     scrip::spawn_warm();
     let rt = RealtimeState::new(dhan.clone());
     let paper_rt = RealtimeState::new_paper(dhan.clone());
