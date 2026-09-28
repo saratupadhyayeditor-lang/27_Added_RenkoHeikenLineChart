@@ -246,6 +246,22 @@ pub struct Settings {
     /// (live or paper) is throttled so no more than this many orders are sent in
     /// any trailing one-second window. Dhan's API allows ~6/sec; clamped 1..=30.
     pub order_per_sec: i64,
+    /// "Engine Scan" throttle toggle. When ON, the engine re-scans its entry
+    /// conditions only every `scan_interval_ms` instead of the ultrafast ~100ms
+    /// tick. Exits (SL / trail / TP) are NEVER throttled - they stay on the
+    /// dedicated guardian task. When OFF, the default ~100ms cadence is used.
+    pub scan_interval_on: bool,
+    /// "Engine Scan" interval in milliseconds. Only meaningful while
+    /// `scan_interval_on`; normalised to 50..=86_400_000 (24h) with a 50ms floor
+    /// so a stray 0 can never spin the loop. Default 100 = the normal tick.
+    pub scan_interval_ms: i64,
+    /// Engine Scan sub-mode: instead of a fixed interval, scan once per bar close
+    /// - i.e. the instant the selected timeframe rolls to a new bar. When on, the
+    /// interval inputs are ignored (the UI disables them).
+    pub scan_bar_close: bool,
+    /// Timeframe whose bar close triggers the scan: `1min` | `5min`. Only
+    /// meaningful while `scan_bar_close` is on.
+    pub scan_bar_close_tf: String,
     pub start_after_enabled: bool,
     pub start_after: String,
     pub no_trade_after_enabled: bool,
@@ -261,7 +277,13 @@ pub struct Settings {
     pub strike_mode: String,
     pub strike_count: i64,
     pub only_positive: bool,
+    /// "Pick fastest positive rising LTP": when ON, each strategy scans only its
+    /// own side's strikes (bullish stock -> CE leg, bearish stock -> PE leg) and
+    /// executes the premium that is rising fastest (highest positive % change),
+    /// never a falling one. If nothing on that side is rising, no entry fires.
     pub fastest_rising: bool,
+    /// Strike-window size (`Fastest-Rising Strikes`): how many strikes above and
+    /// below ATM are scanned when picking the fastest riser / nearest +green leg.
     pub fastest_count: i64,
     /// Testing-only "Manual Strike Select": when on, the ATM / strike-mode /
     /// count / +green / fastest-rising preferences are ignored and the engine
@@ -311,6 +333,14 @@ pub struct Settings {
     pub all_in_one: bool,
     pub dir_guard: bool,
     pub overall_dir: bool,
+    /// "Filter-side routing": when ON, the executed option leg is decided SOLELY
+    /// by the strategy's own filter side - a bullish-filtered strategy trades CE,
+    /// a bearish-filtered one trades PE - and no other direction source (NIFTY
+    /// straight-line lock, Top-Movers auto side, Run-Strategy-In override or the
+    /// Overall Bullish/Bearish toggle) may flip it. A bullish filter that detects
+    /// bearish simply fails its gate, so it never opens a PE trade (and vice
+    /// versa). When OFF the normal multi-source routing applies.
+    pub filter_side_route: bool,
     /// Multi-position mode A: when a position is already open, allow a new
     /// position on the next fresh signal (the entry gate turning from not-met to
     /// met). Concurrent positions are unlimited, so a signal that keeps
@@ -460,6 +490,10 @@ impl Default for Settings {
             trade_limit_count: 5,
             ai_trades: false,
             order_per_sec: 6,
+            scan_interval_on: false,
+            scan_interval_ms: 100,
+            scan_bar_close: false,
+            scan_bar_close_tf: "1min".into(),
             start_after_enabled: false,
             start_after: "09:15".into(),
             no_trade_after_enabled: false,
@@ -500,6 +534,7 @@ impl Default for Settings {
             all_in_one: false,
             dir_guard: false,
             overall_dir: true,
+            filter_side_route: false,
             multi_fresh_on: true,
             multi_always_on: false,
             brain_mode: "off".into(),
@@ -1224,6 +1259,10 @@ impl RealtimeState {
             doc.settings.order_per_sec = 6;
         }
         doc.settings.order_per_sec = order_per_sec_budget(doc.settings.order_per_sec);
+        // Engine Scan interval: keep it inside the floor/ceiling so a saved 0 or a
+        // nonsense value can never make the engine spin or misbehave.
+        doc.settings.scan_interval_ms = scan_interval_budget(doc.settings.scan_interval_ms);
+        doc.settings.scan_bar_close_tf = scan_bar_close_tf(&doc.settings.scan_bar_close_tf).to_string();
         let st = Self {
             dhan,
             paper,
@@ -1356,6 +1395,8 @@ impl RealtimeState {
             parsed.settings.order_per_sec = 6;
         }
         parsed.settings.order_per_sec = order_per_sec_budget(parsed.settings.order_per_sec);
+        parsed.settings.scan_interval_ms = scan_interval_budget(parsed.settings.scan_interval_ms);
+        parsed.settings.scan_bar_close_tf = scan_bar_close_tf(&parsed.settings.scan_bar_close_tf).to_string();
         let count = parsed.strategies.len() + parsed.positions.len() + parsed.closed.len();
         {
             let mut d = self.doc.lock().map_err(|_| "state lock poisoned".to_string())?;
@@ -1701,12 +1742,15 @@ impl RealtimeState {
 
     fn spawn_engine(self) {
         tokio::spawn(async move {
-            // 100ms base timer: every strategy is re-scanned on the live bar each
-            // tick; entry rate is bounded by the orders/sec cap.
-            let mut tick = tokio::time::interval(Duration::from_millis(100));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Engine loop. Housekeeping runs on a base ~100ms cadence; the entry
+            // scan is additionally throttled by the "Engine Scan" setting when it
+            // is enabled (see `scan_interval_on` / `scan_interval_ms`). Exits are
+            // never throttled - they live in the dedicated 50ms guardian task.
+            let mut last_scan = 0i64;
+            // Last bar bucket seen in "Countdown to Bar Close" scan mode; a change
+            // means a new bar just opened, which is exactly when we scan.
+            let mut last_bar_bucket = 0i64;
             loop {
-                tick.tick().await;
                 // Scanners run whenever their own toggle is ON, independent of the
                 // engine run/arm state, so the Top Movers / commodity readouts
                 // always fetch (old app polled them outside the run gate).
@@ -1746,22 +1790,68 @@ impl RealtimeState {
                     }
                     self.log("info", "Run / Tick Now: immediate evaluation pass");
                 }
-                let on = self.doc.lock().map(|d| d.engine_on).unwrap_or(false);
-                if !on {
-                    continue;
+                // Read the run state plus the Engine Scan config in a single lock.
+                let (on, armed, scan_on, scan_ms, scan_bc, scan_bc_tf) = self
+                    .doc()
+                    .map(|d| {
+                        (
+                            d.engine_on,
+                            d.armed,
+                            d.settings.scan_interval_on,
+                            d.settings.scan_interval_ms,
+                            d.settings.scan_bar_close,
+                            d.settings.scan_bar_close_tf.clone(),
+                        )
+                    })
+                    .unwrap_or((false, false, false, 100, false, "1min".into()));
+                if on {
+                    self.check_square_off().await;
+                    if force && !armed {
+                        self.log("warn", "tick: engine running but disarmed - arm to place orders");
+                    }
+                    if armed {
+                        // "Engine Scan" throttle. Three cases:
+                        //   OFF            -> scan every loop (historical ~100ms).
+                        //   ON + bar-close -> scan the instant the selected
+                        //                     timeframe rolls to a new bar.
+                        //   ON + interval  -> scan every `scan_ms`.
+                        // A manual Run / Tick Now always bypasses the wait.
+                        let due = if force || !scan_on {
+                            true
+                        } else if scan_bc {
+                            let step = scan_bar_close_step_ms(&scan_bc_tf);
+                            now_ms() / step != last_bar_bucket
+                        } else {
+                            now_ms().saturating_sub(last_scan) >= scan_ms
+                        };
+                        if due {
+                            self.scan_signals().await;
+                            last_scan = now_ms();
+                            if scan_bc {
+                                last_bar_bucket = now_ms() / scan_bar_close_step_ms(&scan_bc_tf);
+                            }
+                        }
+                    }
+                    // Position protection (trail / SL / TP) does NOT run here: it
+                    // lives in the dedicated 50ms guardian task so a slow scanner
+                    // REST call can never delay a trailing-stop exit.
+                    self.reconcile_super().await;
+                } else {
+                    // Idle: forget the last bar so re-arming in bar-close mode
+                    // fires an immediate scan instead of waiting for the next bar.
+                    last_bar_bucket = 0;
                 }
-                self.check_square_off().await;
-                let armed = self.doc.lock().map(|d| d.armed).unwrap_or(false);
-                if force && !armed {
-                    self.log("warn", "tick: engine running but disarmed - arm to place orders");
-                }
-                if armed {
-                    self.scan_signals().await;
-                }
-                // Position protection (trail / SL / TP) does NOT run here: it
-                // lives in the dedicated 50ms guardian task so a slow scanner
-                // REST call can never delay a trailing-stop exit.
-                self.reconcile_super().await;
+                // Base cadence: wake at most every 100ms for housekeeping, but
+                // honour a sub-100ms Engine Scan value (e.g. 50ms) instead of
+                // rounding it up. A larger interval (or bar-close mode) simply
+                // leaves the scan gated - 100ms is fast enough to catch a bar
+                // boundary the moment it happens.
+                let base_ms = if on && scan_on && !scan_bc {
+                    scan_ms.clamp(SCAN_INTERVAL_MIN_MS, 100)
+                } else {
+                    100
+                };
+                tokio::time::sleep(Duration::from_millis(base_ms.max(SCAN_INTERVAL_MIN_MS) as u64)).await;
             }
         });
     }
@@ -2082,7 +2172,9 @@ impl RealtimeState {
     /// can never open a CE trade. `None` when the feature is off or the lines are
     /// tied (no committed direction), so callers keep their normal resolution.
     fn nifty_locked_side(&self, settings: &Settings) -> Option<&'static str> {
-        if !settings.nifty_trend_on {
+        // Per-strategy side routing owns the direction: the strategy's own
+        // stock/filter side decides the leg, so the NIFTY lock must not flip it.
+        if per_strategy_side(settings) || !settings.nifty_trend_on {
             return None;
         }
         match self.nifty_dir.load(Ordering::Relaxed) {
@@ -2098,7 +2190,8 @@ impl RealtimeState {
     /// available). `None` when the override is off - callers then keep their
     /// normal option-side resolution.
     fn effective_run_in_side(&self, settings: &Settings) -> Option<&'static str> {
-        if !settings.run_in_enabled {
+        // Per-strategy side routing disables the "Run Strategy In" CE/PE override.
+        if per_strategy_side(settings) || !settings.run_in_enabled {
             return None;
         }
         if settings.run_in_auto {
@@ -2120,6 +2213,12 @@ impl RealtimeState {
     /// single source, otherwise the filter side and the traded contract can
     /// disagree and an entry fires opposite to the filter that gated it.
     fn active_side(&self, settings: &Settings) -> Option<&'static str> {
+        // Per-strategy side routing is per strategy: there is no single global
+        // side to narrow the scanner/Overall-direction with, so report
+        // "undecided" and let each strategy's own side drive its leg.
+        if per_strategy_side(settings) {
+            return None;
+        }
         self.effective_run_in_side(settings)
             .or_else(|| self.auto_option_side(settings))
     }
@@ -2146,6 +2245,9 @@ impl RealtimeState {
     /// diagnostics: the operator's global run-in side wins, else the live scanner
     /// direction, else the strategy's own bullish/bearish side.
     fn desired_option_side(&self, settings: &Settings, strat: &Strategy) -> String {
+        if let Some(side) = routed_option_side(settings, strat) {
+            return side.to_string();
+        }
         if let Some(side) = self.effective_run_in_side(settings) {
             return side.to_string();
         }
@@ -2365,9 +2467,9 @@ impl RealtimeState {
         // picks instead of leaving them beside the fresh ones. When no direction
         // is decided both legs are shown.
         let settings = self.doc().map(|d| d.settings.clone()).unwrap_or_default();
-        let active = self
-            .effective_run_in_side(&settings)
-            .or_else(|| self.auto_option_side(&settings));
+        // Same single direction source as the engine: with Filter-side routing on
+        // there is no global side, so both gainer (CE) and loser (PE) rows show.
+        let active = self.active_side(&settings);
         let mut legs: Vec<Value> = Vec::new();
         for (side, list) in [("CE", &gainers), ("PE", &losers)] {
             if active.is_some() && active != Some(side) {
@@ -2700,7 +2802,16 @@ impl RealtimeState {
     /// saved settings, which override the manual gate/filter set for this entry.
     fn template_for_direction(&self, settings: &Settings, strat: &Strategy) -> Option<Settings> {
         let mut name = String::new();
-        if settings.movers_on && !settings.manual_strikes_enabled {
+        if per_strategy_side(settings) {
+            // Per-strategy side routing: the strategy's own side selects the
+            // template, never the Top-Movers bias (which could disagree with the
+            // routed leg).
+            name = if strategy_is_bull(strat) {
+                settings.bull_template.clone()
+            } else {
+                settings.bear_template.clone()
+            };
+        } else if settings.movers_on && !settings.manual_strikes_enabled {
             let b = self.mover_bias.load(Ordering::Relaxed);
             if b > 0 {
                 name = settings.mover_bull_template.clone();
@@ -2740,6 +2851,10 @@ impl RealtimeState {
         let bull = side == "CE";
         let mut s2 = settings.clone();
         s2.run_in_enabled = false;
+        // The readout lists each pick's own side explicitly, so keep the
+        // per-strategy side routing from collapsing both rows onto one side.
+        s2.filter_side_route = false;
+        s2.fastest_rising = false;
         s2.option_side = side.to_string();
         let base = Strategy {
             id: format!("pick:{}:{side}", sid),
@@ -3101,6 +3216,16 @@ impl RealtimeState {
             "info",
             &format!("scan pass: {} strategies, {} eligible, filter_mode={} movers={} comm={}", strategies.len(), eligible, filter_mode, movers_on, commodity_on),
         );
+        // Per-strategy scan gap. When Engine Scan is active the outer engine loop
+        // already gates the whole pass (fixed interval or bar close), so the
+        // per-strategy throttle is disabled (0) and every eligible strategy is
+        // evaluated on that pass. With Engine Scan off, keep the historical
+        // 100ms per-strategy cadence.
+        let scan_gap_ms: i64 = if settings0.scan_interval_on {
+            0
+        } else {
+            100
+        };
         for mut strat in strategies {
             if !in_run(&strat) || strat.security_id <= 0 || (strat.conditions.is_empty() && !strat.synthetic) {
                 continue;
@@ -3146,7 +3271,7 @@ impl RealtimeState {
             // it appears instead of at the next bar close.
             {
                 let last = self.last_sig.lock().ok().and_then(|m| m.get(&strat.id).copied()).unwrap_or(0);
-                if now - last < 100 {
+                if now - last < scan_gap_ms {
                     continue;
                 }
                 if let Ok(mut m) = self.last_sig.lock() {
@@ -4342,6 +4467,12 @@ impl RealtimeState {
     /// category. Shared by the automatic leg resolver and the testing-only
     /// Manual Strike Select so both always agree on the side.
     fn target_option_side(&self, strat: &Strategy, settings: &Settings) -> &'static str {
+        // Filter-side routing (highest priority): the strategy's own filter side
+        // picks the contract, so a bullish filter set can only ever trade CE and a
+        // bearish set only PE - no scanner/run-in/overall override can flip it.
+        if let Some(side) = routed_option_side(settings, strat) {
+            return side;
+        }
         if let Some(side) = self.nifty_locked_side(settings) {
             return side;
         }
@@ -4523,11 +4654,13 @@ impl RealtimeState {
         premium >= intrinsic * 0.98
     }
 
-    /// Resolve the option leg, then apply the NIFTY strike preferences:
-    /// "Only +green premium strikes" and "Pick fastest positive rising LTP" from
-    /// a window of `fastestCount` strikes around ATM. With Option Type = "Both
-    /// CE & PE" the fastest positive riser is compared across BOTH sides, so the
-    /// engine can pick the CE or the PE leg - exactly like the old engine.
+    /// Resolve the option leg, then pick the strike on that leg from a window of
+    /// `fastestCount` strikes around ATM:
+    ///   * "Pick fastest positive rising LTP" -> only the strategy's own side is
+    ///     scanned (bullish stock -> CE leg, bearish stock -> PE leg) and the
+    ///     fastest RISING (+green) premium wins. A falling strike is never chosen;
+    ///     if nothing is rising the entry is skipped.
+    ///   * "Only +green premium strikes" -> the +green strike nearest ATM.
     async fn resolve_option_strategy_pref(&self, strat: &Strategy, spot: f64, settings: &Settings) -> Option<Strategy> {
         let base = self.resolve_option_strategy(strat, spot, settings)?;
         // Paper trading is filled only from the shared live feed + in-memory scrip
@@ -4552,12 +4685,13 @@ impl RealtimeState {
         if strikes.is_empty() {
             return Some(base);
         }
-        // Option Type "Both CE & PE" leaves the side open: the fastest positive
-        // riser (or the nearest +green premium when fastest is off) decides.
-        // The strict NIFTY direction lock and the "Run Strategy In" override both
-        // collapse the pool to their forced side, so the cross-side "fastest
-        // riser" scan can never pick the opposite leg while NIFTY is committed.
-        let sides: Vec<&'static str> = if let Some(side) = self.nifty_locked_side(settings) {
+        // Which side's strikes to scan. Per-strategy side routing ("Filter-side
+        // routing" / "Pick fastest positive rising LTP") pins it to the strategy's
+        // own side; otherwise Option Type "Both CE & PE" leaves it open, and the
+        // strict NIFTY lock / Run-in override still collapse it to one side.
+        let sides: Vec<&'static str> = if let Some(side) = routed_option_side(settings, strat) {
+            vec![side]
+        } else if let Some(side) = self.nifty_locked_side(settings) {
             vec![side]
         } else if let Some(side) = self.effective_run_in_side(settings) {
             vec![side]
@@ -4632,30 +4766,21 @@ impl RealtimeState {
                 }
             }
         }
-        if settings.only_positive {
-            pool.retain(|(_id, _s, _k, ltp, chg)| *ltp > 0.0 && *chg > 0.0);
+        // "+green only": keep just the premiums that are actually rising. This is
+        // now required by BOTH preferences, so a falling (ghatne wali) strike can
+        // never be executed.
+        if settings.only_positive || settings.fastest_rising {
+            pool.retain(|(_id, _s, _k, ltp, chg)| is_rising_premium(*ltp, *chg));
         }
         if pool.is_empty() {
+            // No +green premium in the window for this side: skip the entry
+            // instead of executing a falling strike.
             return None;
         }
-        let chosen = if settings.fastest_rising {
-            let mut b: Option<&(i64, String, f64, f64, f64)> = None;
-            for c in &pool {
-                if b.map(|x| c.4 > x.4).unwrap_or(true) {
-                    b = Some(c);
-                }
-            }
-            b
-        } else {
-            let mut b: Option<&(i64, String, f64, f64, f64)> = None;
-            for c in &pool {
-                if b.map(|x| (c.2 - spot).abs() < (x.2 - spot).abs()).unwrap_or(true) {
-                    b = Some(c);
-                }
-            }
-            b
-        };
-        let c = chosen.or_else(|| pool.first())?;
+        // "Pick fastest positive rising LTP" -> the biggest riser on this side;
+        // "Only +green premium strikes" -> the +green strike nearest ATM.
+        let chosen = pick_pref_candidate(&pool, spot, settings.fastest_rising);
+        let c = chosen.map(|i| &pool[i]).or_else(|| pool.first())?;
         let mut out = strat.clone();
         out.security_id = c.0;
         out.exchange_segment = seg.to_string();
@@ -7112,6 +7237,67 @@ fn strategy_is_bull(strat: &Strategy) -> bool {
     }
 }
 
+/// True when the option leg must follow each strategy's own stock/filter side
+/// instead of a global scanner direction. Two features need this:
+///   * "Filter-side routing" - bullish filters trade CE, bearish filters PE.
+///   * "Pick fastest positive rising LTP" - a bullish stock may only scan its CE
+///     leg, a bearish stock only its PE leg, then the fastest riser is picked.
+/// In both cases no NIFTY lock / Top-Movers auto side / Run-in / Overall
+/// direction may flip the leg.
+fn per_strategy_side(settings: &Settings) -> bool {
+    settings.filter_side_route || settings.fastest_rising
+}
+
+/// Option side forced by per-strategy routing: bullish strategies trade CE,
+/// bearish ones PE. `None` when neither feature is on, so callers keep their
+/// normal multi-source resolution.
+fn routed_option_side(settings: &Settings, strat: &Strategy) -> Option<&'static str> {
+    if per_strategy_side(settings) {
+        Some(if strategy_is_bull(strat) { "CE" } else { "PE" })
+    } else {
+        None
+    }
+}
+
+/// A strike-quote candidate: `(security_id, trading_symbol, strike, ltp,
+/// change_pct)`. `change_pct` is the premium's percentage change vs the previous
+/// close, so a positive value means the premium is rising.
+type LegCandidate = (i64, String, f64, f64, f64);
+
+/// A premium is "rising" only when it has a live price and its change vs the
+/// previous close is strictly positive. Flat or falling premiums are excluded so
+/// the selector can never execute a "ghatne wali" strike.
+fn is_rising_premium(ltp: f64, chg: f64) -> bool {
+    ltp > 0.0 && chg > 0.0
+}
+
+/// Index of the strike the "strike preference" should execute.
+///   * "Pick fastest positive rising LTP" -> the highest (fastest) positive
+///     `change_pct`; a tie goes to the strike nearest ATM.
+///   * "Only +green premium strikes" -> the +green strike nearest ATM.
+/// The caller passes an already +green-filtered pool, so this never returns a
+/// falling strike.
+fn pick_pref_candidate(pool: &[LegCandidate], spot: f64, fastest: bool) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, c) in pool.iter().enumerate() {
+        let better = match best {
+            None => true,
+            Some(b) => {
+                let x = &pool[b];
+                if fastest {
+                    c.4 > x.4 || (c.4 == x.4 && (c.2 - spot).abs() < (x.2 - spot).abs())
+                } else {
+                    (c.2 - spot).abs() < (x.2 - spot).abs()
+                }
+            }
+        };
+        if better {
+            best = Some(i);
+        }
+    }
+    best
+}
+
 fn filter_is_bull(k: &str) -> bool {
     if k.starts_with("Bull") {
         true
@@ -7792,6 +7978,40 @@ fn order_per_sec_budget(ops: i64) -> i64 {
     ops.clamp(1, 30)
 }
 
+/// "Engine Scan" interval bounds. A 50ms floor keeps the scan from ever spinning
+/// the loop, and the 24h ceiling matches the max a user can express in the UI.
+const SCAN_INTERVAL_MIN_MS: i64 = 50;
+const SCAN_INTERVAL_MAX_MS: i64 = 86_400_000;
+
+/// Normalise the Engine Scan interval: anything below the floor (including a
+/// stray 0/negative) becomes 100ms, and anything above 24h is clamped. Applied
+/// on state load and on every settings save so the engine always sees a value it
+/// can trust.
+fn scan_interval_budget(ms: i64) -> i64 {
+    if ms < SCAN_INTERVAL_MIN_MS {
+        100
+    } else {
+        ms.min(SCAN_INTERVAL_MAX_MS)
+    }
+}
+
+/// Normalise the Engine Scan bar-close timeframe to the two the UI offers. Any
+/// unrecognised value falls back to `1min` so the engine never has to guess.
+fn scan_bar_close_tf(tf: &str) -> &'static str {
+    match tf.trim().to_lowercase().as_str() {
+        "5min" | "5m" => "5min",
+        _ => "1min",
+    }
+}
+
+/// Milliseconds in one bar of the given Engine Scan bar-close timeframe.
+fn scan_bar_close_step_ms(tf: &str) -> i64 {
+    match scan_bar_close_tf(tf) {
+        "5min" => 5 * 60_000,
+        _ => 60_000,
+    }
+}
+
 /// Index ids must be scanned under the `IDX_I` segment so their `IDX_I:<sid>`
 /// quote key matches the feed cache. Injecting them as `NSE_EQ` silently drops
 /// every index from the Top Movers / NIFTY-trend universes.
@@ -8303,6 +8523,10 @@ pub async fn settings_post(State(rt): State<RealtimeState>, Json(v): Json<Value>
             d.settings.order_per_sec = 6;
         }
         d.settings.order_per_sec = order_per_sec_budget(d.settings.order_per_sec);
+        // Engine Scan interval: normalise on every save so the engine loop always
+        // reads a value inside the floor/ceiling (100ms default for a stray 0).
+        d.settings.scan_interval_ms = scan_interval_budget(d.settings.scan_interval_ms);
+        d.settings.scan_bar_close_tf = scan_bar_close_tf(&d.settings.scan_bar_close_tf).to_string();
         // "Make this default setting" markers (old AST runIn/tradeIn `default`
         // flags): the routing is always persisted, so surface the confirmation
         // the old engine logged instead of leaving the checkbox silently inert.
@@ -9997,6 +10221,95 @@ mod gate_tests {
         assert_eq!(side_allowed(true, false, None), (true, false));
     }
 
+    #[test]
+    fn filter_side_routing_forces_the_filter_side() {
+        let bull = bull_strategy();
+        let bear = bear_strategy();
+        let mut s = Settings::default();
+        // Off: no forced side, normal multi-source routing applies.
+        assert_eq!(routed_option_side(&s, &bull), None);
+        assert_eq!(routed_option_side(&s, &bear), None);
+
+        // On: the strategy's own filter side decides the leg, so a bullish
+        // strategy can only ever trade CE and a bearish one only PE - regardless
+        // of the other direction sources being armed.
+        s.filter_side_route = true;
+        assert_eq!(routed_option_side(&s, &bull), Some("CE"));
+        assert_eq!(routed_option_side(&s, &bear), Some("PE"));
+
+        // The competing overrides are suppressed while routing is on.
+        s.nifty_trend_on = true;
+        s.run_in_enabled = true;
+        s.run_in_side = "CE".into();
+        s.option_side = "CE".into();
+        assert_eq!(routed_option_side(&s, &bear), Some("PE"), "bearish leg cannot be flipped to CE");
+
+        // A generic BUY strategy counts as bullish; a SELL one as bearish.
+        let generic = Strategy { category: String::new(), side: "BUY".into(), ..Default::default() };
+        let generic_sell = Strategy { category: String::new(), side: "SELL".into(), ..Default::default() };
+        assert_eq!(routed_option_side(&s, &generic), Some("CE"));
+        assert_eq!(routed_option_side(&s, &generic_sell), Some("PE"));
+    }
+
+    #[test]
+    fn filter_side_route_round_trip_uses_camel_case() {
+        let mut s = Settings::default();
+        assert!(!s.filter_side_route);
+        s.filter_side_route = true;
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["filterSideRoute"], serde_json::json!(true));
+        let back: Settings = serde_json::from_value(v).unwrap();
+        assert!(back.filter_side_route);
+    }
+
+    #[test]
+    fn fastest_rising_scans_only_the_stocks_own_side() {
+        // OFF: no forced side (normal multi-source routing).
+        let bull = bull_strategy();
+        let bear = bear_strategy();
+        let mut s = Settings::default();
+        assert_eq!(routed_option_side(&s, &bull), None);
+        assert_eq!(routed_option_side(&s, &bear), None);
+
+        // ON: a bullish stock may only scan its CE leg, a bearish stock only PE -
+        // even with the other direction sources armed.
+        s.fastest_rising = true;
+        s.nifty_trend_on = true;
+        s.run_in_enabled = true;
+        s.run_in_side = "PE".into();
+        s.option_side = "PE".into();
+        assert_eq!(routed_option_side(&s, &bull), Some("CE"));
+        assert_eq!(routed_option_side(&s, &bear), Some("PE"));
+    }
+
+    #[test]
+    fn fastest_rising_never_picks_a_falling_strike() {
+        // +5% (the fastest riser among the rising ones, but NOT nearest to ATM)
+        // must beat +3% and +1%; a strong FALLING strike is excluded upstream.
+        let pool: Vec<LegCandidate> = vec![
+            (1, "A".into(), 100.0, 120.0, 1.0),
+            (2, "B".into(), 110.0, 150.0, 5.0),
+            (3, "C".into(), 90.0, 130.0, 3.0),
+        ];
+        let spot = 100.0;
+        assert_eq!(pick_pref_candidate(&pool, spot, true), Some(1), "fastest = max % change");
+        // "Only +green (no fastest)" -> nearest to ATM.
+        assert_eq!(pick_pref_candidate(&pool, spot, false), Some(0), "nearest to ATM");
+
+        // A tie in % change breaks toward the strike nearest ATM, deterministically.
+        let tie: Vec<LegCandidate> = vec![
+            (1, "A".into(), 130.0, 120.0, 4.0),
+            (2, "B".into(), 100.0, 110.0, 4.0),
+        ];
+        assert_eq!(pick_pref_candidate(&tie, spot, true), Some(1));
+
+        // Rising predicate: falling / flat / unquoted premiums are rejected.
+        assert!(is_rising_premium(12.0, 2.5));
+        assert!(!is_rising_premium(12.0, -0.1), "falling premium rejected");
+        assert!(!is_rising_premium(12.0, 0.0), "flat premium rejected");
+        assert!(!is_rising_premium(0.0, 3.0), "unquoted premium rejected");
+    }
+
     const UI_BULL: &[&str] = &[
         "IncUp", "GapUp", "IncUpAll", "CrossUp", "GtUp", "LtUp", "PaneCrossUp", "PaneIncUpAll",
         "BullBbwInc", "BullSmf", "BullAsr", "BullOit", "BullBbCrossAbove", "BullPcCrossAbove",
@@ -10584,6 +10897,57 @@ mod gate_tests {
         assert_eq!(order_per_sec_budget(6), 6);
         assert_eq!(order_per_sec_budget(30), 30);
         assert_eq!(order_per_sec_budget(500), 30);
+    }
+
+    #[test]
+    fn scan_interval_budget_normalises_floor_and_ceiling() {
+        // A stray 0/negative falls back to the normal 100ms tick.
+        assert_eq!(scan_interval_budget(0), 100);
+        assert_eq!(scan_interval_budget(-5), 100);
+        assert_eq!(scan_interval_budget(49), 100);
+        // Valid sub-minute and minute values are preserved exactly.
+        assert_eq!(scan_interval_budget(50), 50);
+        assert_eq!(scan_interval_budget(100), 100);
+        assert_eq!(scan_interval_budget(250), 250);
+        assert_eq!(scan_interval_budget(1000), 1000);
+        assert_eq!(scan_interval_budget(60_000), 60_000);
+        // Above one day is clamped.
+        assert_eq!(scan_interval_budget(86_400_001), SCAN_INTERVAL_MAX_MS);
+    }
+
+    #[test]
+    fn engine_scan_settings_round_trip_uses_camel_case() {
+        let mut s = Settings::default();
+        assert!(!s.scan_interval_on);
+        assert_eq!(s.scan_interval_ms, 100);
+        assert!(!s.scan_bar_close);
+        assert_eq!(s.scan_bar_close_tf, "1min");
+        s.scan_interval_on = true;
+        s.scan_interval_ms = 60_000;
+        s.scan_bar_close = true;
+        s.scan_bar_close_tf = "5min".into();
+        let v = serde_json::to_value(&s).unwrap();
+        // The UI reads/writes these exact camelCase keys.
+        assert_eq!(v["scanIntervalOn"], serde_json::json!(true));
+        assert_eq!(v["scanIntervalMs"], serde_json::json!(60_000));
+        assert_eq!(v["scanBarClose"], serde_json::json!(true));
+        assert_eq!(v["scanBarCloseTf"], serde_json::json!("5min"));
+        let back: Settings = serde_json::from_value(v).unwrap();
+        assert!(back.scan_interval_on);
+        assert_eq!(back.scan_interval_ms, 60_000);
+        assert!(back.scan_bar_close);
+        assert_eq!(back.scan_bar_close_tf, "5min");
+    }
+
+    #[test]
+    fn scan_bar_close_timeframe_maps_to_the_right_step() {
+        assert_eq!(scan_bar_close_step_ms("1min"), 60_000);
+        assert_eq!(scan_bar_close_step_ms("5min"), 300_000);
+        // Anything unrecognised falls back to 1min.
+        assert_eq!(scan_bar_close_step_ms("15min"), 60_000);
+        assert_eq!(scan_bar_close_step_ms(""), 60_000);
+        assert_eq!(scan_bar_close_tf("5m"), "5min");
+        assert_eq!(scan_bar_close_tf("bogus"), "1min");
     }
 
     #[test]
