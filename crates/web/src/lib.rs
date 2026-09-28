@@ -1577,13 +1577,30 @@ fn dir_from_str(s: &str) -> PosDir {
     }
 }
 
-/// Auto-mirror the stop-loss from the dragged target distance (risk == reward
-/// on creation, i.e. R:R 1:1). Returns `(target, stop)`.
-fn mirror_levels(dir: PosDir, entry: f64, dragged: f64) -> (f64, f64) {
-    let risk = (dragged - entry).abs();
+/// Resolve the profit/stop levels for a drag from `entry` to `cur`. The level
+/// nearest the cursor tracks the cursor (so the box follows the mouse instead of
+/// appearing inverted), and the opposite level mirrors it for a 1:1 risk/reward
+/// while drawing. Long keeps profit above / stop below, Short the reverse.
+/// Returns `(target, stop)`.
+fn pos_levels(dir: PosDir, entry: f64, cur: f64) -> (f64, f64) {
+    let d = cur - entry;
     match dir {
-        PosDir::Long => (entry + risk, entry - risk),
-        PosDir::Short => (entry - risk, entry + risk),
+        // Cursor above entry -> it is the target; below -> it is the stop.
+        PosDir::Long => {
+            if d >= 0.0 {
+                (entry + d, entry - d)
+            } else {
+                (entry - d, entry + d)
+            }
+        }
+        // Cursor below entry -> it is the target; above -> it is the stop.
+        PosDir::Short => {
+            if d <= 0.0 {
+                (entry + d, entry - d)
+            } else {
+                (entry - d, entry + d)
+            }
+        }
     }
 }
 
@@ -1671,6 +1688,18 @@ fn draw_pos_level(
     let _ = ctx.set_line_dash(&empty);
 }
 
+/// Price with a fixed 2-decimal format (never abbreviated like `fmt_val`, so the
+/// exact traded level is always legible).
+fn pos_price(v: f64) -> String {
+    format!("{:.2}", v)
+}
+
+fn measure_w(ctx: &CanvasRenderingContext2d, text: &str) -> f64 {
+    ctx.measure_text(text)
+        .map(|m| m.width())
+        .unwrap_or_else(|_| text.chars().count() as f64 * 5.2)
+}
+
 fn draw_pos_axis_tag(ctx: &CanvasRenderingContext2d, plot: &Plot, y: f64, price: f64, color: &str) {
     if !y.is_finite() || y < plot.top || y > plot.bottom {
         return;
@@ -1679,11 +1708,43 @@ fn draw_pos_axis_tag(ctx: &CanvasRenderingContext2d, plot: &Plot, y: f64, price:
     ctx.fill_rect(plot.right, y - 7.0, AXIS_W, 14.0);
     set_fill(ctx, "#0b0b1a");
     ctx.set_font("10px sans-serif");
-    ctx.fill_text(&fmt_val(price, None), plot.right + 5.0, y + 3.0).ok();
+    ctx.fill_text(&pos_price(price), plot.right + 5.0, y + 3.0).ok();
 }
 
-/// Paint one position tool: shaded profit/loss zones, entry/target/stop lines,
-/// right-axis price tags and a header showing the live risk/reward ratio.
+/// TradingView-style level caption: a small dark pill with a colored accent bar,
+/// right-aligned inside the box. Carries the level name plus points and percent.
+fn draw_pos_caption(
+    ctx: &CanvasRenderingContext2d,
+    plot: &Plot,
+    x_right: f64,
+    y: f64,
+    text: &str,
+    accent: &str,
+) {
+    if !y.is_finite() {
+        return;
+    }
+    ctx.set_font("9px sans-serif");
+    let w = measure_w(ctx, text) + 16.0;
+    let h = 14.0;
+    let x = (x_right - w).clamp(plot.left + 2.0, (plot.right - w - 1.0).max(plot.left + 2.0));
+    let y0 = (y - h / 2.0).clamp(plot.top + 1.0, (plot.bottom - h - 1.0).max(plot.top + 1.0));
+    set_fill(ctx, "rgba(11,11,26,0.88)");
+    ctx.fill_rect(x, y0, w, h);
+    set_fill(ctx, accent);
+    ctx.fill_rect(x, y0, 3.0, h);
+    set_stroke(ctx, accent);
+    ctx.set_line_width(1.0);
+    let empty = Array::new();
+    let _ = ctx.set_line_dash(&empty);
+    ctx.stroke_rect(x + 0.5, y0 + 0.5, w - 1.0, h - 1.0);
+    set_fill(ctx, "#e8e8f2");
+    ctx.fill_text(text, x + 8.0, y0 + 10.0).ok();
+}
+
+/// Paint one position tool TradingView-fashion: shaded profit (green) and loss
+/// (red) zones, entry/target/stop lines, right-axis price tags, and per-level
+/// captions showing price, points and percent plus the live risk/reward.
 fn draw_position(
     ctx: &CanvasRenderingContext2d,
     app: &App,
@@ -1702,22 +1763,29 @@ fn draw_position(
     let y_s = y_for(plot, lo, hi, t.stop_price);
     let cy = |y: f64| y.clamp(plot.top, plot.bottom);
 
+    let entry = t.entry_price;
+    let reward = (t.target_price - entry).abs();
+    let risk = (t.stop_price - entry).abs();
+    let reward_pct = if entry.abs() > 0.0 { reward / entry.abs() * 100.0 } else { 0.0 };
+    let risk_pct = if entry.abs() > 0.0 { risk / entry.abs() * 100.0 } else { 0.0 };
+    let rr = if risk > 0.0 { reward / risk } else { 0.0 };
+
     // profit zone (entry -> target) and loss zone (entry -> stop)
     let (pt, pb) = (cy(y_e).min(cy(y_t)), cy(y_e).max(cy(y_t)));
-    set_fill(ctx, "rgba(0,212,170,0.13)");
+    set_fill(ctx, "rgba(0,212,170,0.14)");
     ctx.fill_rect(xa, pt, bw, (pb - pt).max(0.0));
     let (st, sb) = (cy(y_e).min(cy(y_s)), cy(y_e).max(cy(y_s)));
-    set_fill(ctx, "rgba(255,82,82,0.13)");
+    set_fill(ctx, "rgba(255,82,82,0.14)");
     ctx.fill_rect(xa, st, bw, (sb - st).max(0.0));
 
     // outer border
     let bt = pt.min(st);
     let bb = pb.max(sb);
-    set_stroke(ctx, "#3a3a5e");
+    set_stroke(ctx, "#4a4a72");
     ctx.set_line_width(1.0);
     let empty = Array::new();
     let _ = ctx.set_line_dash(&empty);
-    ctx.stroke_rect(xa, bt, bw, (bb - bt).max(0.0));
+    ctx.stroke_rect(xa + 0.5, bt + 0.5, (bw - 1.0).max(1.0), (bb - bt - 1.0).max(1.0));
 
     // dashed vertical entry-time guide
     set_stroke(ctx, POS_ENTRY);
@@ -1733,29 +1801,52 @@ fn draw_position(
 
     // level lines
     draw_pos_level(ctx, plot, xa, xb, y_e, POS_ENTRY, 1.0, 2);
-    draw_pos_level(ctx, plot, xa, xb, y_t, POS_PROFIT, 1.5, 0);
-    draw_pos_level(ctx, plot, xa, xb, y_s, POS_LOSS, 1.5, 0);
+    draw_pos_level(ctx, plot, xa, xb, y_t, POS_PROFIT, 2.0, 0);
+    draw_pos_level(ctx, plot, xa, xb, y_s, POS_LOSS, 2.0, 0);
 
     // right-axis price tags
     draw_pos_axis_tag(ctx, plot, y_t, t.target_price, POS_PROFIT);
     draw_pos_axis_tag(ctx, plot, y_s, t.stop_price, POS_LOSS);
     draw_pos_axis_tag(ctx, plot, y_e, t.entry_price, POS_ENTRY);
 
-    // header: direction + risk/reward ratio
-    let risk = (t.entry_price - t.stop_price).abs();
-    let reward = (t.target_price - t.entry_price).abs();
-    let rr = if risk > 0.0 { reward / risk } else { 0.0 };
-    let title = format!("{}  R:R 1:{:.2}", pos_label(t.dir), rr);
+    // per-level captions with points + percent
+    draw_pos_caption(
+        ctx,
+        plot,
+        xb,
+        y_t,
+        &format!("Target {}  +{} (+{:.2}%)", pos_price(t.target_price), pos_price(reward), reward_pct),
+        POS_PROFIT,
+    );
+    draw_pos_caption(
+        ctx,
+        plot,
+        xb,
+        y_s,
+        &format!("Stop {}  -{} (-{:.2}%)", pos_price(t.stop_price), pos_price(risk), risk_pct),
+        POS_LOSS,
+    );
+    draw_pos_caption(
+        ctx,
+        plot,
+        xb,
+        y_e,
+        &format!("Entry {}   R:R 1:{:.2}", pos_price(entry), rr),
+        POS_ENTRY,
+    );
+
+    // header: direction + profit read-out
+    let title = format!("{}   +{} (+{:.2}%)", pos_label(t.dir), pos_price(reward), reward_pct);
     ctx.set_font("bold 10px sans-serif");
-    let w = title.chars().count() as f64 * 6.4 + 12.0;
-    let lx = (xa + 4.0).min(plot.right - w - 2.0).max(plot.left + 2.0);
-    let ly = (bt + 4.0).min(plot.bottom - 18.0).max(plot.top + 1.0);
+    let w = measure_w(ctx, &title) + 18.0;
+    let lx = (xa + 4.0).min((plot.right - w - 2.0).max(plot.left + 2.0)).max(plot.left + 2.0);
+    let ly = (bt + 4.0).min((plot.bottom - 17.0).max(plot.top + 1.0)).max(plot.top + 1.0);
     set_fill(ctx, "#ffffff");
     ctx.fill_rect(lx, ly, w, 15.0);
     set_fill(ctx, if t.dir == PosDir::Long { POS_PROFIT } else { POS_LOSS });
     ctx.fill_rect(lx, ly, 4.0, 15.0);
     set_fill(ctx, "#0b0b1a");
-    ctx.fill_text(&title, lx + 8.0, ly + 11.0).ok();
+    ctx.fill_text(&title, lx + 9.0, ly + 11.0).ok();
 }
 
 fn draw_positions(ctx: &CanvasRenderingContext2d, app: &App, plot: &Plot, lo: f64, hi: f64) {
@@ -1763,9 +1854,10 @@ fn draw_positions(ctx: &CanvasRenderingContext2d, app: &App, plot: &Plot, lo: f6
         draw_position(ctx, app, plot, lo, hi, t);
     }
     if let Some(d) = &app.pos_drag {
-        // While dragging, show the mirrored target/SL live so the auto-SL is
-        // visible before the mouse is released.
-        let (target, stop) = mirror_levels(d.dir, d.entry_price, d.cur_price);
+        // While dragging, show the live target/SL so the auto-mirrored level is
+        // visible before the mouse is released. The cursor-side edge tracks the
+        // cursor, so the box grows with the mouse instead of feeling inverted.
+        let (target, stop) = pos_levels(d.dir, d.entry_price, d.cur_price);
         let t = PositionTool {
             dir: d.dir,
             entry_time: d.entry_time,
@@ -3640,6 +3732,20 @@ fn hook_toolbar() {
     }
 }
 
+/// Canvas-local (x, y) of a mouse event plus whether it is inside the canvas.
+/// Used by the window-level move listeners so a drag keeps tracking the cursor
+/// even after it leaves the canvas (smooth TradingView-style drawing).
+fn canvas_xy(e: &MouseEvent) -> Option<(f64, f64, bool)> {
+    let c = by_id("chartCanvas")?.dyn_into::<HtmlCanvasElement>().ok()?;
+    let rect = c.get_bounding_client_rect();
+    let w = c.client_width() as f64;
+    let h = c.client_height() as f64;
+    let x = e.client_x() as f64 - rect.left();
+    let y = e.client_y() as f64 - rect.top();
+    let inside = x >= 0.0 && y >= 0.0 && x <= w && y <= h;
+    Some((x, y, inside))
+}
+
 fn hook_canvas() {
     let container = match by_id("chart-container") {
         Some(c) => c,
@@ -3659,34 +3765,32 @@ fn hook_canvas() {
     container.append_child(&canvas).ok();
     container.append_child(&loading).ok();
 
-    // mousemove
+    // Crosshair preview. Deliberately render-free: the dedicated handler below
+    // owns the single redraw per move, so a drag repaints once (smooth, no
+    // double-render flicker). On the window so the crosshair also updates while
+    // the cursor is dragged outside the canvas.
     let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-        let rect = by_id("chartCanvas")
-            .map(|c| c.get_bounding_client_rect())
-            .unwrap();
-        let x = e.client_x() as f64 - rect.left();
-        let y = e.client_y() as f64 - rect.top();
+        let Some((x, y, inside)) = canvas_xy(&e) else { return };
         with_app(|app| {
-            if app.pos_drag.is_some() || app.pos_edit.is_some() {
+            if app.pos_drag.is_some() || app.pos_edit.is_some() || !inside {
                 app.cross = None;
                 app.cross_idx = None;
                 return;
             }
             app.cross = Some((x, y));
             app.pane_cross = None;
-            let (sec, _exch, _it, _tf) = (app.sec_id, 0, 0, 0);
-            let _ = sec;
             let w = by_id("chartCanvas").map(|c| c.client_width() as f64).unwrap_or(800.0);
             let h = by_id("chartCanvas").map(|c| c.client_height() as f64).unwrap_or(400.0);
             let plot = plot_for(app, w, h);
             let idx = ((x - plot.left) / plot.bar_w + app.view_start).round();
-            if idx >= 0.0 && (idx as usize) < app.candles.len() {
-                app.cross_idx = Some(idx as usize);
-            }
+            app.cross_idx = if idx >= 0.0 && (idx as usize) < app.candles.len() {
+                Some(idx as usize)
+            } else {
+                None
+            };
         });
-        render_all();
     });
-    canvas
+    window()
         .add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())
         .ok();
     cb.forget();
@@ -3753,13 +3857,10 @@ fn hook_canvas() {
         .ok();
     cb.forget();
 
-    // mousemove: pan drag, position draw/edit, or hover hit-test
+    // mousemove: pan drag, position draw/edit, or hover hit-test. On the window
+    // so a position drag keeps following the cursor past the canvas edge.
     let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
-        let rect = by_id("chartCanvas")
-            .map(|c| c.get_bounding_client_rect())
-            .unwrap();
-        let x = e.client_x() as f64 - rect.left();
-        let y = e.client_y() as f64 - rect.top();
+        let Some((x, y, inside)) = canvas_xy(&e) else { return };
         with_app(|app| {
             let w = by_id("chartCanvas").map(|c| c.client_width() as f64).unwrap_or(800.0);
             let h = by_id("chartCanvas").map(|c| c.client_height() as f64).unwrap_or(400.0);
@@ -3772,11 +3873,13 @@ fn hook_canvas() {
                 d.cur_time = cur_time;
                 app.cross = None;
                 app.cross_idx = None;
-            } else if let Some(edit) = app.pos_edit.as_ref() {
+            } else if app.pos_edit.is_some() {
+                let edit = app.pos_edit.as_ref().unwrap();
                 let idx = edit.idx;
                 let kind = edit.kind;
                 let orig = edit.orig.clone();
-                let delta = cur_price - edit.grab_price;
+                let grab = edit.grab_price;
+                let delta = cur_price - grab;
                 let tick = ((hi - lo).abs() / 400.0).max(0.01);
                 if idx < app.positions.len() {
                     match kind {
@@ -3810,14 +3913,17 @@ fn hook_canvas() {
                 let dx = (x - app.drag_x) / plot.bar_w.max(0.01);
                 app.view_start = (app.drag_start - dx).max(-1.0);
             } else {
-                app.pos_hover =
-                    if app.pos_tool.is_none() { pos_hit(app, &plot, lo, hi, x, y) } else { None };
+                app.pos_hover = if app.pos_tool.is_none() && inside {
+                    pos_hit(app, &plot, lo, hi, x, y)
+                } else {
+                    None
+                };
             }
             apply_pos_cursor(app);
         });
         render_all();
     });
-    canvas
+    window()
         .add_event_listener_with_callback("mousemove", cb.as_ref().unchecked_ref())
         .ok();
     cb.forget();
@@ -3838,7 +3944,7 @@ fn hook_canvas() {
                 let tick = ((hi - lo).abs() / 400.0).max(0.01);
                 let risk = (d.cur_price - d.entry_price).abs();
                 if risk >= tick {
-                    let (target, stop) = mirror_levels(d.dir, d.entry_price, d.cur_price);
+                    let (target, stop) = pos_levels(d.dir, d.entry_price, d.cur_price);
                     app.positions.push(PositionTool {
                         dir: d.dir,
                         entry_time: d.entry_time,
@@ -5283,14 +5389,32 @@ mod pos_tests {
     }
 
     #[test]
-    fn mirror_levels_is_symmetric_for_both_sides() {
-        let (t, s) = mirror_levels(PosDir::Long, 100.0, 130.0);
-        assert!((t - 130.0).abs() < 1e-9 && (s - 70.0).abs() < 1e-9, "long {t}/{s}");
-        let (t, s) = mirror_levels(PosDir::Short, 100.0, 70.0);
-        assert!((t - 70.0).abs() < 1e-9 && (s - 130.0).abs() < 1e-9, "short {t}/{s}");
-        // dragging the "wrong" way still yields a valid mirrored box
-        let (t, s) = mirror_levels(PosDir::Long, 100.0, 80.0);
-        assert!(t > 100.0 && s < 100.0 && (t - 100.0) == (100.0 - s), "long-wrong {t}/{s}");
+    fn pos_levels_tracks_cursor_and_keeps_profit_on_the_right_side() {
+        // Cursor on the profit side -> it lands on the target, stop mirrors.
+        let (t, s) = pos_levels(PosDir::Long, 100.0, 130.0);
+        assert!((t - 130.0).abs() < 1e-9 && (s - 70.0).abs() < 1e-9, "long-up {t}/{s}");
+        let (t, s) = pos_levels(PosDir::Short, 100.0, 70.0);
+        assert!((t - 70.0).abs() < 1e-9 && (s - 130.0).abs() < 1e-9, "short-down {t}/{s}");
+        // Cursor on the loss side -> it lands on the stop, target mirrors. The box
+        // still tracks the cursor (this is the "inverted" feel being fixed).
+        let (t, s) = pos_levels(PosDir::Long, 100.0, 80.0);
+        assert!((t - 120.0).abs() < 1e-9 && (s - 80.0).abs() < 1e-9, "long-down {t}/{s}");
+        let (t, s) = pos_levels(PosDir::Short, 100.0, 130.0);
+        assert!((t - 70.0).abs() < 1e-9 && (s - 130.0).abs() < 1e-9, "short-up {t}/{s}");
+        // Profit always on the correct side of entry, regardless of drag direction.
+        for (dir, cur) in [
+            (PosDir::Long, 130.0),
+            (PosDir::Long, 80.0),
+            (PosDir::Short, 70.0),
+            (PosDir::Short, 130.0),
+        ] {
+            let (t, s) = pos_levels(dir, 100.0, cur);
+            match dir {
+                PosDir::Long => assert!(t > 100.0 && s < 100.0),
+                PosDir::Short => assert!(t < 100.0 && s > 100.0),
+            }
+            assert!((t - 100.0).abs() == (100.0 - s).abs(), "risk != reward");
+        }
     }
 
     #[test]
