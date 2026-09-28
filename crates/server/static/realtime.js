@@ -3360,6 +3360,14 @@ function syncInterlocks() {
   const manualOn = checked("manualStrikesEnabled");
   const atm = val("strikeMode") === "atm";
   const fastOn = checked("fastestRising");
+  // "Pick fastest positive rising LTP" scans a window of fastestCount strikes on
+  // BOTH sides of ATM (see realtime.rs resolve_option_strategy_pref), so the
+  // Execute-Trade-In dropdown is pinned to "Above and below including ATM" while
+  // it is on - that is the pool the engine actually uses.
+  const smEl = q("strikeMode");
+  if (smEl && fastOn && !manualOn && smEl.value !== "both_atm_inc") {
+    smEl.value = "both_atm_inc";
+  }
   const cnt = q("strikeCount");
   if (cnt) {
     const dis = atm || fastOn || manualOn;
