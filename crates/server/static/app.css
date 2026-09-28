@@ -119,6 +119,16 @@
     border-radius: 3px; padding: 2px 7px; font-size: 10px; cursor: pointer;
   }
   .tf-btn.active { background: #2d2d5e; color: #fff; border-color: #3d3d7e; }
+  .pos-tools { display: flex; gap: 3px; align-items: center; }
+  .pos-btn {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--border2);
+    border-radius: 3px; padding: 3px 9px; font-size: 10px; cursor: pointer; white-space: nowrap;
+  }
+  .pos-btn:hover { filter: brightness(1.2); }
+  .pos-btn.active { background: #0f5132; color: #7dffd4; border-color: #00d4aa; box-shadow: 0 0 8px -2px #00d4aa; }
+  .pos-btn.clear { background: #3a1f1f; color: #ffb3b3; border-color: #7e3d3d; }
+  .pos-btn.clear.dim { opacity: .45; cursor: default; }
+  .pos-btn.clear.dim:hover { filter: none; }
   .btn-action {
     background: #2d2d5e; color: #e0e0e0; border: 1px solid #3d3d7e;
     border-radius: 3px; padding: 3px 12px; font-size: 10px; cursor: pointer;

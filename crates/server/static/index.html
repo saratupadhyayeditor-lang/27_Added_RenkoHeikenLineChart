@@ -69,6 +69,11 @@
         <span style="font-size:11px" id="chartTradePnl"></span>
         <div class="tf-grid chart-tf-grid" id="tfGrid"></div>
         <span style="font-size:10px;color:#666" id="chartTfLabel">5m</span>
+        <span class="pos-tools" id="posTools">
+          <button class="pos-btn" id="posLongBtn" title="Long Position: chart par entry se target tak drag karo, SL automatic mirror ho jata hai">Long Position</button>
+          <button class="pos-btn" id="posShortBtn" title="Short Position: chart par entry se target tak drag karo, SL automatic mirror ho jata hai">Short Position</button>
+          <button class="pos-btn clear dim" id="posClearBtn" title="Is chart ke saare Long/Short Position hatao">Clear</button>
+        </span>
         <div class="menu-wrap">
           <button class="btn-action" id="indMenuBtn">Indicators</button>
           <div id="indMenu" class="ind-menu hidden">
@@ -244,7 +249,7 @@
 
 <script src="./vendor/chart.umd.min.js"></script>
 <script type="module">
-  import init, { select_symbol, update_oc_quotes, open_option_chart_by_sid, set_oi_trend_enabled, set_trade_lines, clear_trade_lines } from "./pkg/algo_web.js?v=55";
+  import init, { select_symbol, update_oc_quotes, open_option_chart_by_sid, set_oi_trend_enabled, set_trade_lines, clear_trade_lines } from "./pkg/algo_web.js?v=56";
   import { bootSidebar } from "./sidebar.js?v=18";
   import { bootConnection } from "./connection.js?v=10";
   import { bootRealtime } from "./realtime.js?v=84";
@@ -390,7 +395,7 @@
     const d = e.data || {};
     if (d && d.type === "openTradeChart") openTradeChart(d);
   });
-  init({ module_or_path: "./pkg/algo_web_bg.wasm?v=55" })
+  init({ module_or_path: "./pkg/algo_web_bg.wasm?v=56" })
     .then(() => { bootSidebar({ select_symbol, update_oc_quotes }); bootRealtime(); bootRtStats(); bootBackup(); bootAccount(); startChartLines(); })
     .catch(e => {
       document.getElementById("loading").textContent = "WASM load error: " + e;

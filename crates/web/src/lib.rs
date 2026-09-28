@@ -197,6 +197,53 @@ struct DirOverlay {
     markers: Vec<Marker>,
 }
 
+/// Direction of a user-drawn position tool (TradingView's Long/Short Position).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PosDir {
+    Long,
+    Short,
+}
+
+/// A committed position tool: entry, auto-mirrored profit target and stop-loss.
+/// Times are candle times (epoch seconds) so the box stays anchored when the
+/// timeframe or zoom changes.
+#[derive(Clone, Debug)]
+struct PositionTool {
+    dir: PosDir,
+    entry_time: i64,
+    end_time: i64,
+    entry_price: f64,
+    target_price: f64,
+    stop_price: f64,
+}
+
+/// Which part of a position tool a drag is moving.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PosEditKind {
+    Move,
+    Target,
+    Stop,
+}
+
+/// In-progress draw of a brand-new position (mouse is down).
+#[derive(Clone)]
+struct PosDrag {
+    dir: PosDir,
+    entry_time: i64,
+    entry_price: f64,
+    cur_time: i64,
+    cur_price: f64,
+}
+
+/// In-progress edit of an existing position (mouse is down).
+#[derive(Clone)]
+struct PosEdit {
+    idx: usize,
+    kind: PosEditKind,
+    grab_price: f64,
+    orig: PositionTool,
+}
+
 struct App {
     candles: Vec<Candle>,
     insts: Vec<Inst>,
@@ -265,6 +312,16 @@ struct App {
     /// painted at, mirroring the old app's 700ms / resize throttle.
     oi_strip_last: f64,
     oi_strip_w: f64,
+    /// Armed position tool (None = normal pan/crosshair mode).
+    pos_tool: Option<PosDir>,
+    /// Committed Long/Short Position drawings for the active symbol.
+    positions: Vec<PositionTool>,
+    /// Brand-new position currently being dragged out.
+    pos_drag: Option<PosDrag>,
+    /// Existing position currently being moved/resized.
+    pos_edit: Option<PosEdit>,
+    /// Position part under the pointer (for the hover cursor).
+    pos_hover: Option<(usize, PosEditKind)>,
 }
 
 impl App {
@@ -312,6 +369,11 @@ impl App {
             oi_legend_html: String::new(),
             oi_strip_last: 0.0,
             oi_strip_w: 0.0,
+            pos_tool: None,
+            positions: Vec::new(),
+            pos_drag: None,
+            pos_edit: None,
+            pos_hover: None,
         }
     }
 
@@ -1037,6 +1099,42 @@ fn x_for_time(app: &App, plot: &Plot, time: i64) -> f64 {
     plot.left + (frac_index(app, time) - app.view_start + 0.5) * plot.bar_w
 }
 
+/// Inverse of `frac_index`: candle time for a fractional bar index. Times past
+/// the last candle extrapolate with the current bar interval, so a position box
+/// can be dragged into the (empty) future area like on TradingView.
+fn time_for_index(app: &App, fi: f64) -> i64 {
+    let c = &app.candles;
+    let n = c.len();
+    if n == 0 {
+        return 0;
+    }
+    let iv = bar_interval(app).max(1.0);
+    if fi <= 0.0 {
+        return c[0].time + (fi * iv).round() as i64;
+    }
+    let last = (n - 1) as f64;
+    if fi >= last {
+        return c[n - 1].time + ((fi - last) * iv).round() as i64;
+    }
+    let i = fi.floor();
+    let f = fi - i;
+    let a = c[i as usize].time;
+    let b = c[i as usize + 1].time;
+    a + ((b - a) as f64 * f).round() as i64
+}
+
+/// Inverse of `y_for`: price under a canvas y coordinate.
+fn price_at_y(plot: &Plot, lo: f64, hi: f64, y: f64) -> f64 {
+    let span = (plot.bottom - plot.top).max(1.0);
+    let t = (plot.bottom - y) / span;
+    lo + t * (hi - lo)
+}
+
+/// Fractional bar index under a canvas x coordinate.
+fn index_at_x(plot: &Plot, app: &App, x: f64) -> f64 {
+    (x - plot.left) / plot.bar_w.max(0.01) + app.view_start
+}
+
 fn visible_range(app: &App) -> (usize, usize) {
     let n = app.candles.len();
     if n == 0 {
@@ -1097,6 +1195,19 @@ fn overlay_price_extent(app: &App, lo: &mut f64, hi: &mut f64) {
             }
             if pl.price > *hi {
                 *hi = pl.price;
+            }
+        }
+    }
+    // Long/Short Position levels stay on-screen too.
+    for t in &app.positions {
+        for v in [t.entry_price, t.target_price, t.stop_price] {
+            if v.is_finite() {
+                if v < *lo {
+                    *lo = v;
+                }
+                if v > *hi {
+                    *hi = v;
+                }
             }
         }
     }
@@ -1436,6 +1547,267 @@ fn draw_dir_overlay(
     draw_markers(ctx, app, plot, lo, hi, &d.markers);
 }
 
+// ---------------------------------------------------------------------------
+// Long / Short Position tools (TradingView-style risk/reward boxes)
+// ---------------------------------------------------------------------------
+
+const POS_PROFIT: &str = "#00d4aa";
+const POS_LOSS: &str = "#ff5252";
+const POS_ENTRY: &str = "#c0c0d0";
+
+fn pos_label(dir: PosDir) -> &'static str {
+    match dir {
+        PosDir::Long => "LONG",
+        PosDir::Short => "SHORT",
+    }
+}
+
+fn dir_str(d: PosDir) -> &'static str {
+    match d {
+        PosDir::Long => "long",
+        PosDir::Short => "short",
+    }
+}
+
+fn dir_from_str(s: &str) -> PosDir {
+    if s.eq_ignore_ascii_case("short") {
+        PosDir::Short
+    } else {
+        PosDir::Long
+    }
+}
+
+/// Auto-mirror the stop-loss from the dragged target distance (risk == reward
+/// on creation, i.e. R:R 1:1). Returns `(target, stop)`.
+fn mirror_levels(dir: PosDir, entry: f64, dragged: f64) -> (f64, f64) {
+    let risk = (dragged - entry).abs();
+    match dir {
+        PosDir::Long => (entry + risk, entry - risk),
+        PosDir::Short => (entry - risk, entry + risk),
+    }
+}
+
+fn pos_to_json(t: &PositionTool) -> Value {
+    json!({
+        "dir": dir_str(t.dir),
+        "entryTime": t.entry_time,
+        "endTime": t.end_time,
+        "entryPrice": t.entry_price,
+        "targetPrice": t.target_price,
+        "stopPrice": t.stop_price,
+    })
+}
+
+fn pos_from_json(v: &Value) -> Option<PositionTool> {
+    let entry_time = v.get("entryTime").and_then(|x| x.as_i64())?;
+    let end_time = v
+        .get("endTime")
+        .and_then(|x| x.as_i64())
+        .filter(|t| *t != 0)
+        .unwrap_or(entry_time);
+    Some(PositionTool {
+        dir: dir_from_str(v.get("dir").and_then(|x| x.as_str()).unwrap_or("long")),
+        entry_time,
+        end_time,
+        entry_price: v.get("entryPrice").and_then(|x| x.as_f64())?,
+        target_price: v.get("targetPrice").and_then(|x| x.as_f64())?,
+        stop_price: v.get("stopPrice").and_then(|x| x.as_f64())?,
+    })
+}
+
+/// Which part of a position is under (x, y), or None. Lines win over the body so
+/// grabbing a level always resizes that level instead of moving the whole box.
+fn pos_hit(app: &App, plot: &Plot, lo: f64, hi: f64, x: f64, y: f64) -> Option<(usize, PosEditKind)> {
+    const TOL: f64 = 7.0;
+    for (i, t) in app.positions.iter().enumerate().rev() {
+        let x0 = x_for_time(app, plot, t.entry_time).clamp(plot.left, plot.right);
+        let x1 = x_for_time(app, plot, t.end_time).clamp(plot.left, plot.right);
+        let (xa, xb) = (x0.min(x1) - 4.0, x0.max(x1) + 4.0);
+        if x < xa || x > xb {
+            continue;
+        }
+        let y_e = y_for(plot, lo, hi, t.entry_price);
+        let y_t = y_for(plot, lo, hi, t.target_price);
+        let y_s = y_for(plot, lo, hi, t.stop_price);
+        if (y - y_t).abs() <= TOL {
+            return Some((i, PosEditKind::Target));
+        }
+        if (y - y_s).abs() <= TOL {
+            return Some((i, PosEditKind::Stop));
+        }
+        if (y - y_e).abs() <= TOL {
+            return Some((i, PosEditKind::Move));
+        }
+        let ymin = y_e.min(y_t).min(y_s);
+        let ymax = y_e.max(y_t).max(y_s);
+        if y > ymin && y < ymax {
+            return Some((i, PosEditKind::Move));
+        }
+    }
+    None
+}
+
+fn draw_pos_level(
+    ctx: &CanvasRenderingContext2d,
+    plot: &Plot,
+    xa: f64,
+    xb: f64,
+    y: f64,
+    color: &str,
+    width: f64,
+    style: i32,
+) {
+    if !y.is_finite() || y < plot.top || y > plot.bottom {
+        return;
+    }
+    set_stroke(ctx, color);
+    ctx.set_line_width(width);
+    apply_line_style(ctx, style);
+    ctx.begin_path();
+    ctx.move_to(xa, y);
+    ctx.line_to(xb.max(xa + 1.0), y);
+    ctx.stroke();
+    let empty = Array::new();
+    let _ = ctx.set_line_dash(&empty);
+}
+
+fn draw_pos_axis_tag(ctx: &CanvasRenderingContext2d, plot: &Plot, y: f64, price: f64, color: &str) {
+    if !y.is_finite() || y < plot.top || y > plot.bottom {
+        return;
+    }
+    set_fill(ctx, color);
+    ctx.fill_rect(plot.right, y - 7.0, AXIS_W, 14.0);
+    set_fill(ctx, "#0b0b1a");
+    ctx.set_font("10px sans-serif");
+    ctx.fill_text(&fmt_val(price, None), plot.right + 5.0, y + 3.0).ok();
+}
+
+/// Paint one position tool: shaded profit/loss zones, entry/target/stop lines,
+/// right-axis price tags and a header showing the live risk/reward ratio.
+fn draw_position(
+    ctx: &CanvasRenderingContext2d,
+    app: &App,
+    plot: &Plot,
+    lo: f64,
+    hi: f64,
+    t: &PositionTool,
+) {
+    let x0 = x_for_time(app, plot, t.entry_time).clamp(plot.left, plot.right);
+    let x1 = x_for_time(app, plot, t.end_time).clamp(plot.left, plot.right);
+    let xa = x0.min(x1);
+    let xb = x0.max(x1);
+    let bw = (xb - xa).max(2.0);
+    let y_e = y_for(plot, lo, hi, t.entry_price);
+    let y_t = y_for(plot, lo, hi, t.target_price);
+    let y_s = y_for(plot, lo, hi, t.stop_price);
+    let cy = |y: f64| y.clamp(plot.top, plot.bottom);
+
+    // profit zone (entry -> target) and loss zone (entry -> stop)
+    let (pt, pb) = (cy(y_e).min(cy(y_t)), cy(y_e).max(cy(y_t)));
+    set_fill(ctx, "rgba(0,212,170,0.13)");
+    ctx.fill_rect(xa, pt, bw, (pb - pt).max(0.0));
+    let (st, sb) = (cy(y_e).min(cy(y_s)), cy(y_e).max(cy(y_s)));
+    set_fill(ctx, "rgba(255,82,82,0.13)");
+    ctx.fill_rect(xa, st, bw, (sb - st).max(0.0));
+
+    // outer border
+    let bt = pt.min(st);
+    let bb = pb.max(sb);
+    set_stroke(ctx, "#3a3a5e");
+    ctx.set_line_width(1.0);
+    let empty = Array::new();
+    let _ = ctx.set_line_dash(&empty);
+    ctx.stroke_rect(xa, bt, bw, (bb - bt).max(0.0));
+
+    // dashed vertical entry-time guide
+    set_stroke(ctx, POS_ENTRY);
+    let dash = Array::new();
+    dash.push(&JsValue::from_f64(4.0));
+    dash.push(&JsValue::from_f64(4.0));
+    let _ = ctx.set_line_dash(&dash);
+    ctx.begin_path();
+    ctx.move_to(x0, plot.top);
+    ctx.line_to(x0, plot.bottom);
+    ctx.stroke();
+    let _ = ctx.set_line_dash(&empty);
+
+    // level lines
+    draw_pos_level(ctx, plot, xa, xb, y_e, POS_ENTRY, 1.0, 2);
+    draw_pos_level(ctx, plot, xa, xb, y_t, POS_PROFIT, 1.5, 0);
+    draw_pos_level(ctx, plot, xa, xb, y_s, POS_LOSS, 1.5, 0);
+
+    // right-axis price tags
+    draw_pos_axis_tag(ctx, plot, y_t, t.target_price, POS_PROFIT);
+    draw_pos_axis_tag(ctx, plot, y_s, t.stop_price, POS_LOSS);
+    draw_pos_axis_tag(ctx, plot, y_e, t.entry_price, POS_ENTRY);
+
+    // header: direction + risk/reward ratio
+    let risk = (t.entry_price - t.stop_price).abs();
+    let reward = (t.target_price - t.entry_price).abs();
+    let rr = if risk > 0.0 { reward / risk } else { 0.0 };
+    let title = format!("{}  R:R 1:{:.2}", pos_label(t.dir), rr);
+    ctx.set_font("bold 10px sans-serif");
+    let w = title.chars().count() as f64 * 6.4 + 12.0;
+    let lx = (xa + 4.0).min(plot.right - w - 2.0).max(plot.left + 2.0);
+    let ly = (bt + 4.0).min(plot.bottom - 18.0).max(plot.top + 1.0);
+    set_fill(ctx, "#ffffff");
+    ctx.fill_rect(lx, ly, w, 15.0);
+    set_fill(ctx, if t.dir == PosDir::Long { POS_PROFIT } else { POS_LOSS });
+    ctx.fill_rect(lx, ly, 4.0, 15.0);
+    set_fill(ctx, "#0b0b1a");
+    ctx.fill_text(&title, lx + 8.0, ly + 11.0).ok();
+}
+
+fn draw_positions(ctx: &CanvasRenderingContext2d, app: &App, plot: &Plot, lo: f64, hi: f64) {
+    for t in &app.positions {
+        draw_position(ctx, app, plot, lo, hi, t);
+    }
+    if let Some(d) = &app.pos_drag {
+        // While dragging, show the mirrored target/SL live so the auto-SL is
+        // visible before the mouse is released.
+        let (target, stop) = mirror_levels(d.dir, d.entry_price, d.cur_price);
+        let t = PositionTool {
+            dir: d.dir,
+            entry_time: d.entry_time,
+            end_time: d.cur_time,
+            entry_price: d.entry_price,
+            target_price: target,
+            stop_price: stop,
+        };
+        draw_position(ctx, app, plot, lo, hi, &t);
+    }
+}
+
+fn apply_pos_cursor(app: &App) {
+    let c = if app.pos_tool.is_some() || app.pos_drag.is_some() {
+        "crosshair"
+    } else if app.pos_edit.is_some() {
+        "grabbing"
+    } else {
+        match app.pos_hover {
+            Some((_, PosEditKind::Target)) | Some((_, PosEditKind::Stop)) => "ns-resize",
+            Some((_, PosEditKind::Move)) => "move",
+            None => "default",
+        }
+    };
+    if let Some(el) = by_id("chart-container").and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok()) {
+        let _ = el.style().set_property("cursor", c);
+    }
+}
+
+fn update_pos_buttons() {
+    let tool = read_app(|a| a.pos_tool);
+    for (id, dir) in [("posLongBtn", PosDir::Long), ("posShortBtn", PosDir::Short)] {
+        if let Some(el) = by_id(id) {
+            el.set_class_name(if tool == Some(dir) { "pos-btn active" } else { "pos-btn" });
+        }
+    }
+    if let Some(el) = by_id("posClearBtn") {
+        let has = read_app(|a| !a.positions.is_empty());
+        el.set_class_name(if has { "pos-btn clear" } else { "pos-btn clear dim" });
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Drawing
@@ -1587,6 +1959,9 @@ fn draw_main() {
         for inst in &app.insts {
             draw_markers(&ctx, app, &plot, lo, hi, &inst.markers);
         }
+
+        // Long/Short Position tools (drawn above candle overlays, below crosshair)
+        draw_positions(&ctx, app, &plot, lo, hi);
 
         // last price line + right-axis tag, then the bottom time labels
         draw_last_price(&ctx, app, &plot, lo, hi);
@@ -3232,6 +3607,37 @@ fn hook_toolbar() {
         legend.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).ok();
         cb.forget();
     }
+    // Long / Short Position tools: arm a tool, then drag on the chart to draw
+    // entry + profit target; the stop-loss mirrors automatically.
+    for (id, dir) in [("posLongBtn", PosDir::Long), ("posShortBtn", PosDir::Short)] {
+        if let Some(b) = by_id(id) {
+            let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_e: web_sys::Event| {
+                with_app(|a| {
+                    a.pos_tool = if a.pos_tool == Some(dir) { None } else { Some(dir) };
+                });
+                update_pos_buttons();
+                read_app(apply_pos_cursor);
+            });
+            b.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).ok();
+            cb.forget();
+        }
+    }
+    // Clear every position on the active chart.
+    if let Some(b) = by_id("posClearBtn") {
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_e: web_sys::Event| {
+            with_app(|a| {
+                a.positions.clear();
+                a.pos_drag = None;
+                a.pos_edit = None;
+                a.pos_hover = None;
+            });
+            persist_positions();
+            update_pos_buttons();
+            render_all();
+        });
+        b.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).ok();
+        cb.forget();
+    }
 }
 
 fn hook_canvas() {
@@ -3261,6 +3667,11 @@ fn hook_canvas() {
         let x = e.client_x() as f64 - rect.left();
         let y = e.client_y() as f64 - rect.top();
         with_app(|app| {
+            if app.pos_drag.is_some() || app.pos_edit.is_some() {
+                app.cross = None;
+                app.cross_idx = None;
+                return;
+            }
             app.cross = Some((x, y));
             app.pane_cross = None;
             let (sec, _exch, _it, _tf) = (app.sec_id, 0, 0, 0);
@@ -3285,6 +3696,8 @@ fn hook_canvas() {
         with_app(|app| {
             app.cross = None;
             app.cross_idx = None;
+            app.pos_hover = None;
+            apply_pos_cursor(app);
         });
         render_all();
     });
@@ -3299,10 +3712,40 @@ fn hook_canvas() {
             .map(|c| c.get_bounding_client_rect())
             .unwrap();
         let x = e.client_x() as f64 - rect.left();
+        let y = e.client_y() as f64 - rect.top();
         with_app(|app| {
-            app.dragging = true;
-            app.drag_x = x;
-            app.drag_start = app.view_start;
+            let w = by_id("chartCanvas").map(|c| c.client_width() as f64).unwrap_or(800.0);
+            let h = by_id("chartCanvas").map(|c| c.client_height() as f64).unwrap_or(400.0);
+            let plot = plot_for(app, w, h);
+            let (lo, hi) = price_extent(app, &plot);
+            let can_draw = !app.candles.is_empty();
+            if let Some(dir) = app.pos_tool.filter(|_| can_draw) {
+                // Start a brand-new position: this point is the entry.
+                let fi = index_at_x(&plot, app, x);
+                let t = time_for_index(app, fi);
+                let p = price_at_y(&plot, lo, hi, y);
+                app.pos_drag = Some(PosDrag {
+                    dir,
+                    entry_time: t,
+                    entry_price: p,
+                    cur_time: t,
+                    cur_price: p,
+                });
+                app.pos_edit = None;
+                app.pos_hover = None;
+                app.dragging = false;
+            } else if let Some((idx, kind)) = pos_hit(app, &plot, lo, hi, x, y) {
+                let orig = app.positions[idx].clone();
+                let grab_price = price_at_y(&plot, lo, hi, y);
+                app.pos_edit = Some(PosEdit { idx, kind, grab_price, orig });
+                app.pos_drag = None;
+                app.dragging = false;
+            } else {
+                app.dragging = true;
+                app.drag_x = x;
+                app.drag_start = app.view_start;
+            }
+            apply_pos_cursor(app);
         });
     });
     canvas
@@ -3310,22 +3753,67 @@ fn hook_canvas() {
         .ok();
     cb.forget();
 
-    // mousemove drag handled in same mousemove above? need separate; add to window
+    // mousemove: pan drag, position draw/edit, or hover hit-test
     let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
         let rect = by_id("chartCanvas")
             .map(|c| c.get_bounding_client_rect())
             .unwrap();
         let x = e.client_x() as f64 - rect.left();
+        let y = e.client_y() as f64 - rect.top();
         with_app(|app| {
-            if app.dragging {
-                let plot = plot_for(
-                    app,
-                    by_id("chartCanvas").map(|c| c.client_width() as f64).unwrap_or(800.0),
-                    400.0,
-                );
+            let w = by_id("chartCanvas").map(|c| c.client_width() as f64).unwrap_or(800.0);
+            let h = by_id("chartCanvas").map(|c| c.client_height() as f64).unwrap_or(400.0);
+            let plot = plot_for(app, w, h);
+            let (lo, hi) = price_extent(app, &plot);
+            let cur_price = price_at_y(&plot, lo, hi, y);
+            let cur_time = time_for_index(app, index_at_x(&plot, app, x));
+            if let Some(d) = app.pos_drag.as_mut() {
+                d.cur_price = cur_price;
+                d.cur_time = cur_time;
+                app.cross = None;
+                app.cross_idx = None;
+            } else if let Some(edit) = app.pos_edit.as_ref() {
+                let idx = edit.idx;
+                let kind = edit.kind;
+                let orig = edit.orig.clone();
+                let delta = cur_price - edit.grab_price;
+                let tick = ((hi - lo).abs() / 400.0).max(0.01);
+                if idx < app.positions.len() {
+                    match kind {
+                        PosEditKind::Move => {
+                            let t = &mut app.positions[idx];
+                            t.entry_price = orig.entry_price + delta;
+                            t.target_price = orig.target_price + delta;
+                            t.stop_price = orig.stop_price + delta;
+                        }
+                        PosEditKind::Target => {
+                            let e = orig.entry_price;
+                            let v = match orig.dir {
+                                PosDir::Long => cur_price.max(e + tick),
+                                PosDir::Short => cur_price.min(e - tick),
+                            };
+                            app.positions[idx].target_price = v;
+                        }
+                        PosEditKind::Stop => {
+                            let e = orig.entry_price;
+                            let v = match orig.dir {
+                                PosDir::Long => cur_price.min(e - tick),
+                                PosDir::Short => cur_price.max(e + tick),
+                            };
+                            app.positions[idx].stop_price = v;
+                        }
+                    }
+                }
+                app.cross = None;
+                app.cross_idx = None;
+            } else if app.dragging {
                 let dx = (x - app.drag_x) / plot.bar_w.max(0.01);
                 app.view_start = (app.drag_start - dx).max(-1.0);
+            } else {
+                app.pos_hover =
+                    if app.pos_tool.is_none() { pos_hit(app, &plot, lo, hi, x, y) } else { None };
             }
+            apply_pos_cursor(app);
         });
         render_all();
     });
@@ -3336,10 +3824,76 @@ fn hook_canvas() {
 
     // mouseup
     let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |_e: MouseEvent| {
-        with_app(|app| app.dragging = false);
+        let changed = with_app_ret(|app| {
+            app.dragging = false;
+            let mut changed = false;
+            if app.pos_edit.take().is_some() {
+                changed = true;
+            }
+            if let Some(d) = app.pos_drag.take() {
+                let w = by_id("chartCanvas").map(|c| c.client_width() as f64).unwrap_or(800.0);
+                let h = by_id("chartCanvas").map(|c| c.client_height() as f64).unwrap_or(400.0);
+                let plot = plot_for(app, w, h);
+                let (lo, hi) = price_extent(app, &plot);
+                let tick = ((hi - lo).abs() / 400.0).max(0.01);
+                let risk = (d.cur_price - d.entry_price).abs();
+                if risk >= tick {
+                    let (target, stop) = mirror_levels(d.dir, d.entry_price, d.cur_price);
+                    app.positions.push(PositionTool {
+                        dir: d.dir,
+                        entry_time: d.entry_time,
+                        end_time: d.cur_time,
+                        entry_price: d.entry_price,
+                        target_price: target,
+                        stop_price: stop,
+                    });
+                    changed = true;
+                    // Auto-disarm so the chart returns to pan/crosshair mode.
+                    app.pos_tool = None;
+                }
+            }
+            changed
+        });
+        if changed {
+            persist_positions();
+            update_pos_buttons();
+        }
+        read_app(apply_pos_cursor);
+        render_all();
     });
     window()
         .add_event_listener_with_callback("mouseup", cb.as_ref().unchecked_ref())
+        .ok();
+    cb.forget();
+
+    // double-click removes the position under the pointer
+    let cb = Closure::<dyn FnMut(MouseEvent)>::new(move |e: MouseEvent| {
+        let rect = by_id("chartCanvas")
+            .map(|c| c.get_bounding_client_rect())
+            .unwrap();
+        let x = e.client_x() as f64 - rect.left();
+        let y = e.client_y() as f64 - rect.top();
+        let removed = with_app_ret(|app| {
+            let w = by_id("chartCanvas").map(|c| c.client_width() as f64).unwrap_or(800.0);
+            let h = by_id("chartCanvas").map(|c| c.client_height() as f64).unwrap_or(400.0);
+            let plot = plot_for(app, w, h);
+            let (lo, hi) = price_extent(app, &plot);
+            if let Some((idx, _)) = pos_hit(app, &plot, lo, hi, x, y) {
+                app.positions.remove(idx);
+                app.pos_hover = None;
+                true
+            } else {
+                false
+            }
+        });
+        if removed {
+            persist_positions();
+            update_pos_buttons();
+            render_all();
+        }
+    });
+    canvas
+        .add_event_listener_with_callback("dblclick", cb.as_ref().unchecked_ref())
         .ok();
     cb.forget();
 
@@ -3643,6 +4197,42 @@ fn restore_indicators() {
 }
 
 // ---------------------------------------------------------------------------
+// Long / Short Position persistence (per exchange+security)
+// ---------------------------------------------------------------------------
+
+const POS_SAVE_KEY: &str = "algo_chart_positions";
+
+fn pos_key(app: &App) -> String {
+    format!("{}:{}", app.exch, app.sec_id)
+}
+
+fn persist_positions() {
+    let key = read_app(pos_key);
+    let arr: Vec<Value> = read_app(|a| a.positions.iter().map(pos_to_json).collect());
+    let mut map: serde_json::Map<String, Value> = ls_get(POS_SAVE_KEY)
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    map.insert(key, Value::Array(arr));
+    if let Ok(s) = serde_json::to_string(&Value::Object(map)) {
+        ls_set(POS_SAVE_KEY, &s);
+    }
+}
+
+fn restore_positions() {
+    let key = read_app(pos_key);
+    let list: Vec<Value> = ls_get(POS_SAVE_KEY)
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .and_then(|m| m.get(&key).cloned())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let parsed: Vec<PositionTool> = list.iter().filter_map(pos_from_json).collect();
+    with_app(|a| a.positions = parsed);
+    update_pos_buttons();
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -3657,6 +4247,8 @@ pub fn start() {
     hook_realtime_toggle();
     start_ticker();
     restore_indicators();
+    restore_positions();
+    update_pos_buttons();
     optionchain::boot_option_chain();
     let _ = by_id("indSectionCount").map(|c| c.set_text_content(Some("0")));
     load_chart();
@@ -3690,7 +4282,15 @@ pub fn select_symbol(sec_id: f64, exch: &str, inst_type: &str, name: &str) {
         app.live_vol = 0.0;
         app.local_bar = false;
         app.bar_vol_base = 0.0;
+        // position drawings are symbol-specific: drop the in-flight state, then
+        // restore any saved drawings for the newly selected instrument.
+        app.pos_drag = None;
+        app.pos_edit = None;
+        app.pos_hover = None;
+        app.pos_tool = None;
     });
+    restore_positions();
+    update_pos_buttons();
     if let Some(el) = by_id("chartSymbolLabel") {
         el.set_text_content(Some(name));
     }
@@ -4635,4 +5235,110 @@ pub fn live_tick() {
         return;
     }
     apply_live_tick();
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod pos_tests {
+    use super::*;
+
+    fn candle(t: i64, px: f64) -> Candle {
+        Candle { time: t, open: px, high: px + 1.0, low: px - 1.0, close: px, volume: 10.0 }
+    }
+
+    fn app_with(n: usize) -> App {
+        let mut a = App::new();
+        a.candles =
+            (0..n).map(|i| candle(1_700_000_000 + i as i64 * 300, 100.0 + i as f64)).collect();
+        a.view_start = 0.0;
+        a.view_count = n as f64;
+        a
+    }
+
+    #[test]
+    fn time_index_round_trip() {
+        let app = app_with(50);
+        for i in 0..50 {
+            let t = app.candles[i].time;
+            let fi = frac_index(&app, t);
+            assert!((fi - i as f64).abs() < 1e-6, "fi {fi} i {i}");
+            assert_eq!(time_for_index(&app, fi), t);
+        }
+        let last = app.candles[49].time;
+        assert_eq!(time_for_index(&app, 50.0), last + 300);
+        assert_eq!(time_for_index(&app, 51.5), last + 750);
+    }
+
+    #[test]
+    fn price_y_round_trip() {
+        let plot = Plot { left: 4.0, right: 796.0, top: 10.0, bottom: 410.0, bar_w: 8.0 };
+        let (lo, hi) = (100.0, 200.0);
+        for px in [100.0, 123.4, 150.0, 199.9, 200.0] {
+            let y = y_for(&plot, lo, hi, px);
+            let back = price_at_y(&plot, lo, hi, y);
+            assert!((back - px).abs() < 1e-9, "px {px} back {back}");
+        }
+        assert!((price_at_y(&plot, lo, hi, plot.top) - hi).abs() < 1e-9);
+        assert!((price_at_y(&plot, lo, hi, plot.bottom) - lo).abs() < 1e-9);
+        assert!(price_at_y(&plot, lo, hi, plot.bottom + 50.0) < lo);
+    }
+
+    #[test]
+    fn mirror_levels_is_symmetric_for_both_sides() {
+        let (t, s) = mirror_levels(PosDir::Long, 100.0, 130.0);
+        assert!((t - 130.0).abs() < 1e-9 && (s - 70.0).abs() < 1e-9, "long {t}/{s}");
+        let (t, s) = mirror_levels(PosDir::Short, 100.0, 70.0);
+        assert!((t - 70.0).abs() < 1e-9 && (s - 130.0).abs() < 1e-9, "short {t}/{s}");
+        // dragging the "wrong" way still yields a valid mirrored box
+        let (t, s) = mirror_levels(PosDir::Long, 100.0, 80.0);
+        assert!(t > 100.0 && s < 100.0 && (t - 100.0) == (100.0 - s), "long-wrong {t}/{s}");
+    }
+
+    #[test]
+    fn position_json_round_trip() {
+        let p = PositionTool {
+            dir: PosDir::Short,
+            entry_time: 1_700_000_000,
+            end_time: 1_700_000_300,
+            entry_price: 21500.5,
+            target_price: 21450.0,
+            stop_price: 21551.0,
+        };
+        let back = pos_from_json(&pos_to_json(&p)).expect("parse");
+        assert_eq!(back.dir, p.dir);
+        assert_eq!(back.entry_time, p.entry_time);
+        assert_eq!(back.end_time, p.end_time);
+        assert!((back.entry_price - p.entry_price).abs() < 1e-9);
+        assert!((back.target_price - p.target_price).abs() < 1e-9);
+        assert!((back.stop_price - p.stop_price).abs() < 1e-9);
+        let v = json!({ "dir": "long", "entryTime": 5, "entryPrice": 1.0, "targetPrice": 2.0, "stopPrice": 0.5 });
+        assert_eq!(pos_from_json(&v).unwrap().end_time, 5);
+        assert!(pos_from_json(&json!({ "dir": "long" })).is_none());
+    }
+
+    #[test]
+    fn hit_test_finds_target_stop_entry_and_body() {
+        let mut app = app_with(50);
+        app.positions.push(PositionTool {
+            dir: PosDir::Long,
+            entry_time: app.candles[10].time,
+            end_time: app.candles[30].time,
+            entry_price: 150.0,
+            target_price: 190.0,
+            stop_price: 110.0,
+        });
+        let plot = plot_for(&app, 800.0, 420.0);
+        let (lo, hi) = price_extent(&app, &plot);
+        let x = x_for_time(&app, &plot, app.candles[10].time);
+        let y_t = y_for(&plot, lo, hi, 190.0);
+        let y_s = y_for(&plot, lo, hi, 110.0);
+        let y_e = y_for(&plot, lo, hi, 150.0);
+        assert_eq!(pos_hit(&app, &plot, lo, hi, x, y_t), Some((0, PosEditKind::Target)));
+        assert_eq!(pos_hit(&app, &plot, lo, hi, x, y_s), Some((0, PosEditKind::Stop)));
+        assert_eq!(pos_hit(&app, &plot, lo, hi, x, y_e), Some((0, PosEditKind::Move)));
+        // inside the body, away from every level
+        let y_mid = (y_e + y_t) / 2.0;
+        assert_eq!(pos_hit(&app, &plot, lo, hi, x, y_mid), Some((0, PosEditKind::Move)));
+        // far away -> nothing
+        assert_eq!(pos_hit(&app, &plot, lo, hi, x - 400.0, y_e), None);
+    }
 }
