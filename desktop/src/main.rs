@@ -73,11 +73,15 @@ fn main() {
         let staging = args.get(2).map(PathBuf::from);
         let target = args.get(3).map(PathBuf::from);
         let launch = args.get(4).map(PathBuf::from);
-        let pid = args.get(5).map(String::as_str).unwrap_or("0");
+        let pid = args.get(5).map(String::as_str).unwrap_or("0").to_string();
+        let log = args
+            .get(6)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("algodhan-updater.log"));
         match (staging, target, launch) {
-            (Some(s), Some(t), Some(l)) => updater::run_apply_helper(&s, &t, &l, pid),
+            (Some(s), Some(t), Some(l)) => updater::run_apply_helper(&s, &t, &l, &pid, &log),
             _ => {
-                eprintln!("usage: --apply <staging> <target> <launch> <pid>");
+                eprintln!("usage: --apply <staging> <target> <launch> <pid> <log>");
                 std::process::exit(2);
             }
         }
@@ -371,6 +375,8 @@ fn history_json(data_dir: &std::path::Path) -> serde_json::Value {
 
 fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf) {
     let from = updater::current_version().to_string();
+    let log = data_dir.join("updater.log");
+    updater::log_line(&log, &format!("=== update start: repo={repo} current=v{from}"));
 
     let send = |state: &str, message: String, latest: Option<String>| {
         let _ = proxy.send_event(UserEvent::Status(json!({
@@ -402,6 +408,7 @@ fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf)
     let release = match updater::fetch_latest(&repo) {
         Ok(r) => r,
         Err(e) => {
+            updater::log_line(&log, &format!("fetch_latest failed: {e}"));
             record("error", "-", &e);
             send("error", e, None);
             return;
@@ -410,6 +417,7 @@ fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf)
 
     let current = updater::current_version();
     if release.version <= current {
+        updater::log_line(&log, &format!("already up to date (latest {})", release.tag));
         record("info", &release.tag, "Already up to date");
         send(
             "info",
@@ -439,6 +447,7 @@ fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf)
     let staging = match updater::download_and_stage(&data_dir, &release, &progress) {
         Ok(s) => s,
         Err(e) => {
+            updater::log_line(&log, &format!("download/stage failed: {e}"));
             record("error", &release.tag, &format!("Update failed: {e}"));
             send("error", format!("Update failed: {e}"), Some(release.tag));
             return;
@@ -460,12 +469,14 @@ fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf)
         Some(release.tag.clone()),
     );
 
-    match updater::apply_and_restart(&staging, &install_dir) {
+    match updater::apply_and_restart(&staging, &install_dir, &data_dir) {
         Ok(()) => {
+            updater::log_line(&log, &format!("apply helper launched for {}", release.tag));
             record("ok", &release.tag, "Update apply ho gaya - app restart ho raha hai");
             let _ = proxy.send_event(UserEvent::Quit);
         }
         Err(e) => {
+            updater::log_line(&log, &format!("apply failed: {e}"));
             record("error", &release.tag, &format!("Apply failed: {e}"));
             send("error", format!("Apply failed: {e}"), Some(release.tag));
         }

@@ -3,12 +3,13 @@
 // Flow (triggered by the "Update App" button injected into the UI):
 //   parse repo -> GET /repos/{repo}/releases/latest -> compare versions
 //   -> pick the platform asset -> download -> verify sha256 -> unzip to staging
-//   -> copy this exe to a temp helper -> run `--apply` -> helper waits for this
-//      process to exit, swaps the files in the install dir, relaunches the app.
+//   -> copy this exe to a helper in the data dir -> run `--apply` -> helper
+//      waits for this process to exit, swaps the files in the install dir and
+//      relaunches the app (see `run_apply_helper` + `updater.log`).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -385,12 +386,123 @@ pub(crate) fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Append one timestamped line to the persistent updater log (best-effort).
+pub fn log_line(log: &Path, msg: &str) {
+    if let Some(parent) = log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+        let _ = writeln!(f, "[{}] {msg}", now_ms());
+        let _ = f.flush();
+    }
+}
+
+/// True while the given process id is still running. Used by the helper so it
+/// waits for the real app to exit instead of guessing with a fixed sleep.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe { kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    // kernel32 is linked by default on Windows targets.
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn WaitForSingleObject(handle: *mut core::ffi::c_void, ms: u32) -> u32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    unsafe {
+        let h = OpenProcess(SYNCHRONIZE, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let r = WaitForSingleObject(h, 0);
+        CloseHandle(h);
+        r == WAIT_TIMEOUT
+    }
+}
+
+/// Start the freshly-copied app again. Retries because antivirus / Defender can
+/// briefly lock a brand-new executable, and falls back to the shell on Windows.
+fn launch_app(launch: &Path, install_dir: &Path, log: &Path) -> bool {
+    for attempt in 0..15u32 {
+        let mut cmd = std::process::Command::new(launch);
+        cmd.current_dir(install_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+        match cmd.spawn() {
+            Ok(child) => {
+                log_line(
+                    log,
+                    &format!("relaunched {} (pid {}) on attempt {}", launch.display(), child.id(), attempt + 1),
+                );
+                return true;
+            }
+            Err(e) => {
+                log_line(log, &format!("relaunch attempt {} failed: {e}", attempt + 1));
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(launch)
+            .current_dir(install_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW);
+        match cmd.spawn() {
+            Ok(_) => {
+                log_line(log, "relaunch via `cmd /C start` ok");
+                return true;
+            }
+            Err(e) => log_line(log, &format!("relaunch via `cmd /C start` failed: {e}")),
+        }
+    }
+    false
+}
+
 /// Spawn the detached helper that will swap the files after this process exits.
-pub fn apply_and_restart(staging: &Path, install_dir: &Path) -> Result<(), String> {
+pub fn apply_and_restart(staging: &Path, install_dir: &Path, data_dir: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let ext = if cfg!(windows) { "exe" } else { "" };
-    let helper = std::env::temp_dir().join(format!("algodhan-updater.{ext}"));
+    let updates = data_dir.join("updates");
+    let _ = std::fs::create_dir_all(&updates);
+    let helper = updates.join(format!("algodhan-updater.{ext}"));
     std::fs::copy(&exe, &helper).map_err(|e| format!("helper copy failed: {e}"))?;
+
+    let log = data_dir.join("updater.log");
+    log_line(
+        &log,
+        &format!(
+            "apply requested: staging={} install={} launch={}",
+            staging.display(),
+            install_dir.display(),
+            exe.display()
+        ),
+    );
 
     let pid = std::process::id().to_string();
     let mut cmd = std::process::Command::new(&helper);
@@ -399,6 +511,7 @@ pub fn apply_and_restart(staging: &Path, install_dir: &Path) -> Result<(), Strin
         .arg(install_dir)
         .arg(&exe)
         .arg(&pid)
+        .arg(&log)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -409,27 +522,77 @@ pub fn apply_and_restart(staging: &Path, install_dir: &Path) -> Result<(), Strin
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
-    cmd.spawn().map_err(|e| format!("helper start failed: {e}"))?;
-    Ok(())
+    match cmd.spawn() {
+        Ok(child) => {
+            log_line(&log, &format!("helper spawned (pid {})", child.id()));
+            Ok(())
+        }
+        Err(e) => {
+            log_line(&log, &format!("helper start failed: {e}"));
+            Err(format!("helper start failed: {e}"))
+        }
+    }
 }
 
 /// Runs inside the helper process (`--apply`). Never returns normally.
-pub fn run_apply_helper(staging: &Path, target: &Path, launch: &Path, _pid: &str) -> ! {
-    // Give the main app a moment to exit and release the port/files.
-    std::thread::sleep(Duration::from_millis(1500));
+pub fn run_apply_helper(staging: &Path, target: &Path, launch: &Path, pid: &str, log: &Path) -> ! {
+    let parent = pid.parse::<u32>().ok().filter(|p| *p != 0);
+    log_line(
+        log,
+        &format!(
+            "helper start parent={:?} staging={} target={} launch={}",
+            parent,
+            staging.display(),
+            target.display(),
+            launch.display()
+        ),
+    );
+
+    // Wait for the real app to exit (it may take a while, or the user may close
+    // it manually). This is what makes the swap + relaunch reliable.
+    if let Some(p) = parent {
+        let start = Instant::now();
+        // Don't release the file locks while the app is still up - poll the pid.
+        while process_alive(p) && start.elapsed() < Duration::from_secs(600) {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        log_line(
+            log,
+            &format!("parent exited after {:?} (still alive={})", start.elapsed(), process_alive(p)),
+        );
+    }
+    // A short settle delay for the OS to release file handles / TCP ports.
+    std::thread::sleep(Duration::from_millis(400));
+
     let mut last = String::new();
-    for _ in 0..120 {
+    let mut copied = false;
+    for attempt in 0..240u32 {
         match copy_tree(staging, target) {
             Ok(()) => {
-                let _ = std::process::Command::new(launch).spawn();
-                std::process::exit(0);
+                log_line(log, &format!("files copied on attempt {}", attempt + 1));
+                copied = true;
+                break;
             }
             Err(e) => {
                 last = e.to_string();
+                if attempt % 10 == 0 {
+                    log_line(log, &format!("copy retry {attempt}: {last}"));
+                }
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
     }
-    eprintln!("[updater] apply failed after retries: {last}");
-    std::process::exit(1);
+
+    if !copied {
+        log_line(log, &format!("FATAL copy failed after retries: {last}"));
+        std::process::exit(1);
+    }
+
+    if !launch_app(launch, target, log) {
+        log_line(log, "FATAL relaunch failed - app was not restarted");
+        std::process::exit(1);
+    }
+
+    log_line(log, "relaunch ok - helper exiting");
+    std::process::exit(0);
 }
