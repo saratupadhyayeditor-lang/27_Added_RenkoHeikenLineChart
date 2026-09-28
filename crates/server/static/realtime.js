@@ -127,6 +127,20 @@ let filtersBusy = false;
 let CLOSED_CACHE = null;
 let closedLoading = false;
 let closedLoadedAt = 0;
+// "Show all": the Closed Trades wrapper clips the (already fully rendered) ledger
+// at 230px. Toggling it lifts the cap so the whole closed book is visible at once.
+// Preference persists across reloads; localStorage may be unavailable in a
+// sandboxed frame, so every access is guarded.
+function readClosedExpanded() {
+  try { return localStorage.getItem("rtClosedExpand") === "1"; } catch (e) { return false; }
+}
+let closedExpanded = readClosedExpanded();
+function applyClosedExpand() {
+  const wrap = document.getElementById("rtClosedWrap");
+  const btn = document.getElementById("rtClosedExpand");
+  if (wrap) wrap.classList.toggle("rt-scroll-open", closedExpanded);
+  if (btn) btn.textContent = closedExpanded ? "Collapse" : "Show all";
+}
 // Signature of what is currently painted in the big tables. The 1s poll rebuilds
 // the whole DOM for the closed ledger (thousands of rows) and the condition log;
 // doing that every second is what made the pane hang. Skip the rebuild when the
@@ -850,6 +864,10 @@ function style() {
   #tab-realtime .account-table th { text-align: left; color: #8888b8; font-weight: 500; padding: 4px 5px; border-bottom: 1px solid #2a2a4a; position: sticky; top: 0; background: #111127; }
   #tab-realtime .account-table td { padding: 4px 5px; border-bottom: 1px solid #1c1c38; white-space: nowrap; }
   #tab-realtime .rt-scroll { max-height: 230px; overflow-y: scroll; border: 1px solid var(--border, #1e1e40); border-radius: 3px; scrollbar-width: thin; scrollbar-color: #4a4a80 #12122a; }
+  #tab-realtime .rt-scroll.rt-scroll-open { max-height: none; overflow-y: visible; }
+  #tab-realtime .rt-scan-fade { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; opacity: .26; transition: opacity .35s ease; pointer-events: none; }
+  #tab-realtime .rt-scan-fade.on { opacity: 1; pointer-events: auto; }
+  #tab-realtime .rt-scan-fade input:disabled, #tab-realtime .rt-scan-fade select:disabled { opacity: .5; }
   #tab-realtime .rt-pos { color: #7CFFB2; } #tab-realtime .rt-neg { color: #ff8888; }
   #tab-realtime .rtom-chip { user-select: none; }
   #tab-realtime .rtom-chip:hover { border-color: #b39ddb !important; }
@@ -931,8 +949,11 @@ function shell() {
       <th>Option</th><th>Qty</th><th>Entry</th><th>LTP</th><th>P&amp;L (gross)</th><th>SL/Trail</th><th>Guard</th><th></th>
     </tr></thead><tbody></tbody></table></div>
 
-    <h3 style="font-size:11px;color:#888;text-transform:uppercase;margin:6px 0 4px">Closed Trades</h3>
-    <div class="rt-scroll"><table class="account-table" id="rtClosed"><thead><tr>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0 4px">
+      <h3 style="font-size:11px;color:#888;text-transform:uppercase;margin:0">Closed Trades <span id="rtClosedCount" style="text-transform:none;color:#666;font-weight:normal">(0)</span></h3>
+      <button class="btn-action" id="rtClosedExpand" style="width:auto;padding:3px 10px;margin:0;font-size:10px" title="Closed Trades ki poori list ek saath dikhao (scroll box ki 230px limit hatao)">Show all</button>
+    </div>
+    <div class="rt-scroll" id="rtClosedWrap"><table class="account-table" id="rtClosed"><thead><tr>
       <th>Option</th><th>Qty</th><th>Entry → Exit</th><th>P&amp;L (net)</th><th>Charges</th><th>Reason</th><th>Entry → Exit time</th>
     </tr></thead><tbody></tbody></table></div>
 
@@ -1040,6 +1061,29 @@ function shell() {
         <b class="rt-cap">Order rate:</b>
         <label class="rtom-f" title="Ek second me maximum itne hi order bhejega (Dhan API ~6/sec allow karta hai). Har entry is cap ke andar hi fire hogi.">Order per Second <input type="number" data-set="orderPerSec" min="1" max="30" step="1" style="width:64px"></label>
         <span id="rtOpsStatus" style="font-size:9px;color:#666;font-weight:700"></span>
+      </div>
+
+      <div class="rt-engine-row">
+        <b class="rt-cap">Engine scan:</b>
+        <label class="rtom-f" title="ON: engine apni entry conditions ko throttled cadence par scan karega (niche set kiya gaya). OFF: normal ultrafast ~100ms tick. Exits (SL/Trail/TP) hamesha fast rehte hain.">
+          <input type="checkbox" id="rtEngineScanCb" data-set="scanIntervalOn" style="accent-color:#00d4aa"> Engine Scan
+        </label>
+        <span id="rtScanIntervalBox" class="rt-scan-fade" title="Engine ko kitne interval par scan karna hai. Minutes + Seconds + Milliseconds milakar ek total time banta hai (minimum 50ms).">
+          <label class="rtom-f">Minutes <input type="number" id="rtScanMin" min="0" max="1440" step="1" style="width:70px" placeholder="0"></label>
+          <label class="rtom-f">Seconds <input type="number" id="rtScanSec" min="0" max="59" step="1" style="width:64px" placeholder="0"></label>
+          <label class="rtom-f">Milliseconds <input type="number" id="rtScanMs" min="0" max="999" step="10" style="width:82px" placeholder="100"></label>
+        </span>
+        <span id="rtScanBarCloseChk" class="rt-scan-fade" title="ON: fixed interval ke bajaye har bar close par (nayi candle shuru hote hi) engine scan karega.">
+          <label class="rtom-f"><input type="checkbox" id="rtScanBarCloseCb" data-set="scanBarClose" style="accent-color:#ffd700"> Countdown to Bar Close</label>
+        </span>
+        <span id="rtScanBarCloseBox" class="rt-scan-fade" title="Jis timeframe ka bar close hone par scan karna hai.">
+          <select id="rtScanBarCloseTf" data-set="scanBarCloseTf" style="min-width:210px">
+            <option value="1min">1 minute countdown to bar close</option>
+            <option value="5min">5 minute countdown to bar close</option>
+          </select>
+        </span>
+        <input type="number" id="rtScanTotalMs" data-set="scanIntervalMs" min="50" max="86400000" step="10" style="display:none">
+        <span id="rtScanStatus" style="font-size:9px;color:#666;font-weight:700"></span>
       </div>
 
       <div class="rt-engine-row">
@@ -1208,6 +1252,7 @@ function shell() {
           <label class="rtom-f"><input type="checkbox" data-set="allInOne"> All together (strict AND)</label>
           <label class="rtom-f"><input type="checkbox" data-set="dirGuard"> Direction Guard (no trade on opposite)</label>
           <label class="rtom-f"><input type="checkbox" data-set="overallDir"> Overall Bullish/Bearish idea</label>
+          <label class="rtom-f" style="color:#00d4aa" title="Filter-side routing: ON karne par har trade ka CE/PE leg us strategy ke apne indicator filter se decide hoga. Bullish filter detect hone par CE leg execute hogi, bearish detect hone par trade nahi hogi; bearish filter ke liye isi tarah PE leg. NIFTY lock / Top Movers auto side / Run-Strategy-In override / Overall direction koi bhi is leg ko nahi badal sakta. OFF = purana normal routing."><input type="checkbox" data-set="filterSideRoute" id="rtFilterSideRouteCb" style="accent-color:#00d4aa"> Filter side routing (Bullish&rarr;CE, Bearish&rarr;PE)</label>
           <label class="rtom-f">AI Brain
             <select data-set="brainMode" style="width:170px"><option value="off">OFF</option><option value="auto">Auto (score + conflict veto)</option></select></label>
           <label class="rtom-f">threshold <input type="number" data-set="brainThreshold" min="5" max="100" step="1" style="width:56px"> %</label>
@@ -1651,6 +1696,95 @@ function pushSetting(partial) {
   API.settings(s).then(refresh);
 }
 
+// ---------------------------------------------------------------------------
+// Engine Scan (testing): throttle the entry-condition scan either to a fixed
+// interval (minutes + seconds + milliseconds) or to each bar close of a 1min /
+// 5min timeframe. Exits are never throttled - the guardian task still runs at
+// 50ms. The whole config area fades in/out with the toggles so the inactive
+// controls are obviously not in play.
+// ---------------------------------------------------------------------------
+const SCAN_MIN_MS = 50;
+const SCAN_MAX_MS = 86400000;
+
+function scanTfNorm(v) {
+  return String(v || "").toLowerCase().indexOf("5") === 0 ? "5min" : "1min";
+}
+
+// Combine the three unit inputs into one millisecond value, clamped to the same
+// bounds the engine uses (so the UI and server never disagree).
+function scanIntervalFromInputs() {
+  const g = (id) => {
+    const el = document.getElementById(id);
+    return el ? Math.max(0, Math.floor(num(el.value) || 0)) : 0;
+  };
+  let total = g("rtScanMin") * 60000 + g("rtScanSec") * 1000 + g("rtScanMs");
+  if (total < SCAN_MIN_MS) total = SCAN_MIN_MS;
+  if (total > SCAN_MAX_MS) total = SCAN_MAX_MS;
+  return total;
+}
+
+function humanScanMs(ms) {
+  if (ms >= 60000 && ms % 60000 === 0) return ms / 60000 + (ms === 60000 ? " minute" : " minutes");
+  if (ms >= 1000 && ms % 1000 === 0) return ms / 1000 + (ms === 1000 ? " second" : " seconds");
+  return ms + " ms";
+}
+
+// Reflect the current checkbox/select state onto the DOM (fade + enable/disable
+// + status text). Reads live DOM controls, so it can run before a server round
+// trip for instant feedback.
+function refreshEngineScanUi() {
+  const master = document.getElementById("rtEngineScanCb");
+  const barCb = document.getElementById("rtScanBarCloseCb");
+  const on = !!(master && master.checked);
+  const bc = on && !!(barCb && barCb.checked);
+  const intervalActive = on && !bc;
+  const barActive = on && bc;
+  const box = (id) => document.getElementById(id);
+  if (box("rtScanIntervalBox")) box("rtScanIntervalBox").classList.toggle("on", intervalActive);
+  if (box("rtScanBarCloseChk")) box("rtScanBarCloseChk").classList.toggle("on", on);
+  if (box("rtScanBarCloseBox")) box("rtScanBarCloseBox").classList.toggle("on", barActive);
+  ["rtScanMin", "rtScanSec", "rtScanMs"].forEach((id) => {
+    if (box(id)) box(id).disabled = !intervalActive;
+  });
+  if (box("rtScanBarCloseTf")) box("rtScanBarCloseTf").disabled = !barActive;
+  if (barCb) barCb.disabled = !on;
+  const status = box("rtScanStatus");
+  if (status) {
+    if (!on) {
+      status.textContent = "Scan OFF (normal ~100ms tick)";
+      status.style.color = "#666";
+    } else if (bc) {
+      const tf = scanTfNorm(box("rtScanBarCloseTf") && box("rtScanBarCloseTf").value);
+      status.textContent = "Scan on each " + (tf === "5min" ? "5-minute" : "1-minute") + " bar close";
+      status.style.color = "#00d4aa";
+    } else {
+      status.textContent = "Scanning every " + humanScanMs(scanIntervalFromInputs());
+      status.style.color = "#00d4aa";
+    }
+  }
+}
+
+// Sync the Engine Scan controls from a settings snapshot. Never clobbers the
+// field the user is currently typing in.
+function applyEngineScanUI(s) {
+  s = s || {};
+  const raw = Math.floor(num(s.scanIntervalMs) || 0);
+  const total = raw < SCAN_MIN_MS ? 100 : Math.min(raw, SCAN_MAX_MS);
+  const active = document.activeElement;
+  const setVal = (id, v) => {
+    const el = document.getElementById(id);
+    if (el && el !== active) el.value = v;
+  };
+  setVal("rtScanMin", Math.floor(total / 60000));
+  setVal("rtScanSec", Math.floor((total % 60000) / 1000));
+  setVal("rtScanMs", total % 1000);
+  const hidden = document.getElementById("rtScanTotalMs");
+  if (hidden && hidden !== active) hidden.value = total;
+  const sel = document.getElementById("rtScanBarCloseTf");
+  if (sel && sel !== active) sel.value = scanTfNorm(s.scanBarCloseTf);
+  refreshEngineScanUi();
+}
+
 // --- Run mode (old AST run-mode section) --------------------------------
 // Normal mode runs the ticked strategies; Indicator-filters mode trades the
 // scanner universe (Top Movers / NIFTY trend / Commodities) with the ticked
@@ -1733,6 +1867,43 @@ async function onRunModeToggle(mode, checked) {
 
 function wire() {
   const $ = (id) => document.getElementById(id);
+
+  // Closed Trades "Show all" / "Collapse": lifts/restores the 230px inner-scroll
+  // cap. The full ledger is already in the DOM, so this is a pure view toggle.
+  const closedBtn = $("rtClosedExpand");
+  if (closedBtn) closedBtn.onclick = () => {
+    closedExpanded = !closedExpanded;
+    try { localStorage.setItem("rtClosedExpand", closedExpanded ? "1" : "0"); } catch (e) { /* non-fatal */ }
+  applyClosedExpand();
+
+  // Engine Scan: the interval inputs are not [data-set] (they combine into the
+  // hidden scanIntervalMs), so wire them here; the checkboxes/select are normal
+  // [data-set] controls saved by the generic binder further down.
+  const scanMasterCb = $("rtEngineScanCb");
+  const scanBarCb = $("rtScanBarCloseCb");
+  [scanMasterCb, scanBarCb].forEach((cb) => {
+    if (cb) cb.addEventListener("change", refreshEngineScanUi);
+  });
+  const scanTfSel = $("rtScanBarCloseTf");
+  if (scanTfSel) scanTfSel.addEventListener("change", refreshEngineScanUi);
+  let scanSaveTimer = null;
+  const scheduleScanSave = () => {
+    const hidden = $("rtScanTotalMs");
+    if (hidden) hidden.value = scanIntervalFromInputs();
+    if (scanSaveTimer) clearTimeout(scanSaveTimer);
+    scanSaveTimer = setTimeout(() => {
+      scanSaveTimer = null;
+      API.settings(settingsFromDom()).then(refresh);
+    }, 500);
+  };
+  ["rtScanMin", "rtScanSec", "rtScanMs"].forEach((id) => {
+    const el = $(id);
+    if (el) el.addEventListener("input", () => { refreshEngineScanUi(); scheduleScanSave(); });
+  });
+  refreshEngineScanUi();
+
+  };
+  applyClosedExpand();
 
   // Follow the chart's active instrument: keep the Order Placement cards priced
   // off the same live symbol the user is viewing.
@@ -1819,14 +1990,6 @@ function wire() {
 
   document.querySelectorAll("#tab-realtime [data-set]").forEach((inp) => {
     inp.onchange = () => {
-      const k = inp.getAttribute("data-set");
-      if (k === "fastestRising" && inp.checked) {
-        // Old engine: "Pick fastest positive rising LTP" needs both sides
-        // inside the pool, so it auto-sets Execute Trade In to
-        // "Above and below including ATM" (the user can still change it).
-        const m = document.querySelector('#tab-realtime [data-set="strikeMode"]');
-        if (m && m.value !== "both_atm_inc") m.value = "both_atm_inc";
-      }
       syncInterlocks();
       API.settings(settingsFromDom()).then(refresh);
     };
@@ -3330,6 +3493,7 @@ function applySettingsToDom(s) {
     });
   syncAstToggles(s);
   applyDataPoolUi(!!s.data_pool);
+  applyEngineScanUI(s);
   syncInterlocks();
   applyRunModeUI();
   renderAllChips();
@@ -3748,6 +3912,8 @@ function renderClosed(s) {
   // Prefer the full on-demand ledger; fall back to the snapshot's newest slice
   // before the first `/closed` fetch resolves.
   const list = CLOSED_CACHE && CLOSED_CACHE.length ? CLOSED_CACHE : ((s && s.closed) || []);
+  const cnt = document.getElementById("rtClosedCount");
+  if (cnt) cnt.textContent = "(" + list.length + ")";
   // Repaint only when the ledger (or the charges toggle) actually changed. A
   // multi-thousand-row innerHTML rebuild on every 1s poll is the main reason the
   // paper pane felt frozen; the rows themselves are immutable once booked.
