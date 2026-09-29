@@ -301,17 +301,40 @@ pub struct Settings {
     pub option_type: String,
     pub strike_mode: String,
     pub strike_count: i64,
+    /// "Only +green premium strikes": when ON, the engine walks the strikes in
+    /// the direction chosen by the "Execute Trade In" dropdown (`strike_mode`) and
+    /// only a strike whose premium shows a plus on BOTH its live LTP
+    /// (tick-to-tick) and its published change is eligible. A minus/flat strike is
+    /// skipped and the walk continues to the next strike in the same leg (NOT
+    /// capped by `strike_count`); `None` - the entry is skipped - only when no
+    /// strike in that whole direction is plus, so a falling premium is never
+    /// bought. Signs are read from the live websocket cache, never derived from a
+    /// previous close.
     pub only_positive: bool,
-    /// "Pick fastest positive rising LTP": when ON, each strategy scans only its
-    /// own side's strikes (bullish stock -> CE leg, bearish stock -> PE leg) and
-    /// executes the premium that is rising fastest (highest positive % change),
-    /// never a falling one. If nothing on that side is rising, no entry fires.
+    /// "Opposite side fallback": only meaningful while `only_positive` is ON and a
+    /// single-sided "Execute Trade In" mode is chosen (Above/Below, incl. ATM).
+    /// When the ENTIRE selected side has a live quote on every strike and none of
+    /// them is plus (all minus), the engine automatically walks the OPPOSITE side
+    /// of ATM (Above -> Below and vice-versa) in the SAME option leg (CE/PE) and
+    /// trades the first plus strike found there. While the selected side still has
+    /// unquoted candidates the walk keeps warming them instead of falling back, so
+    /// a plus strike on the chosen side is never missed. ON is the default: the
+    /// "Execute Trade In" dropdown is designed to run on the +green base.
+    pub fallback_opposite_side: bool,
+    /// "Pick fastest positive rising LTP": when ON, the engine scans the SAME
+    /// direction chosen by the "Execute Trade In" dropdown and, among the strikes
+    /// whose premium is plus on BOTH its live LTP (tick-to-tick) and its published
+    /// change, picks the one with the HIGHEST published `change_pct` (LTP change %),
+    /// breaking ties by the absolute LTP `change`. Only a rising premium is ever
+    /// eligible, so a falling strike can never be picked. Works together with
+    /// "Only +green premium strikes" (which narrows to rising premiums) and with
+    /// "Opposite side fallback" (when the selected side is entirely minus). When
+    /// OFF the +green nearest-strike walk is used. `fastest_count` is kept for the
+    /// UI round-trip but does NOT cap the scan.
     pub fastest_rising: bool,
-    /// Strike-window size (`Fastest-Rising Strikes`): how many strikes above and
-    /// below ATM are scanned when picking the fastest riser / nearest +green leg.
     pub fastest_count: i64,
     /// Testing-only "Manual Strike Select": when on, the ATM / strike-mode /
-    /// count / +green / fastest-rising preferences are ignored and the engine
+    /// count preferences are ignored and the engine
     /// trades only the operator-picked contracts in `manual_strikes`.
     pub manual_strikes_enabled: bool,
     /// Operator-picked option contracts for Manual Strike Select.
@@ -543,6 +566,7 @@ impl Default for Settings {
             strike_mode: "both_atm".into(),
             strike_count: 3,
             only_positive: true,
+            fallback_opposite_side: true,
             fastest_rising: false,
             fastest_count: 3,
             manual_strikes_enabled: false,
@@ -2938,7 +2962,6 @@ impl RealtimeState {
         // The readout lists each pick's own side explicitly, so keep the
         // per-strategy side routing from collapsing both rows onto one side.
         s2.filter_side_route = false;
-        s2.fastest_rising = false;
         s2.option_side = side.to_string();
         let base = Strategy {
             id: format!("pick:{}:{side}", sid),
@@ -3580,13 +3603,9 @@ impl RealtimeState {
                 if spot <= 0.0 && !self.paper {
                     spot = self.fetch_ltp(strat.security_id, &strat.exchange_segment).await;
                 }
-                // Paper execution resolves the scrip-master contract only; the real
-                // tab keeps the REST strike scan (`resolve_option_strategy_pref`).
-                let resolved = if self.paper {
-                    self.resolve_option_strategy(&strat, spot, &settings)
-                } else {
-                    self.resolve_option_strategy_pref(&strat, spot, &settings).await
-                };
+                // Resolve the execution contract from the operator's strike
+                // preferences (ATM / ITM / OTM / strike mode).
+                let resolved = self.resolve_option_strategy(&strat, spot, &settings);
                 match resolved {
                     Some(p) => p,
                     None => {
@@ -4689,25 +4708,25 @@ impl RealtimeState {
             }
         }
         let ot = self.target_option_side(strat, settings);
-        let mode = settings.option_type.to_uppercase();
-        let depth = settings.strike_count.max(1) as i64;
-        let mut off = 0i64;
-        let sm = settings.strike_mode.to_uppercase();
-        if matches!(sm.as_str(), "ABOVE" | "ABOVE_ATM") {
-            off = depth;
-        } else if matches!(sm.as_str(), "BELOW" | "BELOW_ATM") {
-            off = -depth;
-        } else if matches!(sm.as_str(), "BOTH" | "BOTH_ATM" | "BOTH_ATM_INC") {
-            off = if ot == "CE" { depth } else { -depth };
-        } else if mode.contains("ITM") || mode.contains("OTM") {
-            let itm = mode.contains("ITM");
-            let dir = if ot == "CE" {
-                if itm { -1 } else { 1 }
-            } else if itm { 1 } else { -1 };
-            off = dir * depth;
-        }
-        let ni = (idx as i64 + off).clamp(0, strikes.len() as i64 - 1) as usize;
-        let strike = strikes[ni];
+        // Strike selection preference (the "Execute Trade In" dropdown supplies the
+        // direction for all of them):
+        //   * "Only +green premium strikes"  -> first rising (+green) strike.
+        //   * "Pick fastest positive rising LTP" -> the biggest riser (max LTP
+        //     change %) among the rising strikes; implies +green eligibility.
+        //   * "Opposite side fallback" -> if the chosen side is entirely minus,
+        //     retry the opposite side of ATM in the same leg.
+        // When no preference is on, fall back to the nearest ATM strike.
+        let strike_idx = if settings.only_positive || settings.fastest_rising {
+            match self.pick_strike_pref(strat, exch, &expiry, &strikes, idx, ot, settings) {
+                Some(i) => i,
+                // No rising strike: skip the entry rather than buy a falling
+                // ("ghatne wali") premium.
+                None => return None,
+            }
+        } else {
+            idx
+        };
+        let strike = strikes[strike_idx];
         let res = sc.resolve(&strat.trading_symbol, &expiry, strike, ot, &strat.exchange_segment)?;
         let seg = fno_segment(exch);
         let mut out = strat.clone();
@@ -4718,6 +4737,257 @@ impl RealtimeState {
         out.instrument = if scrip::is_index_prefix(&prefix) { "OPTIDX" } else { "OPTSTK" }.to_string();
         out.trading_symbol = res.trading_symbol;
         Some(out)
+    }
+
+    /// The full walk order of strike indices for the "Execute Trade In" dropdown,
+    /// starting at ATM `idx` and continuing outward in the selected direction to
+    /// the chain's edge. The "+green" scan follows this order and only stops at
+    /// the first strike whose premium is plus - "Number of Strikes" does NOT cap
+    /// this walk, so a run of minus strikes is skipped over to the next strike in
+    /// the same leg (e.g. Above ATM: idx+1 minus -> idx+2 -> idx+3 ...).
+    ///
+    /// `above`/`above_atm` go up, `below`/`below_atm` go down, `both_atm`/
+    /// `both_atm_inc` alternate up/down outward, `atm` is the ATM leg only.
+    fn green_walk_order(len: usize, idx: usize, mode: &str) -> Vec<usize> {
+        let eq = |s: &str| mode.eq_ignore_ascii_case(s);
+        let mut out: Vec<usize> = Vec::with_capacity(len);
+        if eq("atm") {
+            out.push(idx);
+            return out;
+        }
+        let upward = eq("above") || eq("above_atm");
+        let downward = eq("below") || eq("below_atm");
+        let both = eq("both_atm") || eq("both_atm_inc");
+        // "*_ATM*" modes include the ATM leg itself first.
+        if eq("above_atm") || eq("below_atm") || eq("both_atm_inc") {
+            out.push(idx);
+        }
+        if upward {
+            let mut j = idx as i64 + 1;
+            while j < len as i64 {
+                out.push(j as usize);
+                j += 1;
+            }
+        } else if downward {
+            let mut j = idx as i64 - 1;
+            while j >= 0 {
+                out.push(j as usize);
+                j -= 1;
+            }
+        } else if both {
+            let mut k = 1i64;
+            loop {
+                let up = idx as i64 + k;
+                let dn = idx as i64 - k;
+                let mut any = false;
+                if up < len as i64 {
+                    out.push(up as usize);
+                    any = true;
+                }
+                if dn >= 0 {
+                    out.push(dn as usize);
+                    any = true;
+                }
+                if !any {
+                    break;
+                }
+                k += 1;
+            }
+        } else {
+            // Unknown mode: fall back to the ATM leg only.
+            out.push(idx);
+        }
+        out
+    }
+
+    /// Pure sign decision for the "+green" scan. Given the live LTP, the previous
+    /// print's LTP and the published change, it returns the LTP's own plus sign
+    /// (tick-to-tick) and the change's plus sign. `None` when there is no usable
+    /// positive LTP. State-free so it is trivially testable.
+    ///
+    /// The LTP sign is *never* derived from a previous close: it compares the
+    /// current print against the previous print. Only when no previous print has
+    /// been observed yet does it fall back to the change's sign so the scan can
+    /// still decide on the very first evaluation.
+    ///
+    /// A strike whose change is not available (never seeded / genuinely flat, i.e.
+    /// `0`) leans on the live print for that half of the decision, so the scan
+    /// still works without a REST seed. A genuine minus change is never bought.
+    fn premium_signs_from(ltp: f64, prev_ltp: f64, change: f64) -> Option<(bool, bool)> {
+        if ltp <= 0.0 {
+            return None;
+        }
+        let ltp_plus = if prev_ltp > 0.0 { ltp > prev_ltp } else { change > 0.0 };
+        let chg_plus = if change != 0.0 { change > 0.0 } else { ltp_plus };
+        Some((ltp_plus, chg_plus))
+    }
+
+    /// The opposite ATM side of a single-sided "Execute Trade In" mode, or `None`
+    /// when the mode already covers both sides / is ATM-only (no opposite to fall
+    /// back to). Above <-> Below (including-ATM variants mirror each other).
+    fn opposite_side_mode(mode: &str) -> Option<&'static str> {
+        if mode.eq_ignore_ascii_case("above") {
+            Some("below")
+        } else if mode.eq_ignore_ascii_case("above_atm") {
+            Some("below_atm")
+        } else if mode.eq_ignore_ascii_case("below") {
+            Some("above")
+        } else if mode.eq_ignore_ascii_case("below_atm") {
+            Some("above_atm")
+        } else {
+            None
+        }
+    }
+
+    /// True when score `a` = (published change %, absolute change) outranks `b`:
+    /// a higher LTP change % wins; an equal change % is broken by the higher
+    /// absolute LTP change. Pure so the "fastest positive rising" ranking is
+    /// trivially testable.
+    fn rising_score_better(a: (f64, f64), b: (f64, f64)) -> bool {
+        a.0 > b.0 || (a.0 == b.0 && a.1 > b.1)
+    }
+
+    /// Read one ordered leg list under a single quote-cache lock and report the
+    /// best eligible rising strike, whether any strike on this side had a live
+    /// quote, and the still-unquoted candidates (in order) the caller should warm
+    /// next.
+    ///
+    /// Eligible = plus on BOTH its live LTP (tick-to-tick) and its published
+    /// change, i.e. actually rising - a falling/flat strike is never eligible.
+    /// With `fastest` the scan keeps going and keeps the strike with the highest
+    /// published `change_pct` (ties broken by the absolute `change`); otherwise it
+    /// returns the first rising strike in walk order.
+    fn scan_strike_order(
+        &self,
+        legs: &[(usize, i64)],
+        seg: &str,
+        fastest: bool,
+    ) -> (Option<(usize, i64)>, bool, Vec<(i64, String)>) {
+        let mut best: Option<(usize, i64)> = None;
+        let mut best_key: Option<(f64, f64)> = None;
+        let mut any_quoted = false;
+        let mut unquoted: Vec<(i64, String)> = Vec::new();
+        let Ok(q) = self.dhan.market.quotes.lock() else {
+            return (None, false, unquoted);
+        };
+        for (i, sid) in legs {
+            let key = crate::market::quote_key(*sid, seg);
+            let Some(v) = q.get(&key) else {
+                unquoted.push((*sid, seg.to_string()));
+                continue;
+            };
+            let ltp = v.get("ltp").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            if ltp <= 0.0 {
+                unquoted.push((*sid, seg.to_string()));
+                continue;
+            }
+            any_quoted = true;
+            let change = v.get("change").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let prev = v.get("prev_ltp").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            if !matches!(Self::premium_signs_from(ltp, prev, change), Some((true, true))) {
+                continue;
+            }
+            if !fastest {
+                best = Some((*i, *sid));
+                break;
+            }
+            let pct = v.get("change_pct").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let score = (pct, change);
+            let better = match best_key {
+                None => true,
+                Some(bk) => Self::rising_score_better(score, bk),
+            };
+            if better {
+                best_key = Some(score);
+                best = Some((*i, *sid));
+            }
+        }
+        (best, any_quoted, unquoted)
+    }
+
+    /// Pick the strike for the "Execute Trade In" direction, wiring the strike
+    /// preferences together:
+    ///   * "Only +green premium strikes" walks the chosen direction and takes the
+    ///     FIRST rising (+green) strike; the walk is NOT capped by "Number of
+    ///     Strikes" so a run of minus strikes is skipped to the next strike.
+    ///   * "Pick fastest positive rising LTP" scans the same direction and takes
+    ///     the BIGGEST riser - the highest published LTP change % among the rising
+    ///     strikes (ties broken by the absolute LTP change).
+    ///   * "Opposite side fallback" -> only once the ENTIRE selected side has a
+    ///     live quote and every strike is minus, the opposite side of ATM
+    ///     (Above <-> Below) is scanned in the SAME option leg (CE/PE).
+    /// Any still-unquoted candidate on the chosen side is warmed first so a rising
+    /// strike that lives on the chosen side is never missed. `None` only when no
+    /// rising strike exists in either direction.
+    ///
+    /// The scan reads every candidate's signs/change under a single quote-cache
+    /// lock, so it stays well inside the entry latency budget and never buys a
+    /// falling premium.
+    fn pick_strike_pref(
+        &self,
+        strat: &Strategy,
+        exch: &str,
+        expiry: &str,
+        strikes: &[f64],
+        idx: usize,
+        ot: &str,
+        settings: &Settings,
+    ) -> Option<usize> {
+        const WARM_PER_CALL: usize = 8;
+        let fastest = settings.fastest_rising;
+        let sc = scrip::get()?;
+        let order = Self::green_walk_order(strikes.len(), idx, &settings.strike_mode);
+        if order.is_empty() {
+            return None;
+        }
+        let seg = fno_segment(exch);
+        let resolve_order = |order: &[usize]| -> Vec<(usize, i64)> {
+            let mut v: Vec<(usize, i64)> = Vec::with_capacity(order.len());
+            for i in order {
+                if let Some(r) = sc.resolve(&strat.trading_symbol, expiry, strikes[*i], ot, &strat.exchange_segment) {
+                    if r.security_id > 0 {
+                        v.push((*i, r.security_id));
+                    }
+                }
+            }
+            v
+        };
+        let primary = resolve_order(&order);
+        if primary.is_empty() {
+            return None;
+        }
+        let (mut best, any_quoted, mut warm) = self.scan_strike_order(&primary, seg, fastest);
+        // The selected side still has unquoted candidates: warm them and let the
+        // next evaluation judge them instead of falling back early, so a rising
+        // strike on the chosen side is never skipped.
+        if best.is_none() && !warm.is_empty() {
+            warm.truncate(WARM_PER_CALL);
+            self.dhan.watch_options_now(&warm);
+            return None;
+        }
+        // The ENTIRE selected side is quoted and every strike is minus -> try the
+        // opposite ATM side, in the same leg, before giving up on the entry.
+        if best.is_none() && settings.fallback_opposite_side && any_quoted {
+            if let Some(omode) = Self::opposite_side_mode(&settings.strike_mode) {
+                let oorder = Self::green_walk_order(strikes.len(), idx, omode);
+                let olegs = resolve_order(&oorder);
+                if !olegs.is_empty() {
+                    let (obest, _, ow) = self.scan_strike_order(&olegs, seg, fastest);
+                    best = obest;
+                    warm.extend(ow);
+                }
+            }
+        }
+        if let Some((i, sid)) = best {
+            // Make sure the chosen leg is streaming even if it was already cached.
+            self.dhan.watch_options_now(&[(sid, seg.to_string())]);
+            return Some(i);
+        }
+        if !warm.is_empty() {
+            warm.truncate(WARM_PER_CALL);
+            self.dhan.watch_options_now(&warm);
+        }
+        None
     }
 
     /// Whether an option's own premium is consistent with the underlying: a long
@@ -4742,141 +5012,6 @@ impl RealtimeState {
             (spot - strike).max(0.0)
         };
         premium >= intrinsic * 0.98
-    }
-
-    /// Resolve the option leg, then pick the strike on that leg from a window of
-    /// `fastestCount` strikes around ATM:
-    ///   * "Pick fastest positive rising LTP" -> only the strategy's own side is
-    ///     scanned (bullish stock -> CE leg, bearish stock -> PE leg) and the
-    ///     fastest RISING (+green) premium wins. A falling strike is never chosen;
-    ///     if nothing is rising the entry is skipped.
-    ///   * "Only +green premium strikes" -> the +green strike nearest ATM.
-    async fn resolve_option_strategy_pref(&self, strat: &Strategy, spot: f64, settings: &Settings) -> Option<Strategy> {
-        let base = self.resolve_option_strategy(strat, spot, settings)?;
-        // Paper trading is filled only from the shared live feed + in-memory scrip
-        // master. The strike scan below is a Dhan REST quote call, so paper takes
-        // the scrip-master contract as-is and never hits REST.
-        if self.paper {
-            return Some(base);
-        }
-        if !settings.only_positive && !settings.fastest_rising {
-            return Some(base);
-        }
-        let sc = scrip::get()?;
-        let prefix = scrip::fno_underlying(&strat.trading_symbol);
-        if prefix.is_empty() {
-            return Some(base);
-        }
-        let exch = scrip::scrip_exch(&strat.exchange_segment);
-        let expiries = sc.expiries_for(&prefix, exch)?;
-        let expiry = expiries.first()?.clone();
-        let bucket = sc.bucket(exch, &prefix, &expiry)?;
-        let strikes: Vec<f64> = bucket.keys().map(|k| *k as f64 / 100.0).collect();
-        if strikes.is_empty() {
-            return Some(base);
-        }
-        // Which side's strikes to scan. Per-strategy side routing ("Filter-side
-        // routing" / "Pick fastest positive rising LTP") pins it to the strategy's
-        // own side; otherwise Option Type "Both CE & PE" leaves it open, and the
-        // strict NIFTY lock / Run-in override still collapse it to one side.
-        let sides: Vec<&'static str> = if let Some(side) = routed_option_side(settings, strat) {
-            vec![side]
-        } else if let Some(side) = self.nifty_locked_side(settings) {
-            vec![side]
-        } else if let Some(side) = self.effective_run_in_side(settings) {
-            vec![side]
-        } else {
-            match settings.option_side.to_uppercase().as_str() {
-                "CE" => vec!["CE"],
-                "PE" => vec!["PE"],
-                _ => {
-                    if let Some(side) = self.auto_option_side(settings) {
-                        vec![if side == "CE" { "CE" } else { "PE" }]
-                    } else {
-                        vec!["CE", "PE"]
-                    }
-                }
-            }
-        };
-        let mut atm = 0usize;
-        let mut best = f64::MAX;
-        for (i, s) in strikes.iter().enumerate() {
-            let d = (s - spot).abs();
-            if d < best {
-                best = d;
-                atm = i;
-            }
-        }
-        let window = settings.fastest_count.max(1).min(10) as i64;
-        let lo = (atm as i64 - window).max(0) as usize;
-        let hi = (atm as i64 + window).min(strikes.len() as i64 - 1) as usize;
-        let seg = fno_segment(exch);
-        let mut req: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-        let mut cands: Vec<(i64, String, f64, &'static str)> = Vec::new();
-        for ot in &sides {
-            for i in lo..=hi {
-                if let Some(r) = sc.resolve(&strat.trading_symbol, &expiry, strikes[i], ot, &strat.exchange_segment) {
-                    cands.push((r.security_id, r.trading_symbol, strikes[i], ot));
-                    req.entry(seg.to_string()).or_default().push(r.security_id);
-                }
-            }
-        }
-        if cands.is_empty() {
-            return Some(base);
-        }
-        // Without a broker session the strike-quote scan cannot run; fall back to
-        // the scrip-master ATM contract (`base`) instead of dropping the strategy.
-        let Some(client) = self.dhan.session_client().await else { return Some(base) };
-        self.dhan.dhan_throttle().await;
-        let resp = match client.market_feed_quote(&req).await {
-            Ok(r) => r,
-            Err(_) => return Some(base),
-        };
-        let mut metrics: HashMap<i64, (f64, f64)> = HashMap::new();
-        for (_s, legs) in resp.iter() {
-            for (sid, q) in legs.iter() {
-                if let Ok(id) = sid.parse::<i64>() {
-                    let prev = q.ohlc.as_ref().map(|o| o.close).unwrap_or(0.0);
-                    let pct = if prev > 0.0 { q.net_change / prev * 100.0 } else { 0.0 };
-                    metrics.insert(id, (q.last_price, pct));
-                }
-            }
-        }
-        let mut pool: Vec<(i64, String, f64, f64, f64)> = cands
-            .into_iter()
-            .filter_map(|(id, sym, strike, _ot)| metrics.get(&id).map(|(l, p)| (id, sym, strike, *l, *p)))
-            .collect();
-        // The strike scan just paid a quote call; cache every leg's LTP so the
-        // execution path (`open_entry`) reads it from here instead of paying a
-        // second throttled quote call before the order can go out.
-        if let Ok(mut m) = self.ltp.lock() {
-            for (id, (l, _)) in metrics.iter() {
-                if *l > 0.0 {
-                    m.insert(*id, *l);
-                }
-            }
-        }
-        // "+green only": keep just the premiums that are actually rising. This is
-        // now required by BOTH preferences, so a falling (ghatne wali) strike can
-        // never be executed.
-        if settings.only_positive || settings.fastest_rising {
-            pool.retain(|(_id, _s, _k, ltp, chg)| is_rising_premium(*ltp, *chg));
-        }
-        if pool.is_empty() {
-            // No +green premium in the window for this side: skip the entry
-            // instead of executing a falling strike.
-            return None;
-        }
-        // "Pick fastest positive rising LTP" -> the biggest riser on this side;
-        // "Only +green premium strikes" -> the +green strike nearest ATM.
-        let chosen = pick_pref_candidate(&pool, spot, settings.fastest_rising);
-        let c = chosen.map(|i| &pool[i]).or_else(|| pool.first())?;
-        let mut out = strat.clone();
-        out.security_id = c.0;
-        out.exchange_segment = seg.to_string();
-        out.instrument = if scrip::is_index_prefix(&prefix) { "OPTIDX" } else { "OPTSTK" }.to_string();
-        out.trading_symbol = c.1.clone();
-        Some(out)
     }
 
     /// Resolve a strategy to its option-premium contract and fetch that chart's
@@ -4912,7 +5047,7 @@ impl RealtimeState {
         if spot <= 0.0 {
             return None;
         }
-        let res = self.resolve_option_strategy_pref(strat, spot, settings).await?;
+        let res = self.resolve_option_strategy(strat, spot, settings)?;
         // Publish the resolved premium chart so the Running Strategies view can
         // show which chart this strategy's entry conditions are evaluated on.
         self.record_strat_leg(&strat.id, "run", &res);
@@ -5181,16 +5316,10 @@ impl RealtimeState {
             });
         }
 
-        // Underlying/index strategies: pick the option contract now. Paper resolves
-        // straight from the in-memory scrip master; the live "positive premium /
-        // fastest rising" strike scan below is a Dhan REST quote call, so the real
-        // tab keeps it and the paper tab skips it.
+        // Underlying/index strategies: resolve the option contract now from the
+        // operator's strike preferences (ATM / ITM / OTM / strike mode).
         if strat.instrument.eq_ignore_ascii_case("INDEX") || strat.exchange_segment.eq_ignore_ascii_case("IDX_I") {
-            let resolved = if self.paper {
-                self.resolve_option_strategy(&strat, ltp, &settings)
-            } else {
-                self.resolve_option_strategy_pref(&strat, ltp, &settings).await
-            };
+            let resolved = self.resolve_option_strategy(&strat, ltp, &settings);
             if let Some(res) = resolved {
                 strat = res;
                 exch = strat.exchange_segment.clone();
@@ -7328,14 +7457,11 @@ fn strategy_is_bull(strat: &Strategy) -> bool {
 }
 
 /// True when the option leg must follow each strategy's own stock/filter side
-/// instead of a global scanner direction. Two features need this:
-///   * "Filter-side routing" - bullish filters trade CE, bearish filters PE.
-///   * "Pick fastest positive rising LTP" - a bullish stock may only scan its CE
-///     leg, a bearish stock only its PE leg, then the fastest riser is picked.
-/// In both cases no NIFTY lock / Top-Movers auto side / Run-in / Overall
-/// direction may flip the leg.
+/// instead of a global scanner direction ("Filter-side routing" - bullish
+/// filters trade CE, bearish filters PE). When on, no NIFTY lock / Top-Movers
+/// auto side / Run-in / Overall direction may flip the leg.
 fn per_strategy_side(settings: &Settings) -> bool {
-    settings.filter_side_route || settings.fastest_rising
+    settings.filter_side_route
 }
 
 /// Option side forced by per-strategy routing: bullish strategies trade CE,
@@ -7386,45 +7512,6 @@ fn movers_index_leg(settings: &Settings, sid: i64) -> Option<&'static str> {
 /// the index is skipped).
 fn index_target_side(settings: &Settings, sid: i64) -> Option<bool> {
     movers_index_leg(settings, sid).map(|s| s == "CE")
-}
-
-/// A strike-quote candidate: `(security_id, trading_symbol, strike, ltp,
-/// change_pct)`. `change_pct` is the premium's percentage change vs the previous
-/// close, so a positive value means the premium is rising.
-type LegCandidate = (i64, String, f64, f64, f64);
-
-/// A premium is "rising" only when it has a live price and its change vs the
-/// previous close is strictly positive. Flat or falling premiums are excluded so
-/// the selector can never execute a "ghatne wali" strike.
-fn is_rising_premium(ltp: f64, chg: f64) -> bool {
-    ltp > 0.0 && chg > 0.0
-}
-
-/// Index of the strike the "strike preference" should execute.
-///   * "Pick fastest positive rising LTP" -> the highest (fastest) positive
-///     `change_pct`; a tie goes to the strike nearest ATM.
-///   * "Only +green premium strikes" -> the +green strike nearest ATM.
-/// The caller passes an already +green-filtered pool, so this never returns a
-/// falling strike.
-fn pick_pref_candidate(pool: &[LegCandidate], spot: f64, fastest: bool) -> Option<usize> {
-    let mut best: Option<usize> = None;
-    for (i, c) in pool.iter().enumerate() {
-        let better = match best {
-            None => true,
-            Some(b) => {
-                let x = &pool[b];
-                if fastest {
-                    c.4 > x.4 || (c.4 == x.4 && (c.2 - spot).abs() < (x.2 - spot).abs())
-                } else {
-                    (c.2 - spot).abs() < (x.2 - spot).abs()
-                }
-            }
-        };
-        if better {
-            best = Some(i);
-        }
-    }
-    best
 }
 
 fn filter_is_bull(k: &str) -> bool {
@@ -10443,26 +10530,6 @@ mod gate_tests {
     }
 
     #[test]
-    fn fastest_rising_scans_only_the_stocks_own_side() {
-        // OFF: no forced side (normal multi-source routing).
-        let bull = bull_strategy();
-        let bear = bear_strategy();
-        let mut s = Settings::default();
-        assert_eq!(routed_option_side(&s, &bull), None);
-        assert_eq!(routed_option_side(&s, &bear), None);
-
-        // ON: a bullish stock may only scan its CE leg, a bearish stock only PE -
-        // even with the other direction sources armed.
-        s.fastest_rising = true;
-        s.nifty_trend_on = true;
-        s.run_in_enabled = true;
-        s.run_in_side = "PE".into();
-        s.option_side = "PE".into();
-        assert_eq!(routed_option_side(&s, &bull), Some("CE"));
-        assert_eq!(routed_option_side(&s, &bear), Some("PE"));
-    }
-
-    #[test]
     fn movers_index_leg_settings_round_trip_uses_camel_case() {
         let mut s = Settings::default();
         assert!(s.movers_index_legs.is_empty());
@@ -10522,34 +10589,6 @@ mod gate_tests {
         assert_eq!(index_target_side(&s, 13), Some(false));
         s.movers_index_legs[0] = MoversIndexLeg { security_id: 13, side: "nonsense".into() };
         assert_eq!(movers_index_leg(&s, 13), None, "invalid side is treated as no assignment");
-    }
-
-    #[test]
-    fn fastest_rising_never_picks_a_falling_strike() {
-        // +5% (the fastest riser among the rising ones, but NOT nearest to ATM)
-        // must beat +3% and +1%; a strong FALLING strike is excluded upstream.
-        let pool: Vec<LegCandidate> = vec![
-            (1, "A".into(), 100.0, 120.0, 1.0),
-            (2, "B".into(), 110.0, 150.0, 5.0),
-            (3, "C".into(), 90.0, 130.0, 3.0),
-        ];
-        let spot = 100.0;
-        assert_eq!(pick_pref_candidate(&pool, spot, true), Some(1), "fastest = max % change");
-        // "Only +green (no fastest)" -> nearest to ATM.
-        assert_eq!(pick_pref_candidate(&pool, spot, false), Some(0), "nearest to ATM");
-
-        // A tie in % change breaks toward the strike nearest ATM, deterministically.
-        let tie: Vec<LegCandidate> = vec![
-            (1, "A".into(), 130.0, 120.0, 4.0),
-            (2, "B".into(), 100.0, 110.0, 4.0),
-        ];
-        assert_eq!(pick_pref_candidate(&tie, spot, true), Some(1));
-
-        // Rising predicate: falling / flat / unquoted premiums are rejected.
-        assert!(is_rising_premium(12.0, 2.5));
-        assert!(!is_rising_premium(12.0, -0.1), "falling premium rejected");
-        assert!(!is_rising_premium(12.0, 0.0), "flat premium rejected");
-        assert!(!is_rising_premium(0.0, 3.0), "unquoted premium rejected");
     }
 
     const UI_BULL: &[&str] = &[
@@ -11207,13 +11246,97 @@ mod gate_tests {
         let s = Settings::default();
         assert_eq!(s.strike_mode, "both_atm");
         assert_eq!(s.strike_count, 3);
+        assert_eq!(s.option_side, "both");
+        // "Only +green premium strikes" is the default selection filter.
         assert!(s.only_positive);
+        // Opposite-side fallback is ON by default: the "Execute Trade In" dropdown
+        // runs on the +green base.
+        assert!(s.fallback_opposite_side);
+        // "Pick fastest positive rising LTP" is opt-in, off by default; it shares
+        // the same direction/fallback wiring when switched on.
         assert!(!s.fastest_rising);
         assert_eq!(s.fastest_count, 3);
-        assert_eq!(s.option_side, "both");
         // Manual Strike Select (testing) is off until the operator turns it on.
         assert!(!s.manual_strikes_enabled);
         assert!(s.manual_strikes.is_empty());
+    }
+
+    #[test]
+    fn opposite_side_mode_only_for_single_sided_modes() {
+        assert_eq!(RealtimeState::opposite_side_mode("above"), Some("below"));
+        assert_eq!(RealtimeState::opposite_side_mode("below"), Some("above"));
+        assert_eq!(RealtimeState::opposite_side_mode("above_atm"), Some("below_atm"));
+        assert_eq!(RealtimeState::opposite_side_mode("below_atm"), Some("above_atm"));
+        // Case-insensitive.
+        assert_eq!(RealtimeState::opposite_side_mode("ABOVE"), Some("below"));
+        // Both-sided / ATM-only modes have no opposite side to fall back to.
+        assert_eq!(RealtimeState::opposite_side_mode("both_atm"), None);
+        assert_eq!(RealtimeState::opposite_side_mode("both_atm_inc"), None);
+        assert_eq!(RealtimeState::opposite_side_mode("atm"), None);
+        assert_eq!(RealtimeState::opposite_side_mode("nonsense"), None);
+    }
+
+    #[test]
+    fn green_walk_follows_execute_trade_in_dropdown_to_chain_edge() {
+        // Chain of 11 strikes (indices 0..=10), ATM at index 5. The walk is NOT
+        // capped by "Number of Strikes": it runs to the chain edge in the chosen
+        // direction so minus strikes can be skipped over one by one.
+        let len = 11usize;
+        let idx = 5usize;
+        let w = |mode: &str| RealtimeState::green_walk_order(len, idx, mode);
+        // Strictly above / below: never the ATM leg.
+        assert_eq!(w("above"), vec![6, 7, 8, 9, 10]);
+        assert_eq!(w("below"), vec![4, 3, 2, 1, 0]);
+        // Including ATM: ATM first, then outward in the chosen direction.
+        assert_eq!(w("above_atm"), vec![5, 6, 7, 8, 9, 10]);
+        assert_eq!(w("below_atm"), vec![5, 4, 3, 2, 1, 0]);
+        // Both sides: alternating outward (ATM excluded), or ATM first when
+        // "including ATM".
+        assert_eq!(w("both_atm"), vec![6, 4, 7, 3, 8, 2, 9, 1, 10, 0]);
+        assert_eq!(w("both_atm_inc"), vec![5, 6, 4, 7, 3, 8, 2, 9, 1, 10, 0]);
+        // Case-insensitive; only-ATM / unknown collapses to the ATM leg.
+        assert_eq!(w("ATM"), vec![5]);
+        assert_eq!(w("anything-else"), vec![5]);
+        // No index escapes the chain at either edge.
+        assert_eq!(w("above")[0], 6);
+        assert_eq!(RealtimeState::green_walk_order(len, 0, "below"), Vec::<usize>::new());
+        assert_eq!(RealtimeState::green_walk_order(len, 10, "above"), Vec::<usize>::new());
+        assert_eq!(RealtimeState::green_walk_order(len, 0, "above"), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(RealtimeState::green_walk_order(len, 10, "below"), vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn premium_signs_require_plus_on_both_ltp_and_change() {
+        // Rising print + positive change -> plus on both (green).
+        assert_eq!(RealtimeState::premium_signs_from(10.0, 9.5, 1.0), Some((true, true)));
+        // Falling print even though still up on the day -> minus LTP -> rejected.
+        assert_eq!(RealtimeState::premium_signs_from(10.0, 10.5, 1.0), Some((false, true)));
+        // Positive LTP tick but a minus change -> rejected.
+        assert_eq!(RealtimeState::premium_signs_from(10.0, 9.5, -0.5), Some((true, false)));
+        // No prior print yet: fall back to the change's sign.
+        assert_eq!(RealtimeState::premium_signs_from(10.0, 0.0, 0.5), Some((true, true)));
+        assert_eq!(RealtimeState::premium_signs_from(10.0, 0.0, -0.5), Some((false, false)));
+        // A flat print is not a plus.
+        assert_eq!(RealtimeState::premium_signs_from(10.0, 10.0, 1.0), Some((false, true)));
+        // Not-yet-seeded / flat change leans on the live print (no REST needed).
+        assert_eq!(RealtimeState::premium_signs_from(10.0, 9.5, 0.0), Some((true, true)));
+        assert_eq!(RealtimeState::premium_signs_from(10.0, 10.5, 0.0), Some((false, false)));
+        // No usable live LTP -> unknown.
+        assert_eq!(RealtimeState::premium_signs_from(0.0, 9.0, 1.0), None);
+    }
+
+    #[test]
+    fn fastest_rising_scores_by_change_pct_then_change() {
+        // Higher LTP change % wins regardless of order.
+        assert!(RealtimeState::rising_score_better((5.0, 1.0), (2.0, 9.0)));
+        assert!(!RealtimeState::rising_score_better((2.0, 9.0), (5.0, 1.0)));
+        // Equal change %: the bigger absolute LTP change wins.
+        assert!(RealtimeState::rising_score_better((3.0, 4.0), (3.0, 2.0)));
+        assert!(!RealtimeState::rising_score_better((3.0, 2.0), (3.0, 4.0)));
+        // Identical scores never "replace" the incumbent.
+        assert!(!RealtimeState::rising_score_better((3.0, 2.0), (3.0, 2.0)));
+        // A negative change % can never outrank a positive one.
+        assert!(!RealtimeState::rising_score_better((-1.0, 50.0), (0.5, 0.1)));
     }
 
     #[test]

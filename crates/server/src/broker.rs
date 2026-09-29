@@ -105,7 +105,7 @@ pub struct DhanState {
     /// together per user (DH-904 / error 805 "too many requests"); running the
     /// surfaces in parallel trips it and risks the account being blocked, so a
     /// single global slot is deliberate. Entry latency is instead cut by caching
-    /// every LTP the entry path already fetched (see `resolve_option_strategy_pref`)
+    /// every LTP the entry path already fetched (see the option-leg resolver)
     /// so it makes the fewest possible calls.
     gate: Arc<tokio::sync::Mutex<Instant>>,
     /// Separate, much faster gate for the ORDER APIs. Dhan's order endpoints
@@ -194,6 +194,48 @@ impl DhanState {
             .filter_map(|(sid, exch)| {
                 exchange_segment(exch)
                     .map(|seg| FeedSubscription::with_mode(seg, *sid, FeedMode::Full))
+            })
+            .collect();
+        if subs.is_empty() {
+            return;
+        }
+        if let Ok(g) = self.feed_tx.lock() {
+            if let Some(tx) = g.as_ref() {
+                let _ = tx.send(FeedCommand::Subscribe(subs));
+            }
+        }
+    }
+
+    /// Synchronous, deduplicated "make sure these strikes are streaming" used by
+    /// the entry hot path (the "+green premium" scan) so its candidate window can
+    /// be quoted without awaiting a REST/feed round-trip. Returns immediately;
+    /// the strikes' ticks land on the websocket on the following packets.
+    pub fn watch_options_now(&self, secs: &[(i64, String)]) {
+        if secs.is_empty() {
+            return;
+        }
+        self.market.register_extra(secs);
+        let mut fresh: Vec<(i64, String)> = Vec::new();
+        {
+            let Ok(mut g) = self.watch.lock() else { return };
+            for (sid, exch) in secs {
+                if *sid <= 0 {
+                    continue;
+                }
+                let entry = (*sid, exch.to_uppercase());
+                if !g.contains(&entry) {
+                    g.push(entry.clone());
+                    fresh.push(entry);
+                }
+            }
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        let subs: Vec<FeedSubscription> = fresh
+            .iter()
+            .filter_map(|(sid, exch)| {
+                exchange_segment(exch).map(|seg| FeedSubscription::with_mode(seg, *sid, FeedMode::Full))
             })
             .collect();
         if subs.is_empty() {

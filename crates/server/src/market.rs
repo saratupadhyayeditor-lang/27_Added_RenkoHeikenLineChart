@@ -471,10 +471,28 @@ impl MarketState {
     }
 
     /// Insert/overwrite one quote without broadcasting.
+    ///
+    /// Carries the *previous* print's LTP forward as `prev_ltp` so consumers can
+    /// read a premium's own tick-to-tick direction (the "+/-" of the LTP itself)
+    /// without ever recomputing a change against a previous close.
     pub fn set_quote(&self, key: String, value: Value) {
-        if let Ok(mut g) = self.quotes.lock() {
-            g.insert(key, value);
+        let Ok(mut g) = self.quotes.lock() else { return };
+        let mut value = value;
+        if let Some(ltp) = value.get("ltp").and_then(|v| v.as_f64()) {
+            if ltp > 0.0 {
+                let prev = g
+                    .get(&key)
+                    .and_then(|e| e.get("ltp"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                if prev > 0.0 && prev != ltp {
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("prev_ltp".to_string(), json!(prev));
+                    }
+                }
+            }
         }
+        g.insert(key, value);
     }
 
     /// Push a batch of quotes to every `/ws` subscriber.

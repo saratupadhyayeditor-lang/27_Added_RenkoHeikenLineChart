@@ -1,6 +1,6 @@
 [package]
 name = "algo-desktop"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "Dedicated native desktop shell for the Rust algo app (embedded WebView2 / WebKit, zero UI porting)"
 license = "MIT"

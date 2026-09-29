@@ -122,6 +122,11 @@ let refreshSeq = 0;
 let refreshInFlight = false;
 let refreshQueued = false;
 let filtersBusy = false;
+// The strike-selection base ("Only +green premium strikes" + "Opposite side
+// fallback") must stay ON because the "Execute Trade In" dropdown is designed to
+// run on it. If a legacy snapshot arrives with either off, it is turned back on
+// (with a one-time notice) instead of silently shipping a mismatched config.
+let strikeBaseNormalized = false;
 // The per-second snapshot only carries the newest slice of the closed ledger;
 // the full (uncapped) ledger is paged in on demand via `/closed` and cached here.
 let CLOSED_CACHE = null;
@@ -1137,7 +1142,8 @@ function shell() {
           </select></label>
         <label class="rtom-f">Number of Strikes <input type="number" data-set="strikeCount" min="0" step="1" style="width:56px"></label>
         <label class="rtom-f"><input type="checkbox" data-set="onlyPositive"> Only +green premium strikes</label>
-        <label class="rtom-f"><input type="checkbox" data-set="fastestRising"> Pick fastest positive rising LTP</label>
+        <label class="rtom-f" title="Only +green ke sath: agar Execute Trade In ki chuni hui side (Above/Below ATM) ki saari strikes minus ho, to ATM ke opposite side (Below/Above) me plus-sign wali strike dhoondh kar usi leg (CE/PE) me trade karta hai. Single-side dropdown par hi lagu."><input type="checkbox" data-set="fallbackOppositeSide" style="accent-color:#00d4aa"> Opposite side fallback (if all minus)</label>
+        <label class="rtom-f" title="ON hone par Execute Trade In ki chuni hui side ke plus-sign (rising) premiums me se sabse jyada LTP change % wala strike pick hota hai (tie: jyada LTP change). +green aur Opposite side fallback ke sath mil kar chalta hai. OFF par +green ka sabse kareeb wala rising strike."><input type="checkbox" data-set="fastestRising" style="accent-color:#00d4aa"> Pick fastest positive rising LTP</label>
         <label class="rtom-f">Fastest-Rising Strikes <input type="number" data-set="fastestCount" min="1" step="1" style="width:56px"></label>
       </div>
 
@@ -1995,8 +2001,23 @@ function wire() {
   const alCb = $("rtEngAutoLots");
   if (alCb) alCb.onchange = () => API.autoLots({ autoLots: !!alCb.checked }).then(refresh);
 
+  // "Only +green premium strikes" and "Opposite side fallback (if all minus)" are
+  // the required base the "Execute Trade In" dropdown runs on. If the operator
+  // tries to switch either off, alert and keep it enabled instead of shipping a
+  // config the dropdown cannot honour.
+  const STRIKE_BASE_GUARD = {
+    onlyPositive: "Only +green premium strikes",
+    fallbackOppositeSide: "Opposite side fallback (if all minus)",
+  };
   document.querySelectorAll("#tab-realtime [data-set]").forEach((inp) => {
     inp.onchange = () => {
+      const k = inp.getAttribute("data-set");
+      if (inp.type === "checkbox" && !inp.checked && STRIKE_BASE_GUARD[k]) {
+        uiAlert(
+          '"' + STRIKE_BASE_GUARD[k] + '" ON rakhna zaroori hai. "Execute Trade In" ke sare dropdown options isi +green base par kaam karte hain, isliye ise enable kar diya gaya hai.'
+        );
+        inp.checked = true;
+      }
       syncInterlocks();
       API.settings(settingsFromDom()).then(refresh);
     };
@@ -3439,20 +3460,13 @@ function syncInterlocks() {
   fadeControl(q("tradeLimitCount"), !(checked("tradeLimit") && !checked("aiTrades")));
   renderTradesStatus();
 
-  // --- Strike pool: ATM / fastest-rising fade the normal count; fastest fades
-  //     the redundant "+green only" box and enables its own count. Manual Strike
-  //     Select (testing) fades the whole automatic pool. ---
+  // --- Strike pool: ATM / fastest-rising fade the normal count; fastest-rising
+  //     is a REFINEMENT of "+green only" (biggest riser among the rising
+  //     premiums), so it no longer fades/disable it - both work together.
+  //     Manual Strike Select (testing) fades the whole automatic pool. ---
   const manualOn = checked("manualStrikesEnabled");
   const atm = val("strikeMode") === "atm";
   const fastOn = checked("fastestRising");
-  // "Pick fastest positive rising LTP" scans a window of fastestCount strikes on
-  // BOTH sides of ATM (see realtime.rs resolve_option_strategy_pref), so the
-  // Execute-Trade-In dropdown is pinned to "Above and below including ATM" while
-  // it is on - that is the pool the engine actually uses.
-  const smEl = q("strikeMode");
-  if (smEl && fastOn && !manualOn && smEl.value !== "both_atm_inc") {
-    smEl.value = "both_atm_inc";
-  }
   const cnt = q("strikeCount");
   if (cnt) {
     const dis = atm || fastOn || manualOn;
@@ -3473,11 +3487,25 @@ function syncInterlocks() {
   }
   const pos = q("onlyPositive");
   if (pos) {
-    const dis = fastOn || manualOn;
+    const dis = manualOn;
     pos.disabled = dis;
     pos.style.opacity = dis ? "0.5" : "1";
     pos.style.pointerEvents = dis ? "none" : "";
     const w = pos.closest("label");
+    if (w) { w.style.opacity = dis ? "0.6" : "1"; w.style.pointerEvents = dis ? "none" : ""; }
+  }
+  // --- Opposite-side fallback: needs +green on AND a single-sided "Execute
+  //     Trade In" mode (both-sided / ATM-only have no opposite side). Works the
+  //     same with fastest-rising on (both share the direction + fallback). ---
+  const fb = q("fallbackOppositeSide");
+  if (fb) {
+    const mdl = val("strikeMode");
+    const singleSide = mdl === "above" || mdl === "above_atm" || mdl === "below" || mdl === "below_atm";
+    const dis = manualOn || !checked("onlyPositive") || !singleSide;
+    fb.disabled = dis;
+    fb.style.opacity = dis ? "0.5" : "1";
+    fb.style.pointerEvents = dis ? "none" : "";
+    const w = fb.closest("label");
     if (w) { w.style.opacity = dis ? "0.6" : "1"; w.style.pointerEvents = dis ? "none" : ""; }
   }
   fadeControl(q("optionSide"), manualOn);
@@ -3587,6 +3615,20 @@ function applySettingsToDom(s) {
   syncAstToggles(s);
   applyDataPoolUi(!!s.data_pool);
   applyEngineScanUI(s);
+  // Strike-selection base must stay ON (see strikeBaseNormalized). A legacy
+  // snapshot with either flag off is corrected once, with a notice, so the
+  // "Execute Trade In" dropdown always runs on the +green base.
+  if (!strikeBaseNormalized && (s.onlyPositive === false || s.fallbackOppositeSide === false)) {
+    strikeBaseNormalized = true;
+    ["onlyPositive", "fallbackOppositeSide"].forEach((k) => {
+      const e = document.querySelector('#tab-realtime [data-set="' + k + '"]');
+      if (e) e.checked = true;
+    });
+    uiAlert(
+      '"Only +green premium strikes" aur "Opposite side fallback (if all minus)" ON rakhna zaroori hai - "Execute Trade In" ke sare dropdown options isi base par kaam karte hain. Dono enable kar diye gaye hain.'
+    );
+    pushSetting({ onlyPositive: true, fallbackOppositeSide: true });
+  }
   syncInterlocks();
   applyRunModeUI();
   renderAllChips();
