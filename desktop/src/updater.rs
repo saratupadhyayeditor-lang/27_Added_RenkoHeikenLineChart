@@ -21,7 +21,7 @@ const API: &str = "https://api.github.com";
 /// GitHub Releases on this repo must publish `algo-desktop-<os>-<arch>.zip`
 /// assets (+ `SHA256SUMS`) - see `.github/workflows/release.yml`.
 pub const DEFAULT_REPO: &str =
-    "saratupadhyayeditor-lang/21_Fixed_FastestRisingStrike";
+    "saratupadhyayeditor-lang/22_Fixed_Vote_Veto";
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub struct UpdateConfig {

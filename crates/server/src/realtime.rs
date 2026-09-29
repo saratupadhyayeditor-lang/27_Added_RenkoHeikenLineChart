@@ -381,6 +381,15 @@ pub struct Settings {
     pub multi_always_on: bool,
     pub brain_mode: String,
     pub brain_threshold: i64,
+    /// Opposite-side filter veto mode:
+    /// * `relative` (default) - veto the entry only when the OPPOSITE side's
+    ///   enabled filters agree STRICTLY more than the trade side's own filters
+    ///   (i.e. the opposite read is stronger). A tie, or the trade side leading,
+    ///   never vetoes, so a symmetric two-sided filter set can no longer deadlock
+    ///   into "no trade at all" on either side.
+    /// * `off` - disable the opposite-side veto entirely; the own-side strict /
+    ///   majority / Brain gate is the only entry rule.
+    pub opposite_veto: String,
     /// Option side for index/underlying strategies: `both` | `CE` | `PE`.
     pub option_side: String,
     /// NIFTY ensemble trend timeframe: `1min` | `5min` | `15min` | `both`.
@@ -569,6 +578,7 @@ impl Default for Settings {
             multi_always_on: false,
             brain_mode: "off".into(),
             brain_threshold: 65,
+            opposite_veto: "relative".into(),
             option_side: "both".into(),
             nifty_tf: "5min".into(),
             filters: BTreeMap::new(),
@@ -1836,8 +1846,16 @@ impl RealtimeState {
                     .unwrap_or((false, false, false, 100, false, "1min".into()));
                 if on {
                     self.check_square_off().await;
-                    if force && !armed {
-                        self.log("warn", "tick: engine running but disarmed - arm to place orders");
+                    if !armed {
+                        // Running-but-disarmed places no orders. Surface it on a
+                        // throttle so the Condition Log always explains why the
+                        // engine looks active yet nothing is being traded.
+                        self.log_throttled(
+                            "engine-disarmed",
+                            15_000,
+                            "warn",
+                            "engine RUNNING but DISARMED - no orders will be placed (click 'AI Smart Trading: ON' or 'Run / Tick Now' to arm)",
+                        );
                     }
                     if armed {
                         // "Engine Scan" throttle. Three cases:
@@ -7599,12 +7617,15 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
             f.opposite += 1;
         }
     }
-    // Opposite-side confirmation veto: if a majority of the *opposite* side's
-    // enabled filters has actually met its condition, the chart is reading the
-    // other way and the trade must not fire - regardless of Brain mode. Without
-    // this, opposite indicators were only counted (never vetoed) unless Brain
-    // was set to AUTO, so a bearish chart could still fire a bullish entry.
-    if f.opp_total > 0 && f.opposite * 2 >= f.opp_total {
+    // Opposite-side confirmation veto. The chart only "reads the other way" when
+    // the OPPOSITE side's enabled filters agree STRICTLY more than this trade
+    // side's own filters (relative veto, the default): opposite must lead by at
+    // least one filter. A tie - or this side leading - never vetoes, so a
+    // symmetric Bull+Bear filter set can no longer deadlock into "no trade at
+    // all" on both sides. Mode `off` disables the veto entirely and lets the
+    // own-side strict / majority / Brain gate stand alone.
+    let opposite_veto_on = !settings.opposite_veto.eq_ignore_ascii_case("off");
+    if opposite_veto_on && f.opp_total > 0 && f.opposite > f.pass {
         f.veto = true;
         return (false, f);
     }
@@ -8638,6 +8659,14 @@ pub async fn settings_post(State(rt): State<RealtimeState>, Json(v): Json<Value>
         // reads a value inside the floor/ceiling (100ms default for a stray 0).
         d.settings.scan_interval_ms = scan_interval_budget(d.settings.scan_interval_ms);
         d.settings.scan_bar_close_tf = scan_bar_close_tf(&d.settings.scan_bar_close_tf).to_string();
+        // Opposite-side veto mode: accept only the two documented values so a
+        // stray payload can never silently flip the entry gate ("relative" or
+        // "off"; anything else falls back to the "relative" default).
+        d.settings.opposite_veto = if d.settings.opposite_veto.eq_ignore_ascii_case("off") {
+            "off".to_string()
+        } else {
+            "relative".to_string()
+        };
         // "Make this default setting" markers (old AST runIn/tradeIn `default`
         // flags): the routing is always persisted, so surface the confirmation
         // the old engine logged instead of leaving the checkbox silently inert.
@@ -10137,6 +10166,7 @@ mod gate_tests {
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["optionSide"], json!("CE"));
         assert_eq!(v["brainMode"], json!("auto"));
+        assert_eq!(v["oppositeVeto"], json!("relative"));
         assert_eq!(v["allInOne"], json!(true));
         assert_eq!(v["filterMode"], json!(true));
         assert_eq!(v["filters"]["BullIncUp"], json!(true));
@@ -10155,6 +10185,7 @@ mod gate_tests {
         assert!(back.run_in_enabled && back.run_in_side == "PE" && back.run_in_auto);
         assert!(back.filter_mode);
         assert_eq!(back.scanner_exclude, vec![17818, 1234]);
+        assert_eq!(back.opposite_veto, "relative");
     }
 
     #[test]
@@ -10263,10 +10294,15 @@ mod gate_tests {
         s.filters.insert("BullIncUp".into(), true);
         // Own side passes and there is no opposite agreement.
         assert!(filter_gate(&s, &bull_strategy(), &c, 0), "no opposite agreement => allowed");
-        // A passing opposite filter (Elder Force is a non-blocking confirmer that
-        // always evaluates true) is a conflict and must veto the entry.
+        // Opposite side now leads STRICTLY: the own side has no passing filter
+        // while a passing opposite filter (Elder Force is a non-blocking
+        // confirmer that always evaluates true) counts against it. The relative
+        // veto fires even though Brain mode alone would not reach this branch.
+        s.filters.clear();
+        s.filters.insert("BullIncDown".into(), true);
         s.filters.insert("BearPbrElderforce".into(), true);
-        assert!(!filter_gate(&s, &bull_strategy(), &c, 0), "strong opposite agreement vetoes");
+        let (ok, f) = filter_gate_facts(&s, &bull_strategy(), &c, 0);
+        assert!(!ok && f.veto, "opposite leading strictly vetoes even under Brain AUTO");
     }
 
     #[test]
@@ -10295,10 +10331,43 @@ mod gate_tests {
         s.filters.insert("BearIncDown".into(), true);
         // On a rising ramp the bear filter is unmet, so it must not veto.
         assert!(filter_gate(&s, &bull_strategy(), &c, 0), "unmet opposite does not veto");
-        // A met opposite filter (Elder Force always evaluates true) vetoes even
-        // with Brain off - the chart is reading the other way.
+        // Opposite now leads STRICTLY: the own side has no passing filter and a
+        // met opposite filter (Elder Force always evaluates true) counts once -
+        // so the relative veto fires even with Brain off.
+        s.filters.clear();
+        s.filters.insert("BullIncDown".into(), true);
         s.filters.insert("BearPbrElderforce".into(), true);
-        assert!(!filter_gate(&s, &bull_strategy(), &c, 0), "met opposite vetoes with brain off");
+        let (ok, f) = filter_gate_facts(&s, &bull_strategy(), &c, 0);
+        assert!(!ok && f.veto, "opposite leading strictly vetoes with brain off");
+    }
+
+    #[test]
+    fn opposite_veto_relative_tie_and_off() {
+        let c = ramp(60, 100.0, 1.0);
+        // Tie (own 1 vs opposite 1): a symmetric Bull+Bear filter set must not
+        // deadlock into "no trade" - the relative veto leaves the entry to the
+        // ordinary own-side majority rule.
+        let mut s = Settings::default();
+        s.filters.insert("BullIncUp".into(), true);
+        s.filters.insert("BearPbrElderforce".into(), true);
+        let (ok, f) = filter_gate_facts(&s, &bull_strategy(), &c, 0);
+        assert!(ok && !f.veto, "tie (1 vs 1) must not veto");
+
+        // Mode `off`: even when the opposite side strictly leads, no veto is set.
+        let mut s = Settings::default();
+        s.opposite_veto = "off".into();
+        s.filters.insert("BullIncDown".into(), true);
+        s.filters.insert("BearPbrElderforce".into(), true);
+        let (_, f) = filter_gate_facts(&s, &bull_strategy(), &c, 0);
+        assert!(!f.veto, "opposite veto OFF must never set veto");
+
+        // Mode `relative` (the default): opposite strictly leading does veto.
+        let mut s = Settings::default();
+        assert_eq!(s.opposite_veto, "relative");
+        s.filters.insert("BullIncDown".into(), true);
+        s.filters.insert("BearPbrElderforce".into(), true);
+        let (_, f) = filter_gate_facts(&s, &bull_strategy(), &c, 0);
+        assert!(f.veto, "relative veto fires when opposite strictly leads");
     }
 
     #[test]

@@ -18,7 +18,7 @@ const $ = (id) => document.getElementById(id);
 // Distribution repo baked into the desktop shell too (desktop/src/updater.rs).
 // Pre-filled so a fresh install can update with no manual repo setup.
 const DEFAULT_REPO =
-  "saratupadhyayeditor-lang/21_Fixed_FastestRisingStrike";
+  "saratupadhyayeditor-lang/22_Fixed_Vote_Veto";
 
 let booted = false;
 let logLines = [];

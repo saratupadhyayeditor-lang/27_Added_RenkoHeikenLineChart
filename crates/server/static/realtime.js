@@ -962,6 +962,7 @@ function shell() {
         <h3 class="rt-title">AI Smart Trading Engine</h3>
         <button class="btn-action" id="rtEngineToggle" style="width:auto;padding:5px 12px;margin:0">AI Smart Trading: OFF</button>
         <button class="btn-action" data-act="ticknow" style="width:auto;padding:5px 12px;margin:0;background:#66ccff;color:#0a0a18">Run / Tick Now</button>
+        <span id="rtDisarmWarn" style="display:none;font-size:10px;font-weight:700;color:#ef5350;background:#2a0d0d;border:1px solid #ef5350;border-radius:4px;padding:3px 8px">Engine ON par DISARMED - koi order place nahi hoga. "AI Smart Trading: ON" dabao ya "Run / Tick Now" se arm karo.</span>
         <button class="btn-action" data-act="refresh" style="width:auto;padding:5px 12px;margin:0">Refresh Strategies</button>
         <button class="btn-action warn" data-act="stopall" style="width:auto;padding:5px 12px;margin:0">Stop All</button>
         <button class="btn-action warn" data-act="resetpnl" style="width:auto;padding:5px 12px;margin:0" title="Clear every closed trade, log and realized total. Starts the next trade from a clean ₹0 slate.">Reset P&amp;L</button>
@@ -1257,6 +1258,8 @@ function shell() {
           <label class="rtom-f">AI Brain
             <select data-set="brainMode" style="width:170px"><option value="off">OFF</option><option value="auto">Auto (score + conflict veto)</option></select></label>
           <label class="rtom-f">threshold <input type="number" data-set="brainThreshold" min="5" max="100" step="1" style="width:56px"> %</label>
+          <label class="rtom-f" title="Opposite-side veto: Relative (default) = entry sirf tab veto hoti hai jab OPPOSITE side ke filters apni side se strictly zyada agree karein (kam se kam 1 filter aage). Barabar (tie) ya apni side aage ho to veto NAHI lagega, isliye symmetric Bull+Bear filter set dono side par deadlock nahi karega. OFF = koi opposite veto nahi, sirf apni side ka majority/strict/Brain rule.">Opposite veto
+            <select data-set="oppositeVeto" style="width:180px"><option value="relative">Relative (stronger side wins)</option><option value="off">OFF</option></select></label>
         </div>
         <div id="rtBrainSummary" style="flex-basis:100%;font-size:9px;color:#b39ddb"></div>
         <div style="flex-basis:100%;display:flex;flex-wrap:wrap;gap:10px;align-items:flex-start">
@@ -2021,6 +2024,13 @@ function wire() {
       if (act === "runref" || act === "refresh") {
         refresh();
       } else if (act === "ticknow") {
+        // "Run / Tick Now" is the obvious "go" button: if the engine is not
+        // armed, a bare force-tick would scan nothing and silently place no
+        // orders. Arm it first (with the same confirm as the engine toggle),
+        // then force the immediate evaluation pass.
+        if (!(STATE && STATE.armed)) {
+          if (!(await startRunEngine())) return;
+        }
         await API.tick();
         refresh();
       } else if (act === "closeall") {
@@ -2041,6 +2051,10 @@ function wire() {
         if (!(await uiConfirm("Clear closed trades + logs and reset realized P&L?", { danger: true }))) return;
         await API.reset({ what: "closed" });
         await API.reset({ what: "logs" });
+        // Drop the client-side closed/day-stats caches so the emptied book is
+        // actually reflected (the 1s poll only ships the newest slice and would
+        // otherwise keep painting the cached rows).
+        resetBookCaches();
         refresh();
       } else if (act === "selectall") {
         for (const s of (STATE && STATE.strategies) || []) {
@@ -2258,6 +2272,8 @@ function paintEnginePills(on, armed) {
   }
   const tg = document.getElementById("rtEngineToggle");
   if (tg) tg.textContent = "AI Smart Trading: " + (on ? "ON" : "OFF");
+  const warn = document.getElementById("rtDisarmWarn");
+  if (warn) warn.style.display = on && !armed ? "inline-block" : "none";
 }
 
 function renderSnapshot(s) {
@@ -2315,6 +2331,7 @@ function renderSnapshot(s) {
         const msg = "Reset all Smart P&L?\n\nYe closed trades aur logs" + (PAPER ? " aur open paper positions" : "") + " clear kar dega. Undo nahi hoga.";
         if (!(await uiConfirm(msg, { danger: true }))) return;
         await API.reset({ what: "smart" });
+        resetBookCaches();
         refresh();
       };
     }
@@ -4017,6 +4034,18 @@ function renderClosed(s) {
       </tr>`;
     })
     .join("");
+}
+
+// The closed ledger and day-stats are cached client-side (the 1s poll only ships
+// the newest slice). After a P&L reset the server book is empty, so drop the
+// caches and force a repaint - otherwise the old rows keep showing.
+function resetBookCaches() {
+  CLOSED_CACHE = null;
+  closedLoadedAt = 0;
+  closedRenderSig = "";
+  DAY_STATS = null;
+  dayStatsAt = 0;
+  dayStatsSig = "";
 }
 
 // "Deduct Dhan charges" toggle state. Real trades settle charges broker-side
