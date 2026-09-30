@@ -1,0 +1,88 @@
+name: release
+
+# Builds the desktop update assets and publishes them to a GitHub Release so the
+# in-app "App Update" updater (desktop/src/updater.rs) can self-update from here.
+#
+# Push a tag like v0.1.5, or run this workflow manually with a tag input.
+# Updater contract (must match desktop/src/updater.rs):
+#   asset name: algo-desktop-<os>-<arch>.zip   (windows|linux|macos / x86_64|aarch64)
+#   asset zip root: algo-desktop, algo-server, static/
+#   checksum: SHA256SUMS asset (and/or the GitHub asset digest)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/publish (e.g. v0.1.5)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux system deps (WebKitGTK)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev build-essential pkg-config
+
+      - name: Build desktop platform (unix)
+        if: runner.os != 'Windows'
+        run: bash desktop/scripts/build-desktop.sh
+
+      - name: Build desktop platform (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./desktop/scripts/build-desktop.ps1
+
+      - name: Stash per-platform checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: sums-${{ matrix.os }}
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Publish platform asset to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            dist/algo-desktop-*.zip
+            dist/algo-desktop-*-portable*
+
+  checksums:
+    name: publish-checksums
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: sums
+
+      - name: Merge SHA256SUMS
+        run: |
+          cat sums/*/SHA256SUMS | sort -u > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish merged SHA256SUMS
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: SHA256SUMS

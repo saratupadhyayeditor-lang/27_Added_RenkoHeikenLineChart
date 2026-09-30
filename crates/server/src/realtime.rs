@@ -366,6 +366,12 @@ pub struct Settings {
     pub nifty_trend_pct_on: bool,
     pub nifty_trend_pct: f64,
     pub nifty_trend_conf_inds: Vec<String>,
+    /// Number of straight-line points used to read each confirmation indicator's
+    /// trend. The direction is the net move across that window of points - the
+    /// same straight segment the chart draws - so a single bar's blip can no
+    /// longer flip the read (the old one-point slope did exactly that).
+    /// Minimum 3 points; higher = smoother. Clamped to >= 3 by `nifty_slope_len`.
+    pub nifty_trend_slope_len: i64,
     // --- Commodities ---
     pub commodity_on: bool,
     pub commodity_list: Vec<i64>,
@@ -590,6 +596,7 @@ impl Default for Settings {
             nifty_trend_pct_on: true,
             nifty_trend_pct: 2.5,
             nifty_trend_conf_inds: Vec::new(),
+            nifty_trend_slope_len: 5,
             commodity_on: false,
             commodity_list: Vec::new(),
             scanner_exclude: Vec::new(),
@@ -2629,10 +2636,10 @@ impl RealtimeState {
         if now - self.last_trend.load(Ordering::Relaxed) < 2_500 {
             return;
         }
-        let (enabled, tf, conf) = self
+        let (enabled, tf, conf, slope) = self
             .doc()
-            .map(|d| (d.settings.nifty_trend_on, nifty_timeframe(&d.settings), d.settings.nifty_trend_conf_inds.clone()))
-            .unwrap_or((false, "5min".into(), Vec::new()));
+            .map(|d| (d.settings.nifty_trend_on, nifty_timeframe(&d.settings), d.settings.nifty_trend_conf_inds.clone(), d.settings.nifty_trend_slope_len))
+            .unwrap_or((false, "5min".into(), Vec::new(), 5));
         self.last_trend.store(now, Ordering::Relaxed);
         if !enabled {
             self.clear_nifty_direction();
@@ -2641,7 +2648,7 @@ impl RealtimeState {
         if !self.dhan.is_connected().await {
             return;
         }
-        if let Some((bull, bear, net)) = self.resolve_nifty_direction(&tf, &conf, true).await {
+        if let Some((bull, bear, net)) = self.resolve_nifty_direction(&tf, &conf, slope, true).await {
             self.apply_nifty_direction(bull, bear, net, &tf);
         }
     }
@@ -2657,14 +2664,14 @@ impl RealtimeState {
             return;
         }
         self.last_nifty_flip.store(now, Ordering::Relaxed);
-        let (enabled, tf, conf) = self
+        let (enabled, tf, conf, slope) = self
             .doc()
-            .map(|d| (d.settings.nifty_trend_on, nifty_timeframe(&d.settings), d.settings.nifty_trend_conf_inds.clone()))
-            .unwrap_or((false, "5min".into(), Vec::new()));
+            .map(|d| (d.settings.nifty_trend_on, nifty_timeframe(&d.settings), d.settings.nifty_trend_conf_inds.clone(), d.settings.nifty_trend_slope_len))
+            .unwrap_or((false, "5min".into(), Vec::new(), 5));
         if !enabled {
             return;
         }
-        if let Some((bull, bear, net)) = self.resolve_nifty_direction(&tf, &conf, false).await {
+        if let Some((bull, bear, net)) = self.resolve_nifty_direction(&tf, &conf, slope, false).await {
             self.apply_nifty_direction(bull, bear, net, &tf);
         }
     }
@@ -2677,11 +2684,12 @@ impl RealtimeState {
         &self,
         tf: &str,
         conf: &[String],
+        slope_len: i64,
         allow_rest: bool,
     ) -> Option<(Vec<String>, Vec<String>, i64)> {
         if tf.eq_ignore_ascii_case("both") {
-            let a = self.nifty_assignment_for("1min", conf, allow_rest).await;
-            let b = self.nifty_assignment_for("5min", conf, allow_rest).await;
+            let a = self.nifty_assignment_for("1min", conf, slope_len, allow_rest).await;
+            let b = self.nifty_assignment_for("5min", conf, slope_len, allow_rest).await;
             match (a, b) {
                 (Some(xa), Some(xb)) => {
                     if xa.2.signum() == xb.2.signum() {
@@ -2695,7 +2703,7 @@ impl RealtimeState {
                 (None, None) => None,
             }
         } else {
-            self.nifty_assignment_for(tf, conf, allow_rest).await
+            self.nifty_assignment_for(tf, conf, slope_len, allow_rest).await
         }
     }
 
@@ -2705,6 +2713,7 @@ impl RealtimeState {
         &self,
         tf: &str,
         conf: &[String],
+        slope_len: i64,
         allow_rest: bool,
     ) -> Option<(Vec<String>, Vec<String>, i64)> {
         let c = if allow_rest {
@@ -2719,25 +2728,25 @@ impl RealtimeState {
         if c.len() < 35 {
             return None;
         }
-        Some(nifty_indicator_assignment(&c, conf))
+        Some(nifty_indicator_assignment(&c, conf, slope_len))
     }
 
     /// Publish a resolved direction: store the per-leg filter split, swap the
     /// sign, and on a change re-arm the strike scan + emit the flip signal/log.
     fn apply_nifty_direction(&self, bull: Vec<String>, bear: Vec<String>, net: i64, tf: &str) {
+        // A tie (net 0) carries no committed direction. Keep the previous side and
+        // its filter split instead of dropping to NEUTRAL - a momentary dead-heat
+        // must never free BOTH legs and let the engine trade both directions.
+        if net == 0 {
+            return;
+        }
         if let Ok(mut b) = self.nifty_bull_filters.lock() {
             *b = bull;
         }
         if let Ok(mut b) = self.nifty_bear_filters.lock() {
             *b = bear;
         }
-        let d = if net > 0 {
-            1
-        } else if net < 0 {
-            -1
-        } else {
-            0
-        };
+        let d = if net > 0 { 1 } else { -1 };
         let prev = self.nifty_dir.swap(d, Ordering::Relaxed);
         if prev == d {
             return;
@@ -2745,9 +2754,6 @@ impl RealtimeState {
         // Re-resolve the picked strikes on the new side immediately; the old
         // trades keep running (a switch never closes them).
         self.last_nifty_scan.store(0, Ordering::Relaxed);
-        if d == 0 {
-            return;
-        }
         let seq = self.nifty_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let from = prev.signum();
         if let Ok(mut f) = self.nifty_flip.lock() {
@@ -6149,22 +6155,83 @@ const NIFTY_SEC: i64 = 13;
 /// ids are assigned to the Top Gainer side, bearish ids to the Top Loser side,
 /// so a bullish line trades gainers and a bearish line trades losers. Returns
 /// `(bullish_ids, bearish_ids, net)` where `net = bullish - bearish`.
-fn nifty_indicator_assignment(candles: &[Candle], conf: &[String]) -> (Vec<String>, Vec<String>, i64) {
+fn nifty_indicator_assignment(candles: &[Candle], conf: &[String], slope_len: i64) -> (Vec<String>, Vec<String>, i64) {
     let st = algo_core::model::Settings::default();
+    let window = nifty_slope_len(slope_len);
     let mut bull: Vec<String> = Vec::new();
     let mut bear: Vec<String> = Vec::new();
     for id in conf {
         let out = algo_core::compute(id, candles, &st);
         let Some(s) = out.first() else { continue };
-        let (Some(v0), Some(v1)) = (series_value(s, 0), series_value(s, 1)) else { continue };
-        if v0 > v1 {
-            bull.push(id.clone());
-        } else if v0 < v1 {
-            bear.push(id.clone());
+        // Read the line's ACTUAL trend over a window, not a single last step, so
+        // the straight-line direction matches what the chart draws. `None` (line
+        // not resolved yet) contributes nothing instead of forcing a side.
+        match straight_line_trend(s, 0, window) {
+            Some(SlTrend::Bull) => bull.push(id.clone()),
+            Some(SlTrend::Bear) => bear.push(id.clone()),
+            _ => {}
         }
     }
     let net = bull.len() as i64 - bear.len() as i64;
     (bull, bear, net)
+}
+
+/// Straight-line trend window length. At least 3 points so the net move has more
+/// than a single step to average over; values above the available history clamp
+/// on read.
+fn nifty_slope_len(v: i64) -> usize {
+    v.clamp(3, 200) as usize
+}
+
+/// Trend read of one straight-line series.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlTrend {
+    /// The drawn line is rising.
+    Bull,
+    /// The drawn line is falling.
+    Bear,
+    /// The line is flat; upstream keeps the previous side.
+    Flat,
+}
+
+/// Read the TREND of a straight-line series from a window of its latest points.
+///
+/// The line's direction is the net move across the window (`last - first`) - the
+/// same slope the chart draws between those points. A single bar's blip only
+/// shifts the read in proportion to its share of the window, so it can no longer
+/// flip the line the way the old neighbouring-point read did (that read saw only
+/// one step). This also matches zigzag structure lines, whose points alternate
+/// up/down and would otherwise average out to "flat".
+///
+/// A near-flat line (net move within half an average step of zero) reads `Flat`
+/// so the caller holds its previous side. `None` = still warming up (fewer than
+/// 3 points / non-finite): warm-up must never fabricate a direction.
+fn straight_line_trend(ser: &algo_core::model::SeriesOut, offset: usize, window: usize) -> Option<SlTrend> {
+    let n = ser.data.len();
+    let need = window.max(3);
+    // Last `need` points ending at `offset`, oldest -> newest.
+    let end = n.checked_sub(offset)?;
+    let start = end.saturating_sub(need);
+    if end - start < 3 {
+        return None;
+    }
+    let vals: Vec<f64> = (start..end).map(|i| ser.data[i].value).collect();
+    if !vals.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let span = vals[vals.len() - 1] - vals[0];
+    // Relative noise floor: the net move must beat half an average step, so a
+    // near-flat line of micro-steps reads Flat instead of flickering a side.
+    let sum_step: f64 = vals.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+    let mean_step = sum_step / (vals.len() - 1) as f64;
+    let eps = mean_step * 0.5;
+    if span > eps {
+        Some(SlTrend::Bull)
+    } else if span < -eps {
+        Some(SlTrend::Bear)
+    } else {
+        Some(SlTrend::Flat)
+    }
 }
 
 /// NIFTY trend timeframe: the timeframe the operator ticked for the engine
@@ -10043,14 +10110,42 @@ mod gate_tests {
         // A steadily rising index resolves the straight-line trend indicators
         // bullish -> net positive, every id lands in the CE bucket.
         let up = ramp(400, 100.0, 0.6);
-        let (bull, bear, net) = nifty_indicator_assignment(&up, &conf);
+        let (bull, bear, net) = nifty_indicator_assignment(&up, &conf, 5);
         assert!(net > 0, "rising index must net bullish, got {net}");
         assert!(!bull.is_empty() && bear.is_empty());
         // The mirror-image falling index flips the assignment to the PE bucket.
         let down = ramp(400, 340.0, -0.6);
-        let (bull2, bear2, net2) = nifty_indicator_assignment(&down, &conf);
+        let (bull2, bear2, net2) = nifty_indicator_assignment(&down, &conf, 5);
         assert!(net2 < 0, "falling index must net bearish, got {net2}");
         assert!(!bear2.is_empty() && bull2.is_empty());
+    }
+
+    fn line_of(chronological: &[f64]) -> algo_core::model::SeriesOut {
+        let mut s = algo_core::model::SeriesOut::default();
+        s.data = chronological
+            .iter()
+            .enumerate()
+            .map(|(i, v)| algo_core::model::Point { time: i as i64, value: *v, color: None })
+            .collect();
+        s
+    }
+
+    #[test]
+    fn line_trend_reads_the_line_not_the_last_blip() {
+        // Chronological values: a clear fall (5->4->3->2->1) then one up-tick to 2.
+        // The OLD neighbouring-point read (2 > 1) reported BULLISH; the windowed
+        // read follows the falling line and stays BEARISH.
+        let down_bounce = line_of(&[5.0, 4.0, 3.0, 2.0, 1.0, 2.0]);
+        assert_eq!(straight_line_trend(&down_bounce, 0, 5), Some(SlTrend::Bear));
+        // A clear rise stays bullish.
+        let rise = line_of(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(straight_line_trend(&rise, 0, 5), Some(SlTrend::Bull));
+        // Flat line -> flat (upstream keeps the previous side).
+        let flat = line_of(&[3.0, 3.0, 3.0, 3.0, 3.0]);
+        assert_eq!(straight_line_trend(&flat, 0, 5), Some(SlTrend::Flat));
+        // Not enough history -> unresolved.
+        assert_eq!(straight_line_trend(&line_of(&[1.0]), 0, 5), None);
+        assert_eq!(straight_line_trend(&line_of(&[1.0, 2.0]), 0, 5), None);
     }
 
     #[test]

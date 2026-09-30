@@ -23,6 +23,17 @@ use algo_core::Candle;
 
 mod optionchain;
 
+/// Compute one registry indicator and apply the shared straight-line colour
+/// rule: every straight-line indicator draws green while the line rises
+/// (bullish) and red while it falls (bearish). Non-straight-line ids are
+/// untouched by `color_straight_line`.
+fn compute_indicator(entry: &IndicatorEntry, candles: &[Candle], settings: &Settings) -> Vec<SeriesOut> {
+    let mut series = (entry.compute)(candles, settings);
+    algo_core::indicators::color_straight_line(&entry.def.id, &mut series, settings);
+    series
+}
+
+
 // ---------------------------------------------------------------------------
 // DOM helpers
 // ---------------------------------------------------------------------------
@@ -391,7 +402,7 @@ impl App {
     fn add(&mut self, id: &str) {
         if let Some(entry) = registry().into_iter().find(|x| x.def.id == id) {
             let settings = App::defaults_for(&entry.def);
-            let series = (entry.compute)(&self.candles, &settings);
+            let series = compute_indicator(&entry, &self.candles, &settings);
             let markers = entry
                 .markers
                 .map(|f| f(&self.candles, &settings))
@@ -424,7 +435,7 @@ impl App {
             for (k, v) in overrides {
                 settings.insert((*k).to_string(), v.clone());
             }
-            let series = (entry.compute)(&self.candles, &settings);
+            let series = compute_indicator(&entry, &self.candles, &settings);
             let markers = entry
                 .markers
                 .map(|f| f(&self.candles, &settings))
@@ -455,7 +466,7 @@ impl App {
                 continue;
             }
             if let Some(entry) = registry().into_iter().find(|x| x.def.id == inst.id) {
-                inst.series = (entry.compute)(&self.candles, &inst.settings);
+                inst.series = compute_indicator(&entry, &self.candles, &inst.settings);
                 inst.markers = entry
                     .markers
                     .map(|f| f(&self.candles, &inst.settings))
@@ -468,7 +479,7 @@ impl App {
     fn recompute_all(&mut self) {
         for inst in self.insts.iter_mut() {
             if let Some(entry) = registry().into_iter().find(|x| x.def.id == inst.id) {
-                inst.series = (entry.compute)(&self.candles, &inst.settings);
+                inst.series = compute_indicator(&entry, &self.candles, &inst.settings);
                 inst.markers = entry
                     .markers
                     .map(|f| f(&self.candles, &inst.settings))

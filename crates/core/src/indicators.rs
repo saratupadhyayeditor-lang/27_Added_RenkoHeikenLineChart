@@ -1364,6 +1364,71 @@ fn color_points_by_dir(cc: &[Candle], data: &mut [Point], dir: &[i32], up: &str,
     }
 }
 
+/// Indicator ids drawn as straight lines. Every one of these is repainted by
+/// [`color_straight_line`] so the line is green while it rises (bullish) and red
+/// while it falls (bearish), matching the direction the filters read.
+pub fn is_straight_line(id: &str) -> bool {
+    matches!(
+        id,
+        "pastruct"
+            | "wavefib"
+            | "autotrend"
+            | "zzline"
+            | "trendmaster"
+            | "panemaster"
+            | "projline"
+            | "srema"
+            | "supplydemand"
+            | "slconsensus"
+            | "supline"
+            | "resline"
+            | "pitchfork"
+            | "fibfan"
+            | "gannfan"
+            | "vlcore"
+    )
+}
+
+/// Repaint a straight-line series from its OWN slope: each point is green when it
+/// sits above the previous point (the drawn line is rising / bullish) and red
+/// when it sits below it (falling / bearish). Flat or unresolved stretches keep
+/// whatever neutral colour the indicator already chose.
+fn color_line_by_slope(data: &mut [Point], up: &str, dn: &str) {
+    let n = data.len();
+    if n < 2 {
+        return;
+    }
+    for i in 0..n {
+        let (a, b) = if i == 0 {
+            (data[0].value, data[1].value)
+        } else {
+            (data[i - 1].value, data[i].value)
+        };
+        if !a.is_finite() || !b.is_finite() {
+            continue;
+        }
+        if b > a {
+            data[i].color = Some(up.to_string());
+        } else if b < a {
+            data[i].color = Some(dn.to_string());
+        }
+    }
+}
+
+/// Single entry point that enforces consistent straight-line colouring for every
+/// straight-line indicator: bullish (rising) line = green, bearish (falling)
+/// line = red. Does nothing for any other indicator id.
+pub fn color_straight_line(id: &str, outs: &mut [SeriesOut], settings: &Settings) {
+    if !is_straight_line(id) {
+        return;
+    }
+    let up = strv(settings, "upColor", "#26a69a");
+    let dn = strv(settings, "downColor", "#ef5350");
+    for s in outs.iter_mut() {
+        color_line_by_slope(&mut s.data, &up, &dn);
+    }
+}
+
 fn compute_pastruct(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
     let up = strv(o, "upColor", "#26a69a");
     let dn = strv(o, "downColor", "#ef5350");
@@ -4387,6 +4452,55 @@ mod tests {
             s.insert(st.key.clone(), st.def.clone());
         }
         s
+    }
+
+    #[test]
+    fn straight_line_colour_follows_its_own_slope() {
+        // Rising then falling then flat: points must be green while the line
+        // climbs (bullish) and red while it drops (bearish); a flat step keeps
+        // whatever neutral colour was there (None here).
+        let mut data: Vec<Point> = [1.0, 2.0, 3.0, 2.0, 1.0, 1.0]
+            .iter()
+            .enumerate()
+            .map(|(i, v)| Point { time: i as i64, value: *v, color: None })
+            .collect();
+        color_line_by_slope(&mut data, "#26a69a", "#ef5350");
+        let c: Vec<Option<String>> = data.iter().map(|p| p.color.clone()).collect();
+        assert_eq!(c[0].as_deref(), Some("#26a69a"));
+        assert_eq!(c[1].as_deref(), Some("#26a69a"));
+        assert_eq!(c[2].as_deref(), Some("#26a69a"));
+        assert_eq!(c[3].as_deref(), Some("#ef5350"));
+        assert_eq!(c[4].as_deref(), Some("#ef5350"));
+        assert_eq!(c[5], None);
+    }
+
+    #[test]
+    fn straight_line_indicators_get_direction_colours() {
+        // The shared rule must paint at least some green (rising) and some red
+        // (falling) across the straight-line family, and must not touch a
+        // non-straight-line indicator.
+        let candles = synth(360);
+        let mut green = 0;
+        let mut red = 0;
+        for e in registry() {
+            if !is_straight_line(&e.def.id) {
+                continue;
+            }
+            let mut out = (e.compute)(&candles, &defaults(&e));
+            color_straight_line(&e.def.id, &mut out, &defaults(&e));
+            green += out.iter().flat_map(|s| &s.data).filter(|p| p.color.as_deref() == Some("#26a69a")).count();
+            red += out.iter().flat_map(|s| &s.data).filter(|p| p.color.as_deref() == Some("#ef5350")).count();
+        }
+        assert!(green > 0, "expected rising straight-line legs to be green");
+        assert!(red > 0, "expected falling straight-line legs to be red");
+
+        // A momentum pane is not a straight line, so its colours are untouched.
+        let rsi = registry().into_iter().find(|e| e.def.id == "rsi").unwrap();
+        let mut out = (rsi.compute)(&candles, &defaults(&rsi));
+        let before: Vec<Option<String>> = out.iter().flat_map(|s| s.data.iter().map(|p| p.color.clone())).collect();
+        color_straight_line("rsi", &mut out, &defaults(&rsi));
+        let after: Vec<Option<String>> = out.iter().flat_map(|s| s.data.iter().map(|p| p.color.clone())).collect();
+        assert_eq!(before, after, "non-straight-line indicator must be left alone");
     }
 
     #[test]

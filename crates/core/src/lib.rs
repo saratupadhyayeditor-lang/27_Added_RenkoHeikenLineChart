@@ -11,7 +11,13 @@ pub use model::*;
 /// Compute one indicator by id for the given candles and settings.
 pub fn compute(id: &str, candles: &[Candle], settings: &Settings) -> Vec<SeriesOut> {
     match indicators::find(id) {
-        Some(entry) => (entry.compute)(candles, settings),
+        Some(entry) => {
+            let mut outs = (entry.compute)(candles, settings);
+            // Straight-line indicators share one colour rule everywhere: the line
+            // is green while it rises (bullish) and red while it falls (bearish).
+            indicators::color_straight_line(id, &mut outs, settings);
+            outs
+        }
         None => Vec::new(),
     }
 }
