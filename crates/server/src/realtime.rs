@@ -202,13 +202,15 @@ impl Default for ManualStrike {
     }
 }
 
-/// Operator-assigned option leg for one Top Movers index (`movers_index_legs`).
-/// An index only trades the side the operator explicitly picked - a bullish
-/// view runs CE, a bearish view PE - and an index with no entry is skipped
-/// entirely, because index trading requires the operator's own trend call
-/// rather than an automatic guess. The assigned leg is authoritative: it wins
-/// over the NIFTY straight-line lock, the "Run Strategy In" override and the
-/// Top Movers auto bias for that index only.
+/// Operator-assigned option leg for a scanner underlying - one Top Movers index
+/// (`movers_index_legs`) or one commodity (`commodity_legs`). The underlying
+/// only trades the side the operator explicitly picked - a bullish view runs CE,
+/// a bearish view PE - and an index with no entry is skipped entirely (a
+/// commodity with no entry keeps the old global-side behaviour). The assigned
+/// leg is authoritative: it wins over the NIFTY straight-line lock, the "Run
+/// Strategy In" override and the Top Movers auto bias for that instrument only,
+/// and it selects which indicator-filter side applies (CE = bullish filters,
+/// PE = bearish filters).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct MoversIndexLeg {
@@ -380,6 +382,14 @@ pub struct Settings {
     // --- Commodities ---
     pub commodity_on: bool,
     pub commodity_list: Vec<i64>,
+    /// Operator-assigned CE/PE leg per commodity, exactly like
+    /// `movers_index_legs` for indices: the chosen leg is the only leg the
+    /// commodity trades and it drives which indicator filters apply (CE trades
+    /// the bullish filter set, PE the bearish one). A commodity in
+    /// `commodity_list` with no entry here follows the global scanner side as
+    /// before. Only commodities that actually list options (OPTFUT) can trade a
+    /// CE/PE leg.
+    pub commodity_legs: Vec<MoversIndexLeg>,
     /// Underlying security ids the operator removed from the scanner picks
     /// (Top Movers gainers/losers). An excluded id never enters the
     /// scanner universe, so it is not ranked, not resolved to an option leg and
@@ -605,6 +615,7 @@ impl Default for Settings {
             nifty_trend_color: false,
             commodity_on: false,
             commodity_list: Vec::new(),
+            commodity_legs: Vec::new(),
             scanner_exclude: Vec::new(),
             filter_mode: false,
             all_in_one: false,
@@ -2312,18 +2323,13 @@ impl RealtimeState {
     // -----------------------------------------------------------------------
 
     /// Auto option side from movers dominance.
-    /// Returns `None` when the scanner has not decided a direction, so the
-    /// caller falls back to the strategy's own bullish/bearish side.
+    /// The NIFTY straight-line direction is deliberately NOT part of this global
+    /// source: NIFTY Trend Following applies only to F&O stocks, so it is applied
+    /// per strategy via [`Self::nifty_locked_side`] instead of leaking onto index
+    /// and commodity strategies. Returns `None` when the scanner has not decided a
+    /// direction, so the caller falls back to the strategy's own bullish/bearish
+    /// side.
     fn auto_option_side(&self, settings: &Settings) -> Option<&'static str> {
-        if settings.nifty_trend_on {
-            let d = self.nifty_dir.load(Ordering::Relaxed);
-            if d > 0 {
-                return Some("CE");
-            }
-            if d < 0 {
-                return Some("PE");
-            }
-        }
         if settings.movers_on {
             let b = self.mover_bias.load(Ordering::Relaxed);
             if b > 0 {
@@ -2336,15 +2342,13 @@ impl RealtimeState {
         None
     }
 
-    /// Strict NIFTY straight-line direction lock. While NIFTY Trend Following is
-    /// on and the straight lines have committed a net direction, ONLY that side
-    /// may trade: a bullish NIFTY can never open a PE trade and a bearish NIFTY
-    /// can never open a CE trade. `None` when the feature is off or the lines are
-    /// tied (no committed direction), so callers keep their normal resolution.
-    fn nifty_locked_side(&self, settings: &Settings) -> Option<&'static str> {
-        // Per-strategy side routing owns the direction: the strategy's own
-        // stock/filter side decides the leg, so the NIFTY lock must not flip it.
-        if per_strategy_side(settings) || !settings.nifty_trend_on {
+    /// NIFTY straight-line direction, scoped to F&O-stock strategies only. The
+    /// NIFTY Trend Following feature must never influence index or commodity
+    /// strategies, so this returns `None` unless the strategy's category is F&O.
+    /// `None` too when the feature is off or the lines are tied (no committed
+    /// direction).
+    fn nifty_side_for(&self, strat: &Strategy, settings: &Settings) -> Option<&'static str> {
+        if !settings.nifty_trend_on || strat_category(strat) != StratCat::Fno {
             return None;
         }
         match self.nifty_dir.load(Ordering::Relaxed) {
@@ -2352,6 +2356,22 @@ impl RealtimeState {
             d if d < 0 => Some("PE"),
             _ => None,
         }
+    }
+
+    /// Strict NIFTY straight-line direction lock, applied to F&O stocks only.
+    /// While NIFTY Trend Following is on and the straight lines have committed a
+    /// net direction, ONLY that side may trade for F&O strategies: a bullish NIFTY
+    /// can never open a PE trade and a bearish NIFTY can never open a CE trade.
+    /// Indices and commodities are never locked. `None` when the feature is off,
+    /// the strategy is not an F&O stock, or the lines are tied (no committed
+    /// direction), so callers keep their normal resolution.
+    fn nifty_locked_side(&self, strat: &Strategy, settings: &Settings) -> Option<&'static str> {
+        // Per-strategy side routing owns the direction: the strategy's own
+        // stock/filter side decides the leg, so the NIFTY lock must not flip it.
+        if per_strategy_side(settings) {
+            return None;
+        }
+        self.nifty_side_for(strat, settings)
     }
 
     /// "Run Strategy In" override side (old AST `effectiveRunInSide`): the manual
@@ -2416,6 +2436,9 @@ impl RealtimeState {
     /// direction, else the strategy's own bullish/bearish side.
     fn desired_option_side(&self, settings: &Settings, strat: &Strategy) -> String {
         if let Some(side) = routed_option_side(settings, strat) {
+            return side.to_string();
+        }
+        if let Some(side) = self.nifty_locked_side(strat, settings) {
             return side.to_string();
         }
         if let Some(side) = self.effective_run_in_side(settings) {
@@ -2968,6 +2991,11 @@ impl RealtimeState {
                 let sid = ji(r, "securityId");
                 let spot = jf(r, "last");
                 let Some((name, seg, inst)) = crate::market::symbol_meta(sid) else { continue };
+                // NIFTY Trend Following applies to F&O stocks only: an index or
+                // commodity underlying in the Top Movers lists is never picked.
+                if category_for(&seg, &inst) != StratCat::Fno {
+                    continue;
+                }
                 if let Some(leg) = self.pick_leg(&settings, sid, &name, &seg, &inst, spot, side) {
                     legs.push(json!({
                         "securityId": leg.security_id,
@@ -3056,7 +3084,10 @@ impl RealtimeState {
             } else {
                 settings.bear_template.clone()
             };
-        } else if settings.movers_on && !settings.manual_strikes_enabled {
+        } else if assigned_leg(settings, strat).is_none()
+            && settings.movers_on
+            && !settings.manual_strikes_enabled
+        {
             let b = self.mover_bias.load(Ordering::Relaxed);
             if b > 0 {
                 name = settings.mover_bull_template.clone();
@@ -3345,7 +3376,16 @@ impl RealtimeState {
                     .collect()
             };
             for c in rows {
-                add(&mut out, &mut seen, c.security_id, None, allow_bull, allow_bear);
+                // Operator-assigned leg (CE/PE) is authoritative: only that leg
+                // runs and it bypasses the global side gate, so the ticked
+                // indicator filters for that side (CE = bullish, PE = bearish)
+                // are the whole entry rule. A commodity with no assignment keeps
+                // the old global-side behaviour.
+                if let Some(bull) = commodity_target_side(settings, c.security_id) {
+                    add(&mut out, &mut seen, c.security_id, Some(bull), true, true);
+                } else {
+                    add(&mut out, &mut seen, c.security_id, None, allow_bull, allow_bear);
+                }
             }
         }
 
@@ -3371,12 +3411,18 @@ impl RealtimeState {
 
         // NIFTY trend: Top Gainers (CE) gated by the bullish straight-line
         // filters, Top Losers (PE) by the bearish ones. Both sides run together
-        // when both lists are assigned.
+        // when both lists are assigned. Only F&O-stock underlyings ever run - an
+        // index or commodity pick is dropped here (NIFTY Trend Following applies
+        // to F&O stocks only).
         if settings.nifty_trend_on {
             let payload = self.nifty_picks.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
             for p in jarr(&payload, "picks") {
                 let sid = ji(&p, "underlyingSecurityId");
                 if sid <= 0 {
+                    continue;
+                }
+                let Some((_, seg, inst)) = crate::market::symbol_meta(sid) else { continue };
+                if category_for(&seg, &inst) != StratCat::Fno {
                     continue;
                 }
                 if js(&p, "side").eq_ignore_ascii_case("CE") {
@@ -3500,7 +3546,7 @@ impl RealtimeState {
             // is skipped outright, independent of the "Overall Bullish/Bearish"
             // toggle and of any Run-in override - so a bullish NIFTY can never
             // open a PE trade (and vice versa).
-            if let Some(locked) = self.nifty_locked_side(&settings) {
+            if let Some(locked) = self.nifty_locked_side(&strat, &settings) {
                 if strategy_is_bull(&strat) != (locked == "CE") {
                     continue;
                 }
@@ -3552,7 +3598,9 @@ impl RealtimeState {
             let offset = 0usize;
             // Overall Bullish/Bearish idea: when on, only the overall direction's
             // side is traded (NIFTY trend / top-movers decide the overall side).
-            if settings.overall_dir {
+            // An operator-assigned index/commodity leg is authoritative, so it is
+            // never overridden by the overall direction.
+            if settings.overall_dir && assigned_leg(&settings, &strat).is_none() {
                 if let Some(side) = self.active_side(&settings) {
                     let want_bull = side == "CE";
                     if strategy_is_bull(&strat) != want_bull {
@@ -4719,7 +4767,7 @@ impl RealtimeState {
         if let Some(side) = routed_option_side(settings, strat) {
             return side;
         }
-        if let Some(side) = self.nifty_locked_side(settings) {
+        if let Some(side) = self.nifty_locked_side(strat, settings) {
             return side;
         }
         if let Some(side) = self.effective_run_in_side(settings) {
@@ -4867,9 +4915,18 @@ impl RealtimeState {
         let mut out = strat.clone();
         out.security_id = res.security_id;
         out.exchange_segment = seg.to_string();
-        // Dhan needs OPTIDX for index options and OPTSTK for stock options; the
-        // wrong type returns an empty payload (or one junk bar) from /charts.
-        out.instrument = if scrip::is_index_prefix(&prefix) { "OPTIDX" } else { "OPTSTK" }.to_string();
+        // Dhan needs OPTIDX for index options, OPTSTK for stock options and
+        // OPTFUT for MCX commodity options; the wrong type makes `/charts`
+        // answer an empty payload (or one junk bar), so a commodity CE/PE leg
+        // would never resolve.
+        out.instrument = if scrip::is_index_prefix(&prefix) {
+            "OPTIDX"
+        } else if exch.eq_ignore_ascii_case("MCX") {
+            "OPTFUT"
+        } else {
+            "OPTSTK"
+        }
+        .to_string();
         out.trading_symbol = res.trading_symbol;
         Some(out)
     }
@@ -7879,14 +7936,13 @@ fn per_strategy_side(settings: &Settings) -> bool {
 /// bearish ones PE. `None` when neither feature is on, so callers keep their
 /// normal multi-source resolution.
 fn routed_option_side(settings: &Settings, strat: &Strategy) -> Option<&'static str> {
-    // Operator index leg (Top Movers "Indices"): an explicitly assigned CE/PE is
-    // authoritative and wins over every other direction source - the NIFTY
-    // straight-line lock, the "Run Strategy In" override and the auto scanner
-    // bias - for that index only.
-    if is_index_strategy(strat) {
-        if let Some(side) = movers_index_leg(settings, strat.security_id) {
-            return Some(side);
-        }
+    // Operator-assigned leg (Top Movers "Indices" / "Commodities"): an explicitly
+    // assigned CE/PE is authoritative and wins over every other direction source -
+    // the NIFTY straight-line lock, the "Run Strategy In" override and the auto
+    // scanner bias - for that instrument only. It also fixes the indicator-filter
+    // side (CE = bullish filters, PE = bearish filters).
+    if let Some(side) = assigned_leg(settings, strat) {
+        return Some(side);
     }
     if per_strategy_side(settings) {
         Some(if strategy_is_bull(strat) { "CE" } else { "PE" })
@@ -7895,21 +7951,10 @@ fn routed_option_side(settings: &Settings, strat: &Strategy) -> Option<&'static 
     }
 }
 
-/// True when `strat` is a cash-index strategy. The Top Movers "Indices" picks
-/// are built from `crate::market::symbol_meta` with `IDX_I` / `INDEX`.
-fn is_index_strategy(strat: &Strategy) -> bool {
-    strat.exchange_segment.eq_ignore_ascii_case("IDX_I")
-        || strat.instrument.eq_ignore_ascii_case("INDEX")
-}
-
-/// The CE/PE leg the operator explicitly assigned to a Top Movers index
-/// (`movers_index_legs`). `None` when the index has no valid assignment, in
-/// which case it is skipped - index trading needs the operator's own trend
-/// call, never an automatic side.
-fn movers_index_leg(settings: &Settings, sid: i64) -> Option<&'static str> {
-    settings
-        .movers_index_legs
-        .iter()
+/// Parse the CE/PE leg out of one leg-assignment list (`movers_index_legs` /
+/// `commodity_legs`). `None` when `sid` has no valid assignment.
+fn leg_pick(list: &[MoversIndexLeg], sid: i64) -> Option<&'static str> {
+    list.iter()
         .find(|l| l.security_id == sid)
         .and_then(|l| match l.side.trim().to_uppercase().as_str() {
             "CE" => Some("CE"),
@@ -7918,11 +7963,45 @@ fn movers_index_leg(settings: &Settings, sid: i64) -> Option<&'static str> {
         })
 }
 
+/// The CE/PE leg the operator explicitly assigned to a Top Movers index
+/// (`movers_index_legs`). `None` when the index has no valid assignment, in
+/// which case it is skipped - index trading needs the operator's own trend
+/// call, never an automatic side.
+fn movers_index_leg(settings: &Settings, sid: i64) -> Option<&'static str> {
+    leg_pick(&settings.movers_index_legs, sid)
+}
+
+/// The CE/PE leg the operator explicitly assigned to a commodity
+/// (`commodity_legs`). `None` when the commodity has no valid assignment, in
+/// which case it keeps the global scanner side.
+fn commodity_leg(settings: &Settings, sid: i64) -> Option<&'static str> {
+    leg_pick(&settings.commodity_legs, sid)
+}
+
+/// The operator-assigned CE/PE leg for a scanner index or commodity strategy,
+/// whichever it is. `None` for F&O strategies and for any instrument with no
+/// assignment. The assigned leg is authoritative for that instrument: it fixes
+/// the executed contract AND selects which indicator filters apply.
+fn assigned_leg(settings: &Settings, strat: &Strategy) -> Option<&'static str> {
+    match strat_category(strat) {
+        StratCat::Index => movers_index_leg(settings, strat.security_id),
+        StratCat::Comm => commodity_leg(settings, strat.security_id),
+        StratCat::Fno => None,
+    }
+}
+
 /// Bullish/bearish side an operator index contributes to the scanner universe:
 /// `Some(true)` = CE, `Some(false)` = PE, `None` = nothing (no leg assigned, so
 /// the index is skipped).
 fn index_target_side(settings: &Settings, sid: i64) -> Option<bool> {
     movers_index_leg(settings, sid).map(|s| s == "CE")
+}
+
+/// Bullish/bearish side an operator commodity contributes to the scanner
+/// universe when it has an assigned leg: `Some(true)` = CE, `Some(false)` = PE,
+/// `None` = no assignment (the commodity then follows the global side).
+fn commodity_target_side(settings: &Settings, sid: i64) -> Option<bool> {
+    commodity_leg(settings, sid).map(|s| s == "CE")
 }
 
 fn filter_is_bull(k: &str) -> bool {
@@ -8210,9 +8289,9 @@ enum StratCat {
     Comm,
 }
 
-fn strat_category(strat: &Strategy) -> StratCat {
-    let seg = strat.exchange_segment.to_uppercase();
-    let inst = strat.instrument.to_uppercase();
+fn category_for(seg: &str, inst: &str) -> StratCat {
+    let seg = seg.to_uppercase();
+    let inst = inst.to_uppercase();
     if inst == "INDEX" || inst == "OPTIDX" || seg == "IDX_I" {
         StratCat::Index
     } else if seg.contains("COMM") || seg.contains("NCD") || inst == "FUTCOM" || inst == "OPTFUT" {
@@ -8220,6 +8299,10 @@ fn strat_category(strat: &Strategy) -> StratCat {
     } else {
         StratCat::Fno
     }
+}
+
+fn strat_category(strat: &Strategy) -> StratCat {
+    category_for(&strat.exchange_segment, &strat.instrument)
 }
 
 /// True when the strategy already points at a resolved option contract
@@ -11177,6 +11260,67 @@ mod gate_tests {
         assert_eq!(movers_index_leg(&s, 13), None, "invalid side is treated as no assignment");
     }
 
+    #[test]
+    fn commodity_leg_settings_round_trip_uses_camel_case() {
+        let mut s = Settings::default();
+        assert!(s.commodity_legs.is_empty());
+        s.commodity_legs.push(MoversIndexLeg { security_id: 428348, side: "PE".into() });
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["commodityLegs"][0]["securityId"], serde_json::json!(428348));
+        assert_eq!(v["commodityLegs"][0]["side"], serde_json::json!("PE"));
+        let back: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(back.commodity_legs.len(), 1);
+        assert_eq!(back.commodity_legs[0].security_id, 428348);
+        assert_eq!(back.commodity_legs[0].side, "PE");
+    }
+
+    #[test]
+    fn assigned_commodity_leg_is_authoritative_and_drives_the_filter_side() {
+        let mut s = Settings::default();
+        // No assignment: no forced side, global resolution applies.
+        assert_eq!(commodity_leg(&s, 428348), None);
+        assert_eq!(commodity_target_side(&s, 428348), None);
+
+        // Assign CE: only CE runs. The side the scanner builds the synthetic on
+        // (Some(true)) is what makes the BULLISH indicator filters the entry rule.
+        s.commodity_legs.push(MoversIndexLeg { security_id: 428348, side: "CE".into() });
+        assert_eq!(commodity_leg(&s, 428348), Some("CE"));
+        assert_eq!(commodity_target_side(&s, 428348), Some(true));
+
+        // The assigned leg wins over the NIFTY lock / run-in / option-type /
+        // filter-side routing for that commodity, even armed for the opposite side.
+        s.nifty_trend_on = true;
+        s.run_in_enabled = true;
+        s.run_in_side = "PE".into();
+        s.option_side = "PE".into();
+        s.filter_side_route = true;
+        let comm = Strategy {
+            exchange_segment: "MCX_COMM".into(),
+            instrument: "FUTCOM".into(),
+            security_id: 428348,
+            category: "BEARISH".into(),
+            ..Default::default()
+        };
+        assert_eq!(routed_option_side(&s, &comm), Some("CE"), "assigned CE leg wins over every other source");
+
+        // A non-commodity strategy with the same security id is unaffected by the
+        // commodity leg list.
+        let stock = Strategy {
+            exchange_segment: "NSE_EQ".into(),
+            instrument: "EQUITY".into(),
+            security_id: 428348,
+            category: "BEARISH".into(),
+            ..Default::default()
+        };
+        assert_eq!(routed_option_side(&s, &stock), Some("PE"), "filter-side routing still applies to stocks");
+
+        // Assign PE: flips to the PE leg; an invalid side value is ignored.
+        s.commodity_legs[0] = MoversIndexLeg { security_id: 428348, side: "PE".into() };
+        assert_eq!(commodity_target_side(&s, 428348), Some(false));
+        s.commodity_legs[0] = MoversIndexLeg { security_id: 428348, side: "nonsense".into() };
+        assert_eq!(commodity_leg(&s, 428348), None, "invalid side is treated as no assignment");
+    }
+
     const UI_BULL: &[&str] = &[
         "IncUp", "GapUp", "IncUpAll", "CrossUp", "GtUp", "LtUp", "PaneCrossUp", "PaneIncUpAll",
         "BullBbwInc", "BullSmf", "BullAsr", "BullOit", "BullBbCrossAbove", "BullPcCrossAbove",
@@ -11460,6 +11604,47 @@ mod gate_tests {
         assert_eq!(strat_category(&idx_opt), StratCat::Index);
         let comm_opt = Strategy { exchange_segment: "MCX_COMM".into(), instrument: "OPTFUT".into(), ..Default::default() };
         assert_eq!(strat_category(&comm_opt), StratCat::Comm);
+    }
+
+    #[tokio::test]
+    async fn nifty_trend_applies_to_fno_stocks_only() {
+        // NIFTY Trend Following must never lock an index or a commodity
+        // strategy onto its direction - only F&O stocks follow the straight
+        // lines. This is the regression guard for that scoping.
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        let mut s = Settings::default();
+        s.nifty_trend_on = true;
+
+        let fno = Strategy { exchange_segment: "NSE_EQ".into(), instrument: "EQUITY".into(), ..Default::default() };
+        let idx = Strategy { exchange_segment: "IDX_I".into(), instrument: "INDEX".into(), ..Default::default() };
+        let comm = Strategy { exchange_segment: "MCX_COMM".into(), instrument: "FUTCOM".into(), ..Default::default() };
+        let idx_opt = Strategy { exchange_segment: "NSE_FNO".into(), instrument: "OPTIDX".into(), ..Default::default() };
+        let comm_opt = Strategy { exchange_segment: "MCX_COMM".into(), instrument: "OPTFUT".into(), ..Default::default() };
+
+        // Bullish NIFTY: only the F&O stock locks to CE.
+        rt.nifty_dir.store(1, Ordering::Relaxed);
+        assert_eq!(rt.nifty_locked_side(&fno, &s), Some("CE"));
+        assert_eq!(
+            rt.auto_option_side(&s),
+            None,
+            "the NIFTY direction is not a global auto side, so it cannot leak onto other universes"
+        );
+        assert_eq!(rt.nifty_locked_side(&idx, &s), None, "indices are never locked");
+        assert_eq!(rt.nifty_locked_side(&comm, &s), None, "commodities are never locked");
+        assert_eq!(rt.nifty_locked_side(&idx_opt, &s), None, "index options are never locked");
+        assert_eq!(rt.nifty_locked_side(&comm_opt, &s), None, "commodity options are never locked");
+
+        // Bearish NIFTY: the F&O stock flips to PE; the rest stay untouched.
+        rt.nifty_dir.store(-1, Ordering::Relaxed);
+        assert_eq!(rt.nifty_locked_side(&fno, &s), Some("PE"));
+        assert_eq!(rt.nifty_locked_side(&idx, &s), None);
+        assert_eq!(rt.nifty_locked_side(&comm, &s), None);
+
+        // Feature off: no lock even for an F&O stock.
+        s.nifty_trend_on = false;
+        assert_eq!(rt.nifty_locked_side(&fno, &s), None);
     }
 
     #[test]
