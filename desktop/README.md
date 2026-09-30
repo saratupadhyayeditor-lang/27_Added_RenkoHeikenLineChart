@@ -151,9 +151,9 @@ scripts/build-desktop.sh
 # dist/algo-desktop-<os>-<arch>.zip + dist/SHA256SUMS ko GitHub Release me upload karo
 ```
 
-Automatic option: `.github/workflows/release.yml` tag push (`vX.Y.Z`) par teenon
-platform ke assets build karke release me upload kar deta hai, ya Actions se
-manually chalao (tag input ke saath).
+Automatic option: `.github/release-workflow.yml` (workflows/ me move karke enable
+karo) tag push (`vX.Y.Z`) par teenon platform ke assets build karke release me
+upload kar deta hai, ya Actions se manually chalao (tag input ke saath).
 
 Repo private ho to: manual update ke waqt repo ko thodi der public karo,
 button dabao, phir wapas private. Automatic update nahi chahiye. Behtar option:

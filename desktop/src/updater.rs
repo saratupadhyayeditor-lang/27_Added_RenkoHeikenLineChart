@@ -19,7 +19,7 @@ const API: &str = "https://api.github.com";
 
 /// Distribution repo the updater uses until the operator saves another one.
 /// GitHub Releases on this repo must publish `algo-desktop-<os>-<arch>.zip`
-/// assets (+ `SHA256SUMS`) - see `.github/workflows/release.yml`.
+/// assets (+ `SHA256SUMS`) - see `.github/release-workflow.yml`.
 pub const DEFAULT_REPO: &str =
     "saratupadhyayeditor-lang/24_Fixed_StraightLineIndicatersColorChange";
 
