@@ -12,6 +12,7 @@ import { istTime, istDateTime } from "./ist.js?v=1";
 let booted = false;
 const UI = { range: "all", mode: "", scope: "all" };
 let LAST = null;
+let lastRenderSig = "";
 const CHARTS = {};
 
 function el(id) {
@@ -445,13 +446,31 @@ function shell() {
   `;
 }
 
+// Cheap identity of a report payload: when the 3s poll returns the same period
+// and the same trades, the full set of tables/charts is already on screen and
+// rebuilding every table's innerHTML is pure waste (the old behaviour froze the
+// pane on a large ledger). Changes when the range/mode/scope, the stats totals,
+// or the newest/oldest trade move.
+function reportSig(d) {
+  if (!d) return "";
+  const s = d.stats || {};
+  const tr = d.trades || [];
+  const b = tr.length ? n(tr[0].at) : 0;
+  const e = tr.length ? n(tr[tr.length - 1].at) : 0;
+  return [d.engine, d.armed, d.mode, d.scope, d.range, d.rangeLabel, n(s.n), n(s.net), n(s.winRate), tr.length, b, e, n(d.strategyCount), n(d.strategyTotalNet)].join("|");
+}
+
 async function refresh() {
   const q = `range=${encodeURIComponent(UI.range)}&mode=${encodeURIComponent(UI.mode)}&scope=${encodeURIComponent(UI.scope)}`;
   try {
     // Paper report: rewrite to the paper engine (window.__PAPER__ set by host).
     const url = (window.__PAPER__ ? "/api/paper/stats" : "/api/rt/stats") + "?" + q;
     const r = await fetch(url);
-    LAST = await r.json();
+    const next = await r.json();
+    LAST = next;
+    const sig = reportSig(next);
+    if (sig === lastRenderSig) return;
+    lastRenderSig = sig;
     render();
   } catch (e) {
     const s = el("rsStatus");

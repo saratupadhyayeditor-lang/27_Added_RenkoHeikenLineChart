@@ -372,6 +372,11 @@ pub struct Settings {
     /// longer flip the read (the old one-point slope did exactly that).
     /// Minimum 3 points; higher = smoother. Clamped to >= 3 by `nifty_slope_len`.
     pub nifty_trend_slope_len: i64,
+    /// NIFTY Trend Following confirmation read mode. When ON, each selected
+    /// indicator's direction is read from the COLOUR the chart draws on the line's
+    /// last closed candle (green = bullish, red = bearish) instead of the windowed
+    /// net move; when OFF the normal `nifty_trend_slope_len` window read is used.
+    pub nifty_trend_color: bool,
     // --- Commodities ---
     pub commodity_on: bool,
     pub commodity_list: Vec<i64>,
@@ -597,6 +602,7 @@ impl Default for Settings {
             nifty_trend_pct: 2.5,
             nifty_trend_conf_inds: Vec::new(),
             nifty_trend_slope_len: 5,
+            nifty_trend_color: false,
             commodity_on: false,
             commodity_list: Vec::new(),
             scanner_exclude: Vec::new(),
@@ -1119,12 +1125,22 @@ fn margin_budget_of(margin_amount: f64, margin_pct: f64, available: f64) -> f64 
     }
 }
 
-/// Paper wallet: starting capital + realized P&L - margin locked by the open
-/// paper positions. Derived (never stored) so it can never drift.
-fn paper_available_of(cap: f64, closed: &[Value], positions: &[Value], charges_on: bool) -> f64 {
+/// Paper wallet balance BEFORE the running trades' margin is committed:
+/// starting capital + realized P&L. The margin budget is sized against this so
+/// the locked margin of open positions is subtracted exactly once (by the entry
+/// gate / margin bar) instead of twice.
+fn paper_wallet_of(cap: f64, closed: &[Value], charges_on: bool) -> f64 {
     let cap = if cap > 0.0 { cap } else { 200_000.0 };
+    (cap + realized_pnl(closed, charges_on)).max(0.0)
+}
+
+/// Paper wallet free cash: balance - margin locked by the open paper positions.
+/// Derived (never stored) so it can never drift. This is the amount shown as the
+/// account's available balance; the margin budget is sized against
+/// [`paper_wallet_of`] instead, so the lock is never counted twice.
+fn paper_available_of(cap: f64, closed: &[Value], positions: &[Value], charges_on: bool) -> f64 {
     let (locked, _) = locked_margin_of(positions);
-    (cap + realized_pnl(closed, charges_on) - locked).max(0.0)
+    (paper_wallet_of(cap, closed, charges_on) - locked).max(0.0)
 }
 
 fn state_path(paper: bool) -> PathBuf {
@@ -1244,6 +1260,10 @@ pub struct RealtimeState {
     nifty_seq: Arc<AtomicI64>,
     /// Throttle for the tick-native NIFTY flip watchdog (millisecond clock).
     last_nifty_flip: Arc<AtomicI64>,
+    /// Throttle for the colour-based NIFTY confirmation scan. When colour mode is
+    /// ON the assigned straight-line indicators' colour is re-read on this fixed
+    /// cadence (see `COLOR_SCAN_MS`) instead of on every tick.
+    last_color_scan: Arc<AtomicI64>,
     /// Order timestamps (ms) in the last second, powering the orders/sec cap.
     order_times: Arc<Mutex<Vec<i64>>>,
     /// Paper-only simulated entry latency: strategy id -> due ms for entries
@@ -1367,6 +1387,7 @@ impl RealtimeState {
             nifty_flip: Arc::new(Mutex::new(Value::Null)),
             nifty_seq: Arc::new(AtomicI64::new(0)),
             last_nifty_flip: Arc::new(AtomicI64::new(0)),
+            last_color_scan: Arc::new(AtomicI64::new(0)),
             order_times: Arc::new(Mutex::new(Vec::new())),
             paper_pending: Arc::new(Mutex::new(HashMap::new())),
             paper_exit_pending: Arc::new(Mutex::new(HashMap::new())),
@@ -1491,6 +1512,24 @@ impl RealtimeState {
         }
     }
 
+    /// Cheap stable hash of the closed ledger + armed flag, seeded by `seed`, so
+    /// the stats endpoint can detect an unchanged ledger and answer from its cache
+    /// WITHOUT cloning the whole (multi-MB) ledger first.
+    pub fn closed_signature(&self, seed: u64) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        seed.hash(&mut h);
+        if let Some(d) = self.doc() {
+            d.armed.hash(&mut h);
+            d.closed.len().hash(&mut h);
+            for c in &d.closed {
+                c.hash(&mut h);
+            }
+        }
+        h.finish()
+    }
+
     fn ltp_of(&self, sec_id: i64, exch: &str) -> f64 {
         if let Some(v) = self.ltp.lock().ok().and_then(|m| m.get(&sec_id).copied()) {
             if v > 0.0 {
@@ -1598,6 +1637,30 @@ impl RealtimeState {
         (self.ltp_of(sec_id, exch), 0.0, 0.0)
     }
 
+    /// `(change, change_pct)` for a security from the shared live-quote cache, with
+    /// a fallback to `ltp - prev_ltp` when the feed only published prices. `(0, 0)`
+    /// when unquoted. Surfaced on the trade lists so the option premium's
+    /// plus/minus sign - the whole point of the "+green premium" pick - is visible
+    /// next to the trade.
+    fn quote_change(&self, sec_id: i64, exch: &str) -> (f64, f64) {
+        let key = crate::market::quote_key(sec_id, exch);
+        if let Ok(q) = self.dhan.market.quotes.lock() {
+            if let Some(v) = q.get(&key) {
+                let f = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let ltp = f("ltp");
+                let prev = f("prev_ltp");
+                let mut chg = f("change");
+                let mut pct = f("change_pct");
+                if chg == 0.0 && prev > 0.0 && ltp > 0.0 {
+                    chg = ltp - prev;
+                    pct = (ltp - prev) / prev * 100.0;
+                }
+                return (round2(chg), round2(pct));
+            }
+        }
+        (0.0, 0.0)
+    }
+
     /// Whether this engine books Dhan broker charges against realized P&L.
     /// Real Dhan trades settle charges broker-side, so only the paper engine
     /// honours the "Deduct Dhan charges" toggle.
@@ -1644,6 +1707,24 @@ impl RealtimeState {
     /// (or unknown funds) means no budget configured, so the margin gate is
     /// disabled; the default `100%` uses the whole wallet.
     fn margin_budget(&self) -> f64 {
+        if self.paper {
+            // Size the paper budget against the wallet BEFORE the running
+            // trades' margin is locked, so `locked` is only ever subtracted
+            // once (in the entry gate / margin bar). Using the post-lock
+            // available here shrank the budget with every open trade and made
+            // the bar report 0 available while capital was still free.
+            let (amount, pct, wallet) = self
+                .doc()
+                .map(|d| {
+                    (
+                        d.settings.margin_amount,
+                        d.settings.margin_pct,
+                        paper_wallet_of(d.settings.paper_capital, &d.closed, d.settings.broker_charges),
+                    )
+                })
+                .unwrap_or((0.0, 100.0, 200_000.0));
+            return margin_budget_of(amount, pct, wallet);
+        }
         let (amount, pct) = self
             .doc()
             .map(|d| (d.settings.margin_amount, d.settings.margin_pct))
@@ -1677,6 +1758,16 @@ impl RealtimeState {
             }
             m.insert(strategy_id.to_string(), val);
         }
+    }
+
+    /// Release the fresh-signal edge for a queued entry that resolved without
+    /// actually filling (margin block, rejection, engine stopped/disarmed). In
+    /// "fresh signal" mode the edge is consumed at queue time, so a fill that
+    /// never lands must hand it back; otherwise the strategy latches silent and
+    /// stops trading until the gate happens to reset and print a brand-new
+    /// signal.
+    fn release_fresh_edge(&self, strategy_id: &str) {
+        self.set_sig_state(strategy_id, false);
     }
 
     /// Trades already taken for a strategy: open positions plus closed trades.
@@ -2433,13 +2524,18 @@ impl RealtimeState {
         }
         if missing.is_empty() {
             if rows.is_empty() {
-                self.log("warn", &format!("scanner quote empty for {} ids (feed cache)", univ.len()));
+                self.log_throttled(
+                    "scanner-quote-empty-cache",
+                    15_000,
+                    "warn",
+                    &format!("scanner quote empty for {} ids (feed cache)", univ.len()),
+                );
             }
             self.seed_ltp_from_rows(&rows);
             return rows;
         }
         let Some(client) = self.dhan.session_client().await else {
-            self.log("warn", "scanner quote: no Dhan session client");
+            self.log_throttled("scanner-quote-nosession", 15_000, "warn", "scanner quote: no Dhan session client");
             return rows;
         };
         for chunk in missing.chunks(100) {
@@ -2469,11 +2565,21 @@ impl RealtimeState {
                         }
                     }
                 }
-                Err(e) => self.log("warn", &format!("scanner quote failed ({} ids): {e}", chunk.len())),
+                Err(e) => self.log_throttled(
+                    "scanner-quote-failed",
+                    15_000,
+                    "warn",
+                    &format!("scanner quote failed ({} ids): {e}", chunk.len()),
+                ),
             }
         }
         if rows.is_empty() {
-            self.log("warn", &format!("scanner quote empty for {} ids", univ.len()));
+            self.log_throttled(
+                "scanner-quote-empty",
+                15_000,
+                "warn",
+                &format!("scanner quote empty for {} ids", univ.len()),
+            );
         }
         // Seed the engine LTP cache from the poll we just paid for, so the entry
         // path reads the underlying's price here instead of making another
@@ -2484,7 +2590,7 @@ impl RealtimeState {
 
     async fn refresh_movers(&self) {
         let now = now_ms();
-        if now - self.last_movers.load(Ordering::Relaxed) < 25000 {
+        if now - self.last_movers.load(Ordering::Relaxed) < 100 {
             return;
         }
         let (enabled, gain_n, lose_n, indices) = self
@@ -2514,6 +2620,10 @@ impl RealtimeState {
         univ.extend(index_legs(&indices));
         univ.sort();
         univ.dedup();
+        // Stream the whole scan universe on the live feed so the Top Movers /
+        // Top Losers re-rank from the websocket cache (fast) instead of a REST
+        // round-trip on every 100ms pass. The first pass still REST-seeds.
+        self.dhan.watch_options_now(&univ);
         let rows: Vec<Value> = self.quote_rows(&univ).await;
         let mut sorted = rows.clone();
         sorted.sort_by(|a, b| jf(b, "changePct").partial_cmp(&jf(a, "changePct")).unwrap_or(std::cmp::Ordering::Equal));
@@ -2636,19 +2746,27 @@ impl RealtimeState {
         if now - self.last_trend.load(Ordering::Relaxed) < 2_500 {
             return;
         }
-        let (enabled, tf, conf, slope) = self
+        let (enabled, tf, conf, slope, color) = self
             .doc()
-            .map(|d| (d.settings.nifty_trend_on, nifty_timeframe(&d.settings), d.settings.nifty_trend_conf_inds.clone(), d.settings.nifty_trend_slope_len))
-            .unwrap_or((false, "5min".into(), Vec::new(), 5));
+            .map(|d| (d.settings.nifty_trend_on, nifty_timeframe(&d.settings), d.settings.nifty_trend_conf_inds.clone(), d.settings.nifty_trend_slope_len, d.settings.nifty_trend_color))
+            .unwrap_or((false, "5min".into(), Vec::new(), 5, false));
         self.last_trend.store(now, Ordering::Relaxed);
         if !enabled {
             self.clear_nifty_direction();
             return;
         }
+        // Colour mode re-reads the assigned indicators on the fixed colour scan
+        // cadence, not on the 2.5s REST refresh.
+        if color {
+            if now - self.last_color_scan.load(Ordering::Relaxed) < COLOR_SCAN_MS {
+                return;
+            }
+            self.last_color_scan.store(now, Ordering::Relaxed);
+        }
         if !self.dhan.is_connected().await {
             return;
         }
-        if let Some((bull, bear, net)) = self.resolve_nifty_direction(&tf, &conf, slope, true).await {
+        if let Some((bull, bear, net)) = self.resolve_nifty_direction(&tf, &conf, slope, color, true).await {
             self.apply_nifty_direction(bull, bear, net, &tf);
         }
     }
@@ -2664,14 +2782,22 @@ impl RealtimeState {
             return;
         }
         self.last_nifty_flip.store(now, Ordering::Relaxed);
-        let (enabled, tf, conf, slope) = self
+        let (enabled, tf, conf, slope, color) = self
             .doc()
-            .map(|d| (d.settings.nifty_trend_on, nifty_timeframe(&d.settings), d.settings.nifty_trend_conf_inds.clone(), d.settings.nifty_trend_slope_len))
-            .unwrap_or((false, "5min".into(), Vec::new(), 5));
+            .map(|d| (d.settings.nifty_trend_on, nifty_timeframe(&d.settings), d.settings.nifty_trend_conf_inds.clone(), d.settings.nifty_trend_slope_len, d.settings.nifty_trend_color))
+            .unwrap_or((false, "5min".into(), Vec::new(), 5, false));
         if !enabled {
             return;
         }
-        if let Some((bull, bear, net)) = self.resolve_nifty_direction(&tf, &conf, slope, false).await {
+        // Colour mode: re-read the assigned indicators' colour every
+        // COLOR_SCAN_MS instead of on every tick.
+        if color {
+            if now - self.last_color_scan.load(Ordering::Relaxed) < COLOR_SCAN_MS {
+                return;
+            }
+            self.last_color_scan.store(now, Ordering::Relaxed);
+        }
+        if let Some((bull, bear, net)) = self.resolve_nifty_direction(&tf, &conf, slope, color, false).await {
             self.apply_nifty_direction(bull, bear, net, &tf);
         }
     }
@@ -2685,11 +2811,12 @@ impl RealtimeState {
         tf: &str,
         conf: &[String],
         slope_len: i64,
+        color: bool,
         allow_rest: bool,
     ) -> Option<(Vec<String>, Vec<String>, i64)> {
         if tf.eq_ignore_ascii_case("both") {
-            let a = self.nifty_assignment_for("1min", conf, slope_len, allow_rest).await;
-            let b = self.nifty_assignment_for("5min", conf, slope_len, allow_rest).await;
+            let a = self.nifty_assignment_for("1min", conf, slope_len, color, allow_rest).await;
+            let b = self.nifty_assignment_for("5min", conf, slope_len, color, allow_rest).await;
             match (a, b) {
                 (Some(xa), Some(xb)) => {
                     if xa.2.signum() == xb.2.signum() {
@@ -2703,7 +2830,7 @@ impl RealtimeState {
                 (None, None) => None,
             }
         } else {
-            self.nifty_assignment_for(tf, conf, slope_len, allow_rest).await
+            self.nifty_assignment_for(tf, conf, slope_len, color, allow_rest).await
         }
     }
 
@@ -2714,6 +2841,7 @@ impl RealtimeState {
         tf: &str,
         conf: &[String],
         slope_len: i64,
+        color: bool,
         allow_rest: bool,
     ) -> Option<(Vec<String>, Vec<String>, i64)> {
         let c = if allow_rest {
@@ -2728,7 +2856,7 @@ impl RealtimeState {
         if c.len() < 35 {
             return None;
         }
-        Some(nifty_indicator_assignment(&c, conf, slope_len))
+        Some(nifty_indicator_assignment(&c, conf, slope_len, color))
     }
 
     /// Publish a resolved direction: store the per-leg filter split, swap the
@@ -2772,6 +2900,9 @@ impl RealtimeState {
 
     fn clear_nifty_direction(&self) {
         self.nifty_dir.store(0, Ordering::Relaxed);
+        // Force the next colour scan to run immediately when the trend (or its
+        // colour mode) is switched back on.
+        self.last_color_scan.store(0, Ordering::Relaxed);
         if let Ok(mut b) = self.nifty_bull_filters.lock() {
             b.clear();
         }
@@ -2789,7 +2920,7 @@ impl RealtimeState {
     /// run, each strictly on its own side.
     async fn refresh_nifty_scan(&self) {
         let now = now_ms();
-        if now - self.last_nifty_scan.load(Ordering::Relaxed) < 25_000 {
+        if now - self.last_nifty_scan.load(Ordering::Relaxed) < 100 {
             return;
         }
         let (enabled, movers_on, settings) = self
@@ -2988,7 +3119,7 @@ impl RealtimeState {
             group: String::new(),
             manual: false,
         };
-        self.resolve_option_strategy(&base, spot, &s2)
+        self.resolve_option_strategy(&base, spot, &s2, true)
     }
 
     /// CE/PE side a scanner pick resolves to from the live NIFTY direction /
@@ -3611,7 +3742,7 @@ impl RealtimeState {
                 }
                 // Resolve the execution contract from the operator's strike
                 // preferences (ATM / ITM / OTM / strike mode).
-                let resolved = self.resolve_option_strategy(&strat, spot, &settings);
+                let resolved = self.resolve_option_strategy(&strat, spot, &settings, false);
                 match resolved {
                     Some(p) => p,
                     None => {
@@ -4683,7 +4814,7 @@ impl RealtimeState {
     /// nearest expiry, ATM/ITM/OTM strike from the scrip master, CE for bullish
     /// (or BUY) and PE for bearish (or SELL). Mirrors the old engine's option
     /// selection. Returns `None` when the scrip master cannot resolve it.
-    fn resolve_option_strategy(&self, strat: &Strategy, spot: f64, settings: &Settings) -> Option<Strategy> {
+    fn resolve_option_strategy(&self, strat: &Strategy, spot: f64, settings: &Settings, provisional: bool) -> Option<Strategy> {
         let sc = scrip::get()?;
         // Manual Strike Select (testing) wins over every automatic preference.
         if let Some(m) = self.resolve_manual_strike(strat, spot, settings) {
@@ -4723,10 +4854,8 @@ impl RealtimeState {
         //     retry the opposite side of ATM in the same leg.
         // When no preference is on, fall back to the nearest ATM strike.
         let strike_idx = if settings.only_positive || settings.fastest_rising {
-            match self.pick_strike_pref(strat, exch, &expiry, &strikes, idx, ot, settings) {
+            match self.pick_strike_pref(strat, exch, &expiry, &strikes, idx, ot, settings, provisional) {
                 Some(i) => i,
-                // No rising strike: skip the entry rather than buy a falling
-                // ("ghatne wali") premium.
                 None => return None,
             }
         } else {
@@ -4938,8 +5067,11 @@ impl RealtimeState {
         idx: usize,
         ot: &str,
         settings: &Settings,
+        provisional: bool,
     ) -> Option<usize> {
-        const WARM_PER_CALL: usize = 8;
+        // Warm the whole candidate walk in one pass so a pick can land on the
+        // very next 100ms scanner tick instead of advancing 8 strikes per pass.
+        const WARM_PER_CALL: usize = 128;
         let fastest = settings.fastest_rising;
         let sc = scrip::get()?;
         let order = Self::green_walk_order(strikes.len(), idx, &settings.strike_mode);
@@ -4969,6 +5101,13 @@ impl RealtimeState {
         if best.is_none() && !warm.is_empty() {
             warm.truncate(WARM_PER_CALL);
             self.dhan.watch_options_now(&warm);
+            // Readout (provisional): never leave the picked-strike list blank
+            // while the +green quotes warm up. Show the nearest resolvable
+            // contract in the chosen direction now; the strict entry path still
+            // returns None until a genuinely rising premium is found.
+            if provisional {
+                return Some(primary[0].0);
+            }
             return None;
         }
         // The ENTIRE selected side is quoted and every strike is minus -> try the
@@ -4992,6 +5131,12 @@ impl RealtimeState {
         if !warm.is_empty() {
             warm.truncate(WARM_PER_CALL);
             self.dhan.watch_options_now(&warm);
+        }
+        // Provisional readout: the selected side is fully quoted but none is
+        // rising (and no opposite-side fallback applied). Show the nearest
+        // contract so the direction's strike is visible; the entry stays gated.
+        if provisional {
+            return Some(primary[0].0);
         }
         None
     }
@@ -5053,7 +5198,7 @@ impl RealtimeState {
         if spot <= 0.0 {
             return None;
         }
-        let res = self.resolve_option_strategy(strat, spot, settings)?;
+        let res = self.resolve_option_strategy(strat, spot, settings, false)?;
         // Publish the resolved premium chart so the Running Strategies view can
         // show which chart this strategy's entry conditions are evaluated on.
         self.record_strat_leg(&strat.id, "run", &res);
@@ -5199,7 +5344,18 @@ impl RealtimeState {
                         );
                     }
                     Err(e) => {
-                        me.log("error", &format!("delayed entry {} failed: {e}", strat.name));
+                        // The fresh-signal edge was consumed when the order was
+                        // queued. If it never fills (margin block / rejection /
+                        // no premium) release the edge so the still-true gate can
+                        // re-trigger, instead of latching silent until the gate
+                        // happens to reset and print a new signal.
+                        me.release_fresh_edge(&strat.id);
+                        me.log_throttled(
+                            &format!("delay-fail:{}", strat.id),
+                            5_000,
+                            "error",
+                            &format!("delayed entry {} failed: {e}", strat.name),
+                        );
                         if let Some(mut d) = me.doc() {
                             if let Some(s) = d.strategies.iter_mut().find(|s| s.id == strat.id) {
                                 s.last_error = e.clone();
@@ -5208,6 +5364,8 @@ impl RealtimeState {
                     }
                 }
             } else {
+                // Dropped before it could fill: release the fresh edge too.
+                me.release_fresh_edge(&strat.id);
                 me.log_throttled(
                     &format!("delay-cancel:{}", strat.id),
                     5_000,
@@ -5325,7 +5483,7 @@ impl RealtimeState {
         // Underlying/index strategies: resolve the option contract now from the
         // operator's strike preferences (ATM / ITM / OTM / strike mode).
         if strat.instrument.eq_ignore_ascii_case("INDEX") || strat.exchange_segment.eq_ignore_ascii_case("IDX_I") {
-            let resolved = self.resolve_option_strategy(&strat, ltp, &settings);
+            let resolved = self.resolve_option_strategy(&strat, ltp, &settings, false);
             if let Some(res) = resolved {
                 strat = res;
                 exch = strat.exchange_segment.clone();
@@ -5630,7 +5788,8 @@ impl RealtimeState {
             .iter()
             .any(|u| u.eq_ignore_ascii_case(&underlying));
         let pos_id = gen_id("rtpos");
-        let position = json!({
+        let (entry_chg, entry_chg_pct) = self.quote_change(strat.security_id, &exch);
+        let mut position = json!({
             "id": pos_id,
             "strategyId": strat.id,
             "strategyName": strat.name,
@@ -5675,6 +5834,10 @@ impl RealtimeState {
                 },
             }],
         });
+        // Entry-time premium change (sign + %), captured here so the executed-trade
+        // list can show which sign the "+green premium" pick actually bought.
+        position["ltpChange"] = json!(entry_chg);
+        position["ltpChangePct"] = json!(entry_chg_pct);
         let placed = self.et_placed.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(mut d) = self.doc() {
             d.positions.push(position);
@@ -5856,7 +6019,7 @@ impl RealtimeState {
             Some(round2(pnl))
         };
 
-        let closed = json!({
+        let mut closed = json!({
             "id": gen_id("rtclosed"),
             "positionId": id,
             "strategyId": js(&pos, "strategyId"),
@@ -5884,6 +6047,10 @@ impl RealtimeState {
             "openedAt": ji(&pos, "openedAt"),
             "closedAt": now_ms(),
         });
+        // Carry the entry-time premium change onto the closed record so the
+        // executed-trade list keeps showing the sign the trade was taken on.
+        closed["ltpChange"] = json!(jf(&pos, "ltpChange"));
+        closed["ltpChangePct"] = json!(jf(&pos, "ltpChangePct"));
         if let Some(mut d) = self.doc() {
             d.positions.retain(|p| js(p, "id") != id);
             d.closed.push(closed);
@@ -6155,18 +6322,27 @@ const NIFTY_SEC: i64 = 13;
 /// ids are assigned to the Top Gainer side, bearish ids to the Top Loser side,
 /// so a bullish line trades gainers and a bearish line trades losers. Returns
 /// `(bullish_ids, bearish_ids, net)` where `net = bullish - bearish`.
-fn nifty_indicator_assignment(candles: &[Candle], conf: &[String], slope_len: i64) -> (Vec<String>, Vec<String>, i64) {
+fn nifty_indicator_assignment(candles: &[Candle], conf: &[String], slope_len: i64, color: bool) -> (Vec<String>, Vec<String>, i64) {
     let st = algo_core::model::Settings::default();
     let window = nifty_slope_len(slope_len);
     let mut bull: Vec<String> = Vec::new();
     let mut bear: Vec<String> = Vec::new();
     for id in conf {
         let out = algo_core::compute(id, candles, &st);
-        let Some(s) = out.first() else { continue };
-        // Read the line's ACTUAL trend over a window, not a single last step, so
-        // the straight-line direction matches what the chart draws. `None` (line
-        // not resolved yet) contributes nothing instead of forcing a side.
-        match straight_line_trend(s, 0, window) {
+        // Two reads:
+        // * normal (color = false): the line's trend over a window of points (net
+        //   move) - the same straight segment the chart draws.
+        // * color (color = true): the COLOUR the chart draws on the line's last
+        //   closed candle - green = bullish, red = bearish. This is the colour the
+        //   operator sees, read as-is (never derived from the value slope here).
+        // `None` / `Flat` (line not resolved yet or flat) contributes nothing
+        // instead of forcing a side, in both modes.
+        let trend = if color {
+            out.get(sl_output_index(id)).and_then(|s| color_read(s, 0))
+        } else {
+            out.first().and_then(|s| straight_line_trend(s, 0, window))
+        };
+        match trend {
             Some(SlTrend::Bull) => bull.push(id.clone()),
             Some(SlTrend::Bear) => bear.push(id.clone()),
             _ => {}
@@ -6174,6 +6350,81 @@ fn nifty_indicator_assignment(candles: &[Candle], conf: &[String], slope_len: i6
     }
     let net = bull.len() as i64 - bear.len() as i64;
     (bull, bear, net)
+}
+
+/// The two colours the chart's straight-line overlays use for a bullish (rising)
+/// leg and a bearish (falling) leg. These are the defaults of the indicator
+/// `upColor` / `downColor` settings, and `algo_core` repaints the whole
+/// straight-line family with exactly these before returning it, so the colour read
+/// here is the colour the operator sees on the chart.
+const SL_GREEN: &str = "#26a69a";
+const SL_RED: &str = "#ef5350";
+
+/// Read the COLOUR (not the value) of a straight-line series on its last CLOSED
+/// candle: green -> `Bull`, red -> `Bear`. `offset` skips that many points from the
+/// newest end; the live forming bar is point 0, so the last closed bar sits at
+/// `len - 2 - offset`. Any other / missing colour reads `None` (non-blocking), so
+/// an un-drawn or differently-coloured line never fabricates a side.
+fn color_read(ser: &algo_core::model::SeriesOut, offset: usize) -> Option<SlTrend> {
+    let n = ser.data.len();
+    let i = n.checked_sub(offset + 2)?;
+    let col = ser.data[i].color.as_deref()?.trim().to_ascii_lowercase();
+    if col == SL_GREEN {
+        Some(SlTrend::Bull)
+    } else if col == SL_RED {
+        Some(SlTrend::Bear)
+    } else {
+        None
+    }
+}
+
+/// Output-series index that carries the drawn (coloured) line for a straight-line
+/// indicator id. Most indicators draw on series 0; zigzag and combo master draw
+/// the trendline on series 1.
+fn sl_output_index(id: &str) -> usize {
+    match id {
+        "zzline" | "trendmaster" => 1,
+        _ => 0,
+    }
+}
+
+/// Map a "Straight Line Indicator Color Detection" filter token to the VISIBLE
+/// coloured overlay id the chart draws (and its output index). This is
+/// deliberately NOT the hidden "…state" id the plain `Sl*` direction filters read:
+/// those hidden series carry no green/red colour, while the visible overlay does.
+fn sl_color_series(base: &str) -> Option<(&'static str, usize)> {
+    Some(match base {
+        "ElliottWave" => ("wavefib", 0),
+        "SupplyDemand" => ("supplydemand", 0),
+        "PriceAction" => ("pastruct", 0),
+        "ZigZag" => ("zzline", 1),
+        "ComboMaster" => ("trendmaster", 1),
+        "PaneConsensus" => ("panemaster", 0),
+        "AutoTrendline" => ("autotrend", 0),
+        "Pitchfork" => ("pitchfork", 0),
+        "TrendProjection" => ("projline", 0),
+        "GannFan" => ("gannfan", 0),
+        "FibFan" => ("fibfan", 0),
+        "Srema" => ("srema", 0),
+        "Vl" => ("vl", 0),
+        "Consensus" => ("slconsensus", 0),
+        "Support" => ("supline", 0),
+        "Resistance" => ("resline", 0),
+        _ => return None,
+    })
+}
+
+/// Colour read for one visible straight-line overlay at the given bar: green
+/// passes the bull side, red passes the bear side. A missing/other colour is
+/// non-blocking (`None`), matching the un-drawn-line behaviour of the `Sl*` gates.
+fn color_line_dir(id: &str, idx: usize, bull: bool, candles: &[Candle], offset: usize) -> Option<bool> {
+    let out = ind_series(id, candles, &algo_core::model::Settings::default());
+    let s = out.get(idx)?;
+    match color_read(s, offset)? {
+        SlTrend::Bull => Some(bull),
+        SlTrend::Bear => Some(!bull),
+        SlTrend::Flat => Some(true),
+    }
 }
 
 /// Straight-line trend window length. At least 3 points so the net move has more
@@ -6364,6 +6615,87 @@ const IND_GLOBAL_CAP: usize = 8192;
 /// scan re-seeds it from REST. Kept a few seconds so a subscribed feed keeps the
 /// hot path REST-free while an unsubscribe/quiet symbol still self-heals.
 const LIVE_BAR_TTL: Duration = Duration::from_secs(2);
+
+/// Fixed cadence at which the colour detection is re-read. Both the NIFTY-trend
+/// colour confirmation and the `SlColor*` indicator-filter gate scan the line
+/// colour on this interval instead of on every tick.
+pub const COLOR_SCAN_MS: i64 = 1_000;
+
+/// A sampled colour-filter decision plus when it was taken.
+#[derive(Clone)]
+struct ColorSample {
+    at_ms: i64,
+    val: Option<bool>,
+}
+
+/// Candle-series identity for the colour sample cache: a filter key is unique per
+/// instrument series (first bar time + length pins the series), so the same 5s
+/// sample is reused across the strategies that share the candles.
+type ColorSampleKey = (String, i64, usize, usize);
+
+fn color_samples() -> &'static Mutex<HashMap<ColorSampleKey, ColorSample>> {
+    static M: OnceLock<Mutex<HashMap<ColorSampleKey, ColorSample>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::with_capacity(256)))
+}
+
+/// True for the dedicated "Straight Line Indicator Color Detection" gate keys.
+fn is_color_filter(k: &str) -> bool {
+    k.starts_with("BullSlColor") || k.starts_with("BearSlColor")
+}
+
+/// Evaluate a colour filter at most once per `COLOR_SCAN_MS`, so the algo reads
+/// the assigned straight-line overlays' colour on the fixed cadence rather than
+/// re-deriving it on every tick. `None` (line not drawn yet) is cached too, so an
+/// un-drawn line is not re-checked until the next scan. The pure `filter_eval`
+/// path (used by the colour unit tests) is unaffected.
+fn color_filter_sampled(
+    k: &str,
+    candles: &[Candle],
+    offset: usize,
+    cons: ConsensusCfg,
+    sup: PivotTrendCfg,
+    res: PivotTrendCfg,
+) -> Option<bool> {
+    if candles.is_empty() {
+        return filter_eval_inner(k, candles, offset, cons, sup, res);
+    }
+    let key: ColorSampleKey = (k.to_string(), candles[0].time, candles.len(), offset);
+    let now = now_ms();
+    if let Ok(g) = color_samples().lock() {
+        if let Some(s) = g.get(&key) {
+            if now - s.at_ms < COLOR_SCAN_MS {
+                return s.val;
+            }
+        }
+    }
+    let val = filter_eval_inner(k, candles, offset, cons, sup, res);
+    if let Ok(mut g) = color_samples().lock() {
+        if g.len() > 4096 {
+            g.clear();
+        }
+        g.insert(key, ColorSample { at_ms: now, val });
+    }
+    val
+}
+
+/// Evaluate one gate filter, routing the colour-detection keys through the fixed
+/// colour scan so the indicator-filter colour detection shares the same cadence as
+/// the NIFTY trend read. Every other filter stays tick-native.
+#[inline]
+fn gate_filter_eval(
+    k: &str,
+    candles: &[Candle],
+    offset: usize,
+    cons: ConsensusCfg,
+    sup: PivotTrendCfg,
+    res: PivotTrendCfg,
+) -> Option<bool> {
+    if is_color_filter(k) {
+        color_filter_sampled(k, candles, offset, cons, sup, res)
+    } else {
+        filter_eval_inner(k, candles, offset, cons, sup, res)
+    }
+}
 
 fn ind_global() -> &'static Mutex<HashMap<IndGlobalKey, Arc<Vec<algo_core::model::SeriesOut>>>> {
     IND_GLOBAL.get_or_init(|| Mutex::new(HashMap::with_capacity(512)))
@@ -7465,6 +7797,18 @@ fn filter_eval_inner(
                 }
                 return None;
             }
+            // Straight Line Indicator Color Detection: read the COLOUR the chart
+            // draws on the line's last CLOSED candle (green = bullish, red =
+            // bearish). The colour id is the VISIBLE overlay the operator sees -
+            // not the hidden "…state" id the plain Sl* filters read, which carries
+            // no green/red colour. `None` (un-drawn / differently-coloured line) is
+            // non-blocking, matching the Sl* gates.
+            if let Some(rest) = base.strip_prefix("SlColor") {
+                return match sl_color_series(rest) {
+                    Some((id, idx)) => Some(color_line_dir(id, idx, bull, candles, offset).unwrap_or(true)),
+                    None => None,
+                };
+            }
             // Straight Line Indicators (single directional overlay lines).
             // A structural line that is not drawn yet (no resolved pivots) is
             // non-blocking, matching the old engine's "uncomputable => neutral".
@@ -7751,7 +8095,7 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
         ..Default::default()
     };
     for k in &norm_keys {
-        if filter_eval_inner(k, candles, offset, cons, sup, res).unwrap_or(false) {
+        if gate_filter_eval(k, candles, offset, cons, sup, res).unwrap_or(false) {
             f.pass += 1;
         }
     }
@@ -7767,7 +8111,7 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
             continue;
         }
         f.opp_total += 1;
-        if filter_eval_inner(k, candles, offset, cons, sup, res) == Some(true) {
+        if gate_filter_eval(k, candles, offset, cons, sup, res) == Some(true) {
             f.opposite += 1;
         }
     }
@@ -8597,6 +8941,11 @@ fn snap_of(rt: &RealtimeState) -> Value {
             let mut v = p.clone();
             v["ltp"] = json!(round2(ltp));
             v["pnl"] = json!(round2(pnl));
+            // Live premium change (sign + %) so the running list shows whether the
+            // option's premium is currently plus or minus.
+            let (chg, chg_pct) = rt.quote_change(sid, &js(p, "exchangeSegment"));
+            v["ltpChange"] = json!(chg);
+            v["ltpChangePct"] = json!(chg_pct);
             v
         })
         .collect();
@@ -8688,7 +9037,7 @@ fn snap_of(rt: &RealtimeState) -> Value {
                 // Manual Strike Select resolves from the scrip master alone, so it
                 // can still name the contract before any live quote arrives.
                 if spot > 0.0 || d.settings.manual_strikes_enabled {
-                    if let Some(base) = rt.resolve_option_strategy(s, spot, &d.settings) {
+                    if let Some(base) = rt.resolve_option_strategy(s, spot, &d.settings, true) {
                         let leg = json!({
                             "securityId": base.security_id,
                             "tradingSymbol": base.trading_symbol,
@@ -8723,12 +9072,10 @@ fn snap_of(rt: &RealtimeState) -> Value {
     let auto_side = rt.auto_option_side(&d.settings).map(|s| s.to_string());
     let active_run_in_side = rt.effective_run_in_side(&d.settings).map(|s| s.to_string());
     let margin_available = if rt.paper {
-        paper_available_of(
-            d.settings.paper_capital,
-            &d.closed,
-            &d.positions,
-            d.settings.broker_charges,
-        )
+        // Budget basis = wallet BEFORE locked margin; `margin_info_from` then
+        // subtracts the running trades' locked margin exactly once to show the
+        // remaining available amount.
+        paper_wallet_of(d.settings.paper_capital, &d.closed, d.settings.broker_charges)
     } else {
         real_available
     };
@@ -10041,6 +10388,22 @@ mod gate_tests {
         Strategy { id: "t".into(), name: "T".into(), category: "BEARISH".into(), side: "SELL".into(), ..Default::default() }
     }
 
+    #[tokio::test]
+    async fn blocked_delayed_entry_releases_the_fresh_edge() {
+        // In "fresh signal" mode the entry edge is consumed the moment the order
+        // is queued for the paper latency simulation. If the fill never lands
+        // (margin block / rejection / engine disarmed) the edge must be released,
+        // otherwise the strategy latches silent and stops trading until the gate
+        // happens to reset and print a brand-new signal.
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        rt.set_sig_state("scan:1:PE", true);
+        assert!(rt.sig_state_is_set("scan:1:PE"), "edge is consumed at queue time");
+        rt.release_fresh_edge("scan:1:PE");
+        assert!(!rt.sig_state_is_set("scan:1:PE"), "an unfilled entry must release the edge");
+    }
+
     #[test]
     fn arrow_flip_fires_only_on_the_flip_bar() {
         let candles = wave(400, 100.0, 0.0);
@@ -10110,14 +10473,30 @@ mod gate_tests {
         // A steadily rising index resolves the straight-line trend indicators
         // bullish -> net positive, every id lands in the CE bucket.
         let up = ramp(400, 100.0, 0.6);
-        let (bull, bear, net) = nifty_indicator_assignment(&up, &conf, 5);
+        let (bull, bear, net) = nifty_indicator_assignment(&up, &conf, 5, false);
         assert!(net > 0, "rising index must net bullish, got {net}");
         assert!(!bull.is_empty() && bear.is_empty());
         // The mirror-image falling index flips the assignment to the PE bucket.
         let down = ramp(400, 340.0, -0.6);
-        let (bull2, bear2, net2) = nifty_indicator_assignment(&down, &conf, 5);
+        let (bull2, bear2, net2) = nifty_indicator_assignment(&down, &conf, 5, false);
         assert!(net2 < 0, "falling index must net bearish, got {net2}");
         assert!(!bear2.is_empty() && bull2.is_empty());
+        // Colour mode: each confirmation id's side must be exactly the COLOUR read
+        // of that indicator's visible line on the last closed candle.
+        let mut exp_bull: Vec<String> = Vec::new();
+        let mut exp_bear: Vec<String> = Vec::new();
+        for id in &conf {
+            let out = algo_core::compute(id, &up, &algo_core::model::Settings::default());
+            match out.get(sl_output_index(id)).and_then(|s| color_read(s, 0)) {
+                Some(SlTrend::Bull) => exp_bull.push(id.clone()),
+                Some(SlTrend::Bear) => exp_bear.push(id.clone()),
+                _ => {}
+            }
+        }
+        let (bull_c, bear_c, net_c) = nifty_indicator_assignment(&up, &conf, 5, true);
+        assert_eq!(bull_c, exp_bull, "colour mode bull ids must match the per-indicator colour read");
+        assert_eq!(bear_c, exp_bear, "colour mode bear ids must match the per-indicator colour read");
+        assert_eq!(net_c, exp_bull.len() as i64 - exp_bear.len() as i64);
     }
 
     fn line_of(chronological: &[f64]) -> algo_core::model::SeriesOut {
@@ -10146,6 +10525,118 @@ mod gate_tests {
         // Not enough history -> unresolved.
         assert_eq!(straight_line_trend(&line_of(&[1.0]), 0, 5), None);
         assert_eq!(straight_line_trend(&line_of(&[1.0, 2.0]), 0, 5), None);
+    }
+
+    fn line_colored(vals: &[(f64, &str)]) -> algo_core::model::SeriesOut {
+        let mut s = algo_core::model::SeriesOut::default();
+        s.data = vals
+            .iter()
+            .enumerate()
+            .map(|(i, (v, c))| algo_core::model::Point {
+                time: i as i64,
+                value: *v,
+                color: if c.is_empty() { None } else { Some((*c).to_string()) },
+            })
+            .collect();
+        s
+    }
+
+    #[test]
+    fn color_read_reads_the_last_closed_candle_colour() {
+        // Chronological; the LAST entry is the live forming bar. The colour read
+        // must use the last CLOSED bar (second from the end) and return its
+        // COLOUR, never its value.
+        let green_closed = line_colored(&[
+            (1.0, ""), (2.0, SL_GREEN), (3.0, SL_GREEN), (4.0, SL_GREEN), (0.0, SL_RED),
+        ]);
+        // Last closed (idx 3) is GREEN even though the forming bar is RED.
+        assert_eq!(color_read(&green_closed, 0), Some(SlTrend::Bull));
+        let red_closed = line_colored(&[
+            (5.0, SL_RED), (4.0, SL_RED), (3.0, SL_RED), (2.0, SL_RED), (9.0, SL_GREEN),
+        ]);
+        // Last closed (idx 3) is RED even though the forming bar is GREEN.
+        assert_eq!(color_read(&red_closed, 0), Some(SlTrend::Bear));
+        // Missing / unknown colour -> None (non-blocking), never a side.
+        let none = line_colored(&[(1.0, ""), (2.0, "#123456")]);
+        assert_eq!(color_read(&none, 0), None);
+    }
+
+    #[test]
+    fn straight_line_color_filters_match_the_visible_line_colour() {
+        // Each SlColor* gate must equal the COLOUR read of the VISIBLE overlay the
+        // chart draws (e.g. ElliottWave -> wavefib), on the last closed candle.
+        let tokens = [
+            "ElliottWave", "SupplyDemand", "PriceAction", "ZigZag", "ComboMaster",
+            "PaneConsensus", "AutoTrendline", "Pitchfork", "TrendProjection",
+            "GannFan", "FibFan", "Srema", "Consensus",
+        ];
+        let up = ramp(400, 100.0, 0.6);
+        let down = ramp(400, 340.0, -0.6);
+        let mut saw_bull = 0;
+        let mut saw_bear = 0;
+        for candles in [&up, &down] {
+            for tok in tokens {
+                let (id, idx) = sl_color_series(tok).unwrap();
+                let s = ind_series(id, candles, &algo_core::model::Settings::default());
+                let read = color_read(s.get(idx).unwrap(), 0);
+                let (bull_expect, bear_expect) = match read {
+                    Some(SlTrend::Bull) => (Some(true), Some(false)),
+                    Some(SlTrend::Bear) => (Some(false), Some(true)),
+                    _ => (Some(true), Some(true)),
+                };
+                assert_eq!(
+                    filter_eval(&format!("BullSlColor{tok}"), candles, 0),
+                    bull_expect,
+                    "bull colour for {tok}"
+                );
+                assert_eq!(
+                    filter_eval(&format!("BearSlColor{tok}"), candles, 0),
+                    bear_expect,
+                    "bear colour for {tok}"
+                );
+                match read {
+                    Some(SlTrend::Bull) => saw_bull += 1,
+                    Some(SlTrend::Bear) => saw_bear += 1,
+                    _ => {}
+                }
+            }
+        }
+        // The colour read must actually flip with the line, not always agree.
+        assert!(saw_bull > 0, "at least one visible line must read GREEN somewhere");
+        assert!(saw_bear > 0, "at least one visible line must read RED somewhere");
+    }
+
+    #[test]
+    fn color_scan_reuses_the_sample_until_the_window_elapses() {
+        // The colour detection is read on a fixed cadence: a sample is held for
+        // COLOR_SCAN_MS and only then re-derived, no matter how many ticks arrive.
+        let cons = ConsensusCfg::default();
+        let sup = PivotTrendCfg::default();
+        let res = PivotTrendCfg::default();
+        let candles = wave(400, 100.0, 0.3);
+        let k = "BullSlColorAutoTrendline";
+        let key: ColorSampleKey = (k.to_string(), candles[0].time, candles.len(), 0);
+        color_samples().lock().unwrap().clear();
+        let fresh = filter_eval(k, &candles, 0);
+        let forced = if fresh == Some(true) { Some(false) } else { Some(true) };
+        color_samples().lock().unwrap().insert(key.clone(), ColorSample { at_ms: now_ms(), val: forced });
+        assert_eq!(
+            color_filter_sampled(k, &candles, 0, cons, sup, res),
+            forced,
+            "within the window the cached colour sample must be reused"
+        );
+        {
+            let mut g = color_samples().lock().unwrap();
+            if let Some(s) = g.get_mut(&key) {
+                s.at_ms = now_ms() - COLOR_SCAN_MS - 1;
+            }
+        }
+        assert_eq!(
+            color_filter_sampled(k, &candles, 0, cons, sup, res),
+            fresh,
+            "an expired sample must be re-read"
+        );
+        color_samples().lock().unwrap().clear();
     }
 
     #[test]
@@ -10710,6 +11201,10 @@ mod gate_tests {
         "BullSlElliottWave", "BullSlSupplyDemand", "BullSlPriceAction", "BullSlZigZag",
         "BullSlComboMaster", "BullSlPaneConsensus", "BullSlAutoTrendline", "BullSlPitchfork",
         "BullSlTrendProjection", "BullSlGannFan", "BullSlFibFan", "BullSlSrema", "BullVl",
+        "BullSlColorElliottWave", "BullSlColorSupplyDemand", "BullSlColorPriceAction", "BullSlColorZigZag",
+        "BullSlColorComboMaster", "BullSlColorPaneConsensus", "BullSlColorAutoTrendline", "BullSlColorPitchfork",
+        "BullSlColorTrendProjection", "BullSlColorGannFan", "BullSlColorFibFan", "BullSlColorSrema",
+        "BullSlColorVl", "BullSlColorConsensus", "BullSlColorSupport", "BullSlColorResistance",
         "BullArrowElliottWave", "BullArrowSupplyDemand", "BullArrowPriceAction", "BullArrowZigZag",
         "BullArrowComboMaster", "BullArrowPaneConsensus", "BullArrowAutoTrendline", "BullArrowPitchfork",
         "BullArrowTrendProjection", "BullArrowGannFan", "BullArrowFibFan", "BullArrowSrema",
@@ -10741,6 +11236,10 @@ mod gate_tests {
         "BearSlElliottWave", "BearSlSupplyDemand", "BearSlPriceAction", "BearSlZigZag",
         "BearSlComboMaster", "BearSlPaneConsensus", "BearSlAutoTrendline", "BearSlPitchfork",
         "BearSlTrendProjection", "BearSlGannFan", "BearSlFibFan", "BearSlSrema", "BearVl",
+        "BearSlColorElliottWave", "BearSlColorSupplyDemand", "BearSlColorPriceAction", "BearSlColorZigZag",
+        "BearSlColorComboMaster", "BearSlColorPaneConsensus", "BearSlColorAutoTrendline", "BearSlColorPitchfork",
+        "BearSlColorTrendProjection", "BearSlColorGannFan", "BearSlColorFibFan", "BearSlColorSrema",
+        "BearSlColorVl", "BearSlColorConsensus", "BearSlColorSupport", "BearSlColorResistance",
         "BearArrowElliottWave", "BearArrowSupplyDemand", "BearArrowPriceAction", "BearArrowZigZag",
         "BearArrowComboMaster", "BearArrowPaneConsensus", "BearArrowAutoTrendline", "BearArrowPitchfork",
         "BearArrowTrendProjection", "BearArrowGannFan", "BearArrowFibFan", "BearArrowSrema",
@@ -11143,6 +11642,30 @@ mod gate_tests {
         assert!((margin_budget_of(500_000.0, 100.0, 200_000.0) - 200_000.0).abs() < 1e-9);
         // Zero percentage with no amount stays disabled.
         assert_eq!(margin_budget_of(0.0, 0.0, 200_000.0), 0.0);
+    }
+
+    #[test]
+    fn paper_margin_budget_counts_locked_margin_once() {
+        // 500k wallet, 100k of open notional: the budget must stay the full 500k
+        // and "available" must be 500k - 100k = 400k. The old code sized the
+        // budget off the post-lock wallet and then subtracted the lock again, so
+        // budgets shrank with every open trade and "available" hit 0 early.
+        let cap = 500_000.0;
+        let closed: Vec<Value> = Vec::new();
+        let positions = vec![json!({ "qty": 1000.0, "entry": 100.0 })];
+
+        let wallet = paper_wallet_of(cap, &closed, false);
+        assert!((wallet - 500_000.0).abs() < 1e-9);
+        // Free cash still subtracts the lock exactly once.
+        let free = paper_available_of(cap, &closed, &positions, false);
+        assert!((free - 400_000.0).abs() < 1e-9);
+
+        let budget = margin_budget_of(0.0, 100.0, wallet);
+        let (locked, count) = locked_margin_of(&positions);
+        assert!((budget - 500_000.0).abs() < 1e-9);
+        assert!((locked - 100_000.0).abs() < 1e-9);
+        assert!((budget - locked - 400_000.0).abs() < 1e-9);
+        assert_eq!(count, 1);
     }
 
     // --- Engine controls: timeframe / MTF / auto-lots wiring -----------------

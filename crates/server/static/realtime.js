@@ -146,11 +146,15 @@ function applyClosedExpand() {
   if (wrap) wrap.classList.toggle("rt-scroll-open", closedExpanded);
   if (btn) btn.textContent = closedExpanded ? "Collapse" : "Show all";
 }
-// Signature of what is currently painted in the big tables. The 1s poll rebuilds
-// the whole DOM for the closed ledger (thousands of rows) and the condition log;
-// doing that every second is what made the pane hang. Skip the rebuild when the
-// underlying data has not changed since the last paint.
-let closedRenderSig = "";
+// The 1s poll rebuilds the whole DOM for the closed ledger (thousands of rows)
+// and the condition log; doing that every second is what made the pane hang.
+// Keep an append-only tail for the closed table so a fresh close (which only ever
+// prepends, rows are newest-first) inserts just its row instead of rebuilding the
+// whole innerHTML; the condition log keeps its own repaint signature below.
+let closedRenderedCount = 0;
+let closedRenderedSource = "";
+let closedRenderedCharges = null;
+let closedTailId = "";
 let logRenderSig = "";
 // Day-scoped P&L summary for the engine panes: the summary strip shows TODAY
 // only, while the full history lives in the Trade Stats tabs. Loaded on a
@@ -510,6 +514,28 @@ function _filterLayout(isBull) {
     ]),
   });
 
+  // Straight Line Indicator Color Detection: one filter per straight-line
+  // indicator that fires purely on the LINE'S COLOR on the LAST CLOSED candle -
+  // the line closing GREEN (rising) on the bullish side, RED (falling) on the
+  // bearish side. The live forming bar is deliberately ignored, so the colour is
+  // confirmed only once the candle closes. Server aliases SlColor* to the same
+  // line-direction maths as the Sl* rows, read one bar back (last closed).
+  // Bullish list => green detects; Bearish list => red detects.
+  groups.push({
+    head: "Straight Line Indicator Color Detection (" + (isBull ? "GREEN" : "RED") + " line on last CLOSED candle, scanned every 5s -> " + (isBull ? "bullish CE" : "bearish PE") + ")",
+    rows: [
+      ["ElliottWave", "Elliott wave line"], ["SupplyDemand", "Supply Demand line"], ["PriceAction", "Price Action Trend line"],
+      ["ZigZag", "ZigZag Trendline"], ["ComboMaster", "Combo Master line"], ["PaneConsensus", "Pane Consensus Signal line"],
+      ["AutoTrendline", "Auto Trendline"], ["Pitchfork", "Pitchfork median line"], ["TrendProjection", "Trend Projection line"],
+      ["GannFan", "Gann Fan line"], ["FibFan", "Fibonacci Fan line"], ["Srema", "S/R EMA Reversal line"],
+    ].map(([tok, name]) => [`${B}SlColor${tok}`, `${name} - ${isBull ? "GREEN" : "RED"} on closed candle`]).concat([
+      [`${B}SlColorVl`, `Volume line - ${isBull ? "GREEN" : "RED"} on closed candle`],
+      [`${B}SlColorConsensus`, `Straight Line Consensus line - ${isBull ? "GREEN" : "RED"} on closed candle`],
+      [`${B}SlColorSupport`, `Support Trendline - ${isBull ? "GREEN" : "RED"} on closed candle`],
+      [`${B}SlColorResistance`, `Resistance Trendline - ${isBull ? "GREEN" : "RED"} on closed candle`],
+    ]),
+  });
+
   // Arrow detection: trade the instant a fresh up/down arrow prints on the
   // selected indicator line. Bull side detects the bullish up arrow, Bear side
   // the bearish down arrow, using the exact same direction as the trend filters.
@@ -579,11 +605,11 @@ function filterSectionHTML(side) {
       const rows = sec.rows
         .map((f) => {
           let gear = "";
-          if (/SlConsensus$/.test(f[0]) || /ArrowConsensus$/.test(f[0])) {
+          if (/(Sl|SlColor)Consensus$/.test(f[0]) || /ArrowConsensus$/.test(f[0])) {
             gear = `<span class="sc-gear" title="Straight Line Consensus settings" style="cursor:pointer;color:#ffd700;font-size:11px;line-height:1">&#9881;</span>`;
-          } else if (/SlSupport$/.test(f[0])) {
+          } else if (/(Sl|SlColor)Support$/.test(f[0])) {
             gear = `<span class="pt-gear" data-pt="support" title="Support Trendline settings" style="cursor:pointer;color:#26a69a;font-size:11px;line-height:1">&#9881;</span>`;
-          } else if (/SlResistance$/.test(f[0])) {
+          } else if (/(Sl|SlColor)Resistance$/.test(f[0])) {
             gear = `<span class="pt-gear" data-pt="resistance" title="Resistance Trendline settings" style="cursor:pointer;color:#ef5350;font-size:11px;line-height:1">&#9881;</span>`;
           }
           return `<div style="display:flex;align-items:center;gap:3px"><label style="font-size:9px;color:#ccc;display:flex;align-items:center;gap:3px;flex:1"><input type="checkbox" data-filter="${f[0]}"> ${esc(f[1])}</label>${gear}</div>`;
@@ -951,7 +977,7 @@ function shell() {
 
     <h3 id="rtAccountSection" style="font-size:11px;color:#888;text-transform:uppercase;margin:6px 0 4px">Running Trades <span style="text-transform:none;color:#666;font-weight:normal">(open positions)</span></h3>
     <div class="rt-scroll"><table class="account-table" id="rtPos"><thead><tr>
-      <th>Option</th><th>Qty</th><th>Entry</th><th>LTP</th><th>P&amp;L (gross)</th><th>SL/Trail</th><th>Guard</th><th></th>
+      <th>Option</th><th>Qty</th><th>Entry</th><th>LTP</th><th>LTP chg</th><th>P&amp;L (gross)</th><th>SL/Trail</th><th>Guard</th><th></th>
     </tr></thead><tbody></tbody></table></div>
 
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0 4px">
@@ -959,7 +985,7 @@ function shell() {
       <button class="btn-action" id="rtClosedExpand" style="width:auto;padding:3px 10px;margin:0;font-size:10px" title="Closed Trades ki poori list ek saath dikhao (scroll box ki 230px limit hatao)">Show all</button>
     </div>
     <div class="rt-scroll" id="rtClosedWrap"><table class="account-table" id="rtClosed"><thead><tr>
-      <th>Option</th><th>Qty</th><th>Entry → Exit</th><th>P&amp;L (net)</th><th>Charges</th><th>Reason</th><th>Entry → Exit time</th>
+      <th>Option</th><th>Qty</th><th>Entry → Exit</th><th>LTP chg (entry)</th><th>P&amp;L (net)</th><th>Charges</th><th>Reason</th><th>Entry → Exit time</th>
     </tr></thead><tbody></tbody></table></div>
 
     <div class="account-section" style="border-top:1px solid #1e1e40;margin-top:6px">
@@ -1209,6 +1235,9 @@ function shell() {
         <button class="btn-action" id="rtNiftyTrendConfIndAdd" style="width:auto;padding:3px 10px;margin:0">Add</button>
         <span id="rtNiftyTrendConfIndList" style="font-size:9px;color:#ccc;display:flex;flex-wrap:wrap;gap:4px;align-items:center"></span>
         <input type="hidden" data-list="niftyTrendConfInds">
+        <label class="rtom-f" title="ON: NIFTY ka bullish/bearish side in confirmation indicators ke LINE COLOUR se decide hoga (green = rising = bullish, red = falling = bearish), last closed candle par, aur algo har 5 second me indicators ko scan karega. OFF: normal windowed trend read.">
+          <input type="checkbox" data-set="niftyTrendColor" id="rtNiftyTrendColorCb" style="accent-color:#00d4aa"> Color based trend detection (green/red, 5s scan)
+        </label>
       </div>
       <div id="rtNiftyTrendList" style="display:none;margin-top:4px;font-size:9px;color:#ccc;background:#12122a;border:1px solid #2d2d50;border-radius:4px;padding:6px 8px"></div>
 
@@ -2385,11 +2414,10 @@ function renderSnapshot(s) {
 
 // Live Top Movers + NIFTY trend readouts (auto CE/PE side source).
 async function loadScanners() {
-  // Three throttled readouts per call; they change on the server's own cadence,
-  // not every second, so polling them at 1s only added churn. Refresh a bit
-  // slower - the master-toggle state itself still updates on the 1s snapshot.
+  // Fast readouts: the Top Movers / NIFTY trend lists must track the engine's
+  // 100ms scan so a fresh pick is visible almost immediately (not 2.5s late).
   const now = Date.now();
-  if (now - scannerPollAt < 2500) return;
+  if (now - scannerPollAt < 250) return;
   scannerPollAt = now;
   const cfg = (STATE && STATE.settings) || {};
   const ml = document.getElementById("rtMoversList");
@@ -3547,6 +3575,7 @@ function syncInterlocks() {
   };
   dimRow("rtNiftyTrendConfIndSelect", !ntActive);
   dimRow("rtNiftyTrendConfIndAdd", !ntActive);
+  dimRow("rtNiftyTrendColorCb", !ntActive);
 
   // --- Top Movers: independent of NIFTY trend-following. Both masters can be
   //     ON together and run side by side (they are connected), so there is no
@@ -3769,6 +3798,18 @@ function chartBadgeHTML(prefix, chart) {
   );
 }
 
+// LTP change cell for the trade lists: absolute (₹) + percent with an explicit
+// plus/minus sign, coloured by direction, so the option premium's sign (the point
+// of the "+green premium" pick) is visible next to each trade. `--` when no quote.
+function chgCell(chg, pct) {
+  const c = num(chg);
+  const p = num(pct);
+  if (c === 0 && p === 0) return { txt: "--", col: "#888" };
+  const col = c >= 0 ? "#00d4aa" : "#ef5350";
+  const sgn = (v) => (v >= 0 ? "+" : "-");
+  return { txt: `${sgn(c)}${Math.abs(c).toFixed(2)} (${sgn(p)}${Math.abs(p).toFixed(2)}%)`, col };
+}
+
 function renderRunning(s) {
   const positions = s.positions || [];
   const broker = s.brokerPositions || [];
@@ -3780,6 +3821,49 @@ function renderRunning(s) {
   const callManual = settings.callManual !== false;
   const aiPicks = new Set(s.aiPicks || []);
   const running = (s.strategies || []).filter((x) => x.enabled || (callManual && sel[x.id]) || aiPicks.has(x.id));
+  // Scanner / synthetic strategies (Top Movers, NIFTY trend, Manual Strike) never
+  // live in `s.strategies`, so they are normally surfaced only through the
+  // volatile Picked-Strikes readout. That readout is empty whenever the scanner
+  // pollers yield to the operator (or right after a restart), which left this
+  // list blank while scanner trades were still open. Derive a running row straight
+  // from each open position the saved list does not already cover, so the panel
+  // always mirrors what is actually trading.
+  const savedIds = new Set((s.strategies || []).map((x) => String(x.id)));
+  const seenDerived = new Set();
+  const derived = positions
+    .filter((p) => {
+      const id = String(p.strategyId || "");
+      if (!id || savedIds.has(id) || seenDerived.has(id)) return false;
+      seenDerived.add(id);
+      return true;
+    })
+    .map((p) => {
+      const id = String(p.strategyId);
+      const symbol = String(p.tradingSymbol || "");
+      const bear =
+        /:PE$/i.test(id) || /-PE$/i.test(symbol) || /bear/i.test(String(p.strategyName || ""));
+      const leg = {
+        securityId: p.securityId,
+        tradingSymbol: symbol,
+        segment: p.exchangeSegment,
+        instrument: p.instrument,
+      };
+      return {
+        id,
+        name: p.strategyName || symbol || id,
+        category: bear ? "BEARISH" : "BULLISH",
+        engineTf: "",
+        securityId: p.securityId,
+        exchangeSegment: p.exchangeSegment,
+        instrument: p.instrument,
+        tradingSymbol: symbol,
+        runMode: "premium",
+        tradeMode: "premium",
+        runLeg: leg,
+        tradeLeg: leg,
+        derived: true,
+      };
+    });
   const modeLabel = "Real (live)";
   const armedFilters = Object.keys(settings.filters || {}).filter((k) => settings.filters[k]);
   const filtersBull = armedFilters.filter(filterIsBull).length;
@@ -3825,20 +3909,26 @@ function renderRunning(s) {
     settings.commodityOn ||
     manualMode
   );
+  // When there are saved running strategies, always show them (plus the
+  // scanner rows). Otherwise, prefer the richer Picked-Strikes view when the
+  // scanner has picks; only fall back to the derived rows when that readout is
+  // empty, so a scanner session with open trades never renders a blank list.
+  const allRunning =
+    running.length || !(scannerOn && strikes.length) ? running.concat(derived) : running;
 
   const runStrat = document.getElementById("rtRunStrategies");
   if (runStrat) {
-    const shown = running.length || !scannerOn ? running.length : strikes.length;
+    const shown = allRunning.length || !scannerOn ? allRunning.length : strikes.length;
     const head =
       `<div style="display:flex;justify-content:space-between;gap:6px;font-size:9px;color:#888;padding:0 0 3px">` +
       `<span>${s.engineOn ? '<span style="color:#00d4aa">Engine RUNNING</span>' : '<span style="color:#ffd700">Engine OFF</span>'} · ${shown} strateg${shown === 1 ? "y" : "ies"} · ${esc(modeLabel)}</span>` +
       `<span>${s.armed ? '<span style="color:#ef5350">ARMED</span>' : '<span style="color:#666">disarmed</span>'}${armedFilters.length ? ` · filters ${filtersBull}CE/${filtersBear}PE` : ""}</span>` +
       `</div>`;
     const filtName = (bull) => (bull ? bullNames : bearNames);
-    if (running.length) {
+    if (allRunning.length) {
       runStrat.innerHTML =
         head +
-        running
+        allRunning
           .map((x) => {
             const bull = stratBull(x);
             const pos = positions.filter((p) => (p.strategyId && p.strategyId === x.id) || (p.strategyName && x.name && p.strategyName === x.name));
@@ -3933,11 +4023,13 @@ function renderRunning(s) {
       .map((p) => {
         const pnl = num(p.pnl);
         total += pnl;
+        const ch = chgCell(p.ltpChange, p.ltpChangePct);
         return `<tr>
           <td><b>${esc(p.tradingSymbol || p.securityId)}</b><br><span style="font-size:8px;color:#666">REAL · ${esc(p.method || "")}${p.broker ? " · broker" : ""}</span></td>
           <td>${num(p.qty)}</td>
           <td>${num(p.entry).toFixed(2)}</td>
           <td>${num(p.ltp).toFixed(2)}</td>
+          <td style="color:${ch.col};white-space:nowrap">${ch.txt}</td>
           ${pnlCell(pnl)}
           <td style="white-space:nowrap">
             <button class="btn-action" data-openchart="${esc(String(p.securityId || ""))}" data-exch="${esc(p.exchangeSegment || "")}" data-inst="${esc(p.instrument || "")}" data-sym="${esc(p.tradingSymbol || "")}" style="width:auto;padding:2px 8px;margin:0 4px 0 0;font-size:10px" title="Is trade ka chart kholo (live P&amp;L / SL / trail lines)">Chart</button>
@@ -3949,11 +4041,13 @@ function renderRunning(s) {
         dhanOnly.map((p) => {
           const pnl = num(p.pnl);
           total += pnl;
+          const ch = chgCell(p.ltpChange, p.ltpChangePct);
           return `<tr>
             <td><b>${esc(p.tradingSymbol || p.securityId)}</b><br><span style="font-size:8px;color:#666">DHAN · ${esc(p.exchangeSegment || "")} · ${esc(p.positionType || "")}${p.productType ? " · " + esc(p.productType) : ""}</span></td>
             <td>${num(p.netQty)}</td>
             <td>${num(p.buyAvg).toFixed(2)}</td>
             <td>${num(p.ltp).toFixed(2)}</td>
+            <td style="color:${ch.col};white-space:nowrap">${ch.txt}</td>
             ${pnlCell(pnl)}
             <td></td>
           </tr>`;
@@ -3965,7 +4059,7 @@ function renderRunning(s) {
     } else {
       const totCol = total >= 0 ? "#00d4aa" : "#ef5350";
       runTrades.innerHTML =
-        `<table class="account-table"><thead><tr><th>Option</th><th>Qty</th><th>Entry</th><th>LTP</th><th>P&amp;L</th><th></th></tr></thead><tbody>${rows}</tbody></table>` +
+        `<table class="account-table"><thead><tr><th>Option</th><th>Qty</th><th>Entry</th><th>LTP</th><th>LTP chg</th><th>P&amp;L</th><th></th></tr></thead><tbody>${rows}</tbody></table>` +
         `<div style="font-size:9px;color:#888;padding:3px 2px">Total gross P&amp;L: <b style="color:${totCol}">${total >= 0 ? "+" : "-"}${fmtMoney(Math.abs(total))}</b> · updated ${istTime(Date.now())}</div>`;
       runTrades.querySelectorAll("[data-runclose]").forEach((b) => {
         b.onclick = async () => {
@@ -3990,11 +4084,13 @@ function renderRunning(s) {
         if (num(p.trail) > 0) g.push("TRAIL");
         if (num(p.trailTp) > 0) g.push("TRAIL-TP");
         const guardTxt = g.length ? `<span style="color:#ffd700">${g.join("+")}</span>` : "--";
+        const ch = chgCell(p.ltpChange, p.ltpChangePct);
         return `<tr>
           <td>${esc(p.tradingSymbol || p.securityId)}</td>
           <td>${num(p.qty)}</td>
           <td>${num(p.entry).toFixed(2)}</td>
           <td>${num(p.ltp).toFixed(2)}</td>
+          <td style="color:${ch.col};white-space:nowrap">${ch.txt}</td>
           <td class="${pnlCls}">${num(p.pnl).toFixed(2)}</td>
           <td>${esc(sl)} ${tr ? " / " + esc(tr) : ""}</td>
           <td>${guardTxt}</td>
@@ -4039,43 +4135,58 @@ function reasonLabel(reason) {
   return reason;
 }
 
-function renderClosed(s) {
-  const body = document.querySelector("#rtClosed tbody");
-  if (!body) return;
+function closedRowHTML(c, on) {
+  const charges = on ? (c.charges != null ? num(c.charges) : estimateCharges(c.entry, c.exit, c.qty, c.side, c.instrument, c.tradingSymbol)) : 0;
+  const net = on && c.netPnl != null ? num(c.netPnl) : num(c.pnl);
+  const cls = net >= 0 ? "rt-pos" : "rt-neg";
   const fmtT = (t) => (t ? istTime(num(t)) : "-");
-  const on = chargesOn();
-  // Prefer the full on-demand ledger; fall back to the snapshot's newest slice
-  // before the first `/closed` fetch resolves.
-  const list = CLOSED_CACHE && CLOSED_CACHE.length ? CLOSED_CACHE : ((s && s.closed) || []);
-  const cnt = document.getElementById("rtClosedCount");
-  if (cnt) cnt.textContent = "(" + list.length + ")";
-  // Repaint only when the ledger (or the charges toggle) actually changed. A
-  // multi-thousand-row innerHTML rebuild on every 1s poll is the main reason the
-  // paper pane felt frozen; the rows themselves are immutable once booked.
-  const sig =
-    (CLOSED_CACHE && CLOSED_CACHE.length ? "c" : "s") +
-    ":" + list.length +
-    ":" + (list.length ? num(list[0].closedAt) : 0) +
-    ":" + (list.length ? num(list[list.length - 1].closedAt) : 0) +
-    ":" + (on ? "1" : "0");
-  if (sig === closedRenderSig) return;
-  closedRenderSig = sig;
-  body.innerHTML = list
-    .map((c) => {
-      const charges = on ? (c.charges != null ? num(c.charges) : estimateCharges(c.entry, c.exit, c.qty, c.side, c.instrument, c.tradingSymbol)) : 0;
-      const net = on && c.netPnl != null ? num(c.netPnl) : num(c.pnl);
-      const cls = net >= 0 ? "rt-pos" : "rt-neg";
-      return `<tr>
+  const ch = chgCell(c.ltpChange, c.ltpChangePct);
+  return `<tr>
         <td>${esc(c.tradingSymbol || c.securityId)}</td>
         <td>${num(c.qty)}</td>
         <td>${num(c.entry).toFixed(2)} → ${num(c.exit).toFixed(2)}</td>
+        <td style="color:${ch.col};white-space:nowrap">${ch.txt}</td>
         <td class="${cls}">${net.toFixed(2)}</td>
         <td>${on ? charges.toFixed(2) : "--"}</td>
         <td>${esc(reasonLabel(c.reason))}</td>
         <td>${esc(fmtT(c.openedAt))} → ${esc(fmtT(c.closedAt))}</td>
       </tr>`;
-    })
-    .join("");
+}
+
+function renderClosed(s) {
+  const body = document.querySelector("#rtClosed tbody");
+  if (!body) return;
+  // Prefer the full on-demand ledger; fall back to the snapshot's newest slice
+  // before the first `/closed` fetch resolves.
+  const fromCache = !!(CLOSED_CACHE && CLOSED_CACHE.length);
+  const list = fromCache ? CLOSED_CACHE : ((s && s.closed) || []);
+  const source = fromCache ? "c" : "s";
+  const on = chargesOn();
+  const cnt = document.getElementById("rtClosedCount");
+  if (cnt) cnt.textContent = "(" + list.length + ")";
+  const idOf = (c) => String((c && c.id) || "");
+  // Newest-first + append-only ledger: a pure prepend can insert just the new
+  // rows. Anything else (source switch, charges toggle, reset, re-sort, tail that
+  // no longer matches) falls back to a full repaint.
+  const canAppend =
+    closedRenderedCount > 0 &&
+    list.length > closedRenderedCount &&
+    source === closedRenderedSource &&
+    on === closedRenderedCharges &&
+    closedTailId !== "" &&
+    idOf(list[closedRenderedCount - 1]) === closedTailId;
+  if (canAppend) {
+    const fresh = list.slice(0, list.length - closedRenderedCount);
+    body.insertAdjacentHTML("afterbegin", fresh.map((c) => closedRowHTML(c, on)).join(""));
+    closedRenderedCount = list.length;
+    closedTailId = idOf(list[list.length - 1]);
+    return;
+  }
+  body.innerHTML = list.map((c) => closedRowHTML(c, on)).join("");
+  closedRenderedCount = list.length;
+  closedRenderedSource = source;
+  closedRenderedCharges = on;
+  closedTailId = list.length ? idOf(list[list.length - 1]) : "";
 }
 
 // The closed ledger and day-stats are cached client-side (the 1s poll only ships
@@ -4084,7 +4195,10 @@ function renderClosed(s) {
 function resetBookCaches() {
   CLOSED_CACHE = null;
   closedLoadedAt = 0;
-  closedRenderSig = "";
+  closedRenderedCount = 0;
+  closedRenderedSource = "";
+  closedRenderedCharges = null;
+  closedTailId = "";
   DAY_STATS = null;
   dayStatsAt = 0;
   dayStatsSig = "";
@@ -5033,7 +5147,7 @@ export function bootRealtime() {
   refresh();
   timer = setInterval(() => {
     if (active()) refresh();
-  }, 1000);
+  }, 250);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && active()) refresh();
   });

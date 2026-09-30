@@ -7,6 +7,10 @@
 //! analysis and all chart series - is computed here. The browser only renders
 //! the JSON returned by `GET /api/rt/stats` and `GET /api/paper/stats`.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
+
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -821,12 +825,42 @@ pub fn report(closed: &[Value], q: &StatsQuery, engine: &str, armed: bool, charg
 // HTTP handler
 // ---------------------------------------------------------------------------
 
+/// Memoised reports, keyed by a stable hash of (engine, charges, query, ledger).
+/// The Trade Stats tab polls every few seconds; recomputing the whole report -
+/// normalising every closed row plus the period/strategy/hour buckets - from
+/// scratch on each poll is what made the pane crawl on a large ledger. The key
+/// changes only when the query or the ledger actually changes, so an unchanged
+/// poll is answered from the cache. Capped and cleared wholesale when it grows.
+static STATS_CACHE: Mutex<Vec<(u64, Value)>> = Mutex::new(Vec::new());
+
 pub async fn stats_get(
     State(rt): State<RealtimeState>,
     Query(q): Query<StatsQuery>,
 ) -> impl IntoResponse {
-    let (closed, armed) = rt.stats_input();
     let engine = if rt.paper { "papertrade" } else { "realtime" };
     let charges_on = rt.charges_on();
-    Json(report(&closed, &q, engine, armed, charges_on))
+    // Seed the ledger hash with everything except the ledger itself; the engine
+    // adds the ledger + armed flag without cloning it.
+    let mut seed = DefaultHasher::new();
+    engine.hash(&mut seed);
+    charges_on.hash(&mut seed);
+    q.range.hash(&mut seed);
+    q.mode.hash(&mut seed);
+    q.scope.hash(&mut seed);
+    q.engine.hash(&mut seed);
+    let key = rt.closed_signature(seed.finish());
+    if let Ok(g) = STATS_CACHE.lock() {
+        if let Some((_, v)) = g.iter().find(|(k, _)| *k == key) {
+            return Json(v.clone());
+        }
+    }
+    let (closed, armed) = rt.stats_input();
+    let value = report(&closed, &q, engine, armed, charges_on);
+    if let Ok(mut g) = STATS_CACHE.lock() {
+        if g.len() >= 8 {
+            g.clear();
+        }
+        g.push((key, value.clone()));
+    }
+    Json(value)
 }
