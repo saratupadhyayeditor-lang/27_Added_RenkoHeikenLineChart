@@ -6417,14 +6417,22 @@ fn nifty_indicator_assignment(candles: &[Candle], conf: &[String], slope_len: i6
 const SL_GREEN: &str = "#26a69a";
 const SL_RED: &str = "#ef5350";
 
-/// Read the COLOUR (not the value) of a straight-line series on its last CLOSED
-/// candle: green -> `Bull`, red -> `Bear`. `offset` skips that many points from the
-/// newest end; the live forming bar is point 0, so the last closed bar sits at
-/// `len - 2 - offset`. Any other / missing colour reads `None` (non-blocking), so
-/// an un-drawn or differently-coloured line never fabricates a side.
+/// Read the COLOUR (not the value) of a straight-line series at its newest drawn
+/// point: green -> `Bull`, red -> `Bear`. The renderer paints each segment with
+/// its END point's colour (`draw_line_series`), so the segment the chart draws
+/// across the latest closed candle carries the newest point's colour - exactly
+/// the colour the operator sees on the line right now. `offset` skips that many
+/// newest points.
+///
+/// A fixed `len - 2` index is wrong here: most straight-line series are SPARSE
+/// (one point per vertex / pivot, not one per candle), so `len - 2` can be many
+/// candles - even days - old and read the PREVIOUS leg's colour. The newest point
+/// is the only one guaranteed to sit on the segment covering the latest candle.
+/// Any other / missing colour reads `None` (non-blocking), so an un-drawn or
+/// differently-coloured line never fabricates a side.
 fn color_read(ser: &algo_core::model::SeriesOut, offset: usize) -> Option<SlTrend> {
     let n = ser.data.len();
-    let i = n.checked_sub(offset + 2)?;
+    let i = n.checked_sub(offset + 1)?;
     let col = ser.data[i].color.as_deref()?.trim().to_ascii_lowercase();
     if col == SL_GREEN {
         Some(SlTrend::Bull)
@@ -10625,20 +10633,19 @@ mod gate_tests {
     }
 
     #[test]
-    fn color_read_reads_the_last_closed_candle_colour() {
-        // Chronological; the LAST entry is the live forming bar. The colour read
-        // must use the last CLOSED bar (second from the end) and return its
-        // COLOUR, never its value.
-        let green_closed = line_colored(&[
-            (1.0, ""), (2.0, SL_GREEN), (3.0, SL_GREEN), (4.0, SL_GREEN), (0.0, SL_RED),
-        ]);
-        // Last closed (idx 3) is GREEN even though the forming bar is RED.
-        assert_eq!(color_read(&green_closed, 0), Some(SlTrend::Bull));
-        let red_closed = line_colored(&[
-            (5.0, SL_RED), (4.0, SL_RED), (3.0, SL_RED), (2.0, SL_RED), (9.0, SL_GREEN),
-        ]);
-        // Last closed (idx 3) is RED even though the forming bar is GREEN.
-        assert_eq!(color_read(&red_closed, 0), Some(SlTrend::Bear));
+    fn color_read_reads_the_line_end_colour() {
+        // The renderer paints each segment with its END point's colour, so the
+        // segment drawn across the latest candle carries the NEWEST point's
+        // colour. Read that - never a fixed `len - 2`, which on the sparse
+        // straight-line series (one point per vertex) can be days old.
+        let green_end = line_colored(&[(1.0, ""), (2.0, SL_GREEN), (3.0, SL_GREEN), (4.0, SL_GREEN)]);
+        assert_eq!(color_read(&green_end, 0), Some(SlTrend::Bull));
+        let red_end = line_colored(&[(5.0, SL_RED), (4.0, SL_RED), (3.0, SL_RED)]);
+        assert_eq!(color_read(&red_end, 0), Some(SlTrend::Bear));
+        // offset skips the newest points.
+        let mixed = line_colored(&[(1.0, SL_GREEN), (2.0, SL_GREEN), (3.0, SL_RED)]);
+        assert_eq!(color_read(&mixed, 0), Some(SlTrend::Bear));
+        assert_eq!(color_read(&mixed, 1), Some(SlTrend::Bull));
         // Missing / unknown colour -> None (non-blocking), never a side.
         let none = line_colored(&[(1.0, ""), (2.0, "#123456")]);
         assert_eq!(color_read(&none, 0), None);
