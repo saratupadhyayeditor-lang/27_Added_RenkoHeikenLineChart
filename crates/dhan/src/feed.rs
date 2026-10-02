@@ -21,6 +21,13 @@ use crate::models::ExchangeSegment;
 // Dhan rejects with a bare HTTP 400. With the slash it is `GET /?version=...`.
 pub const FEED_HOST: &str = "wss://api-feed.dhan.co/";
 
+/// Dhan resets the socket with "Connection reset without closing handshake" when
+/// the full ~2.6k-instrument set is blasted as dozens of subscribe frames the
+/// instant the handshake completes. Give the feed a beat to settle, then space
+/// the subscribe frames out instead of firing them all back-to-back.
+const SUBSCRIBE_SETTLE: Duration = Duration::from_millis(300);
+const SUBSCRIBE_PACE: Duration = Duration::from_millis(150);
+
 /// Turn a tungstenite handshake failure into a readable error. Dhan answers a
 /// rejected feed with HTTP 400 plus a short body explaining why (bad token,
 /// missing Data-API entitlement, connection-slot exhaustion), which is useless
@@ -279,6 +286,18 @@ pub enum FeedPacket {
     Disconnect {
         code: i16,
     },
+    /// Connection-state change from the supervisor: `up=true` right after a
+    /// successful handshake + subscribe, `up=false` when a socket drops before
+    /// the next reconnect attempt. Lets the broker watchdog tell "connected but
+    /// silent" apart from "reconnecting in backoff" so it never resets a growing
+    /// backoff (which used to hammer Dhan while a client id was rate-limited).
+    Link {
+        up: bool,
+    },
+    /// A websocket Ping from Dhan (sent every ~10s). It carries no market data
+    /// but proves the socket is alive even when the market is closed and no ticks
+    /// flow, so the broker stays quiet instead of tearing the connection down.
+    Heartbeat,
     Unknown {
         code: u8,
         len: usize,
@@ -465,6 +484,14 @@ impl MarketFeed {
         mut cmd_rx: mpsc::UnboundedReceiver<FeedCommand>,
     ) {
         let mut subs = self.subscriptions.clone();
+        // A duplicated (security_id, segment) makes Dhan reject/reset the whole
+        // subscribe batch, so collapse the set once before it is ever sent.
+        {
+            let mut seen = std::collections::HashSet::new();
+            subs.retain(|s| {
+                seen.insert(format!("{:?}:{}", s.exchange_segment, s.security_id))
+            });
+        }
         // Log shape (never the value) so we can tell a well-formed JWT from a
         // truncated/garbled paste, and spot an over-long handshake URL.
         let special: std::collections::BTreeSet<char> = self
@@ -495,6 +522,9 @@ impl MarketFeed {
                 Ok(()) => return, // tx closed / shutdown requested
                 Err(e) => {
                     tracing_feed(&format!("feed error: {e}; reconnecting in {backoff}s"));
+                    // Tell the broker the socket is down so its watchdog treats
+                    // this as "reconnecting in backoff" and leaves it alone.
+                    let _ = tx.send(FeedPacket::Link { up: false }).await;
                     // Sleep in short slices so a stop request cancels the wait
                     // promptly instead of after a full 90s backoff.
                     let mut left = backoff;
@@ -534,20 +564,38 @@ impl MarketFeed {
         let (ws, _resp) = tokio_tungstenite::connect_async(req)
             .await
             .map_err(feed_error)?;
-        // The handshake succeeded, so the previous failure (if any) is over.
-        // Reset the backoff here, not after a full session, so a socket that
-        // runs fine for hours and then drops reconnects in 2s instead of
-        // inheriting a 90s wait from an old failure streak.
-        *backoff = 2;
+        // Backoff is deliberately NOT reset here: Dhan can accept the handshake
+        // and then immediately reset the socket (client-id block or connection
+        // slot limit). Resetting on every handshake made a blocked feed reconnect
+        // every 2s forever, which kept hammering Dhan so the block never cleared.
+        // It is reset below, once real market data actually arrives.
         let (mut write, mut read) = ws.split();
+        let mut got_data = false;
 
+        // Let the freshly-upgraded socket settle before the first subscribe, then
+        // send the <=100-instrument batches with a gap: Dhan resets a connection
+        // that is hit with the whole set in one burst.
+        tokio::time::sleep(SUBSCRIBE_SETTLE).await;
+        let mut first = true;
         for msg in subscribe_grouped(subs) {
+            if !first {
+                tokio::time::sleep(SUBSCRIBE_PACE).await;
+            }
+            first = false;
             write
                 .send(Message::Text(msg))
                 .await
                 .map_err(|e| DhanError::WebSocket(e.to_string()))?;
         }
         tracing_feed(&format!("feed connected; {} instruments subscribed", subs.len()));
+        let _ = tx.send(FeedPacket::Link { up: true }).await;
+
+        // Proactive keepalive: Dhan pings us, but we also ping it so liveness
+        // does not depend on the exchange's cadence. A quiet holiday market then
+        // stays demonstrably alive instead of being torn down as "silent".
+        let mut keepalive = tokio::time::interval(Duration::from_secs(5));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        keepalive.tick().await; // consume the immediate first tick
 
         loop {
             tokio::select! {
@@ -566,6 +614,12 @@ impl MarketFeed {
                                         disconnect_reason(*code)
                                     ));
                                 }
+                                // Real data arrived, so this connection is
+                                // genuinely working: safe to reset the backoff.
+                                if !stop && !got_data {
+                                    *backoff = 2;
+                                    got_data = true;
+                                }
                                 if tx.send(pkt).await.is_err() {
                                     let _ = write.send(Message::Text(disconnect_message())).await;
                                     return Ok(());
@@ -577,6 +631,13 @@ impl MarketFeed {
                         }
                         Message::Ping(payload) => {
                             let _ = write.send(Message::Pong(payload)).await;
+                            // Surface liveness so a quiet-but-open socket (closed
+                            // market) is not mistaken for a stall.
+                            let _ = tx.send(FeedPacket::Heartbeat).await;
+                        }
+                        Message::Pong(_) => {
+                            // Reply to our own keepalive ping: the socket is alive.
+                            let _ = tx.send(FeedPacket::Heartbeat).await;
                         }
                         Message::Text(text) => {
                             // The feed only sends binary data packets; a text frame is a
@@ -620,7 +681,12 @@ impl MarketFeed {
                                 }
                             }
                             if !added.is_empty() {
+                                let mut first = true;
                                 for msg in subscribe_grouped(&added) {
+                                    if !first {
+                                        tokio::time::sleep(SUBSCRIBE_PACE).await;
+                                    }
+                                    first = false;
                                     write.send(Message::Text(msg)).await
                                         .map_err(|e| DhanError::WebSocket(e.to_string()))?;
                                 }
@@ -629,7 +695,12 @@ impl MarketFeed {
                         }
                         Some(FeedCommand::Unsubscribe(old)) => {
                             subs.retain(|e| !old.iter().any(|o| Self::same(e, o)));
+                            let mut first = true;
                             for msg in unsubscribe_grouped(&old) {
+                                if !first {
+                                    tokio::time::sleep(SUBSCRIBE_PACE).await;
+                                }
+                                first = false;
                                 write.send(Message::Text(msg)).await
                                     .map_err(|e| DhanError::WebSocket(e.to_string()))?;
                             }
@@ -644,6 +715,11 @@ impl MarketFeed {
                             let _ = write.close().await;
                             return Ok(());
                         }
+                    }
+                }
+                _ = keepalive.tick() => {
+                    if let Err(e) = write.send(Message::Ping(Vec::new())).await {
+                        return Err(DhanError::WebSocket(format!("keepalive ping failed: {e}")));
                     }
                 }
             }

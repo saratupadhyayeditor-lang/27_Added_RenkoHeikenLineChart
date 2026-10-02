@@ -281,19 +281,27 @@ export function bootConnection() {
         const mktOpen = isMarketOpen(nowSec());
         const parts = [];
         let stale = false;
-        if (d.last_tick_age_sec != null) {
-          stale = mktOpen && d.last_tick_age_sec > AUTO_RESET_STALE_SEC;
+        // Liveness, not just trade ticks: on a holiday / off-hours the market
+        // sends no ticks, but Dhan + our keepalive ping keep the socket alive.
+        // A fresh heartbeat must therefore never count as "stale" - treating it
+        // as stale is what made Auto Reset stop the feed and show a disconnect.
+        const actAge =
+          d.last_activity_age_sec != null ? d.last_activity_age_sec : d.last_tick_age_sec;
+        if (actAge != null) {
+          stale = mktOpen && actAge > AUTO_RESET_STALE_SEC;
           const color = !mktOpen
             ? "#888"
-            : d.last_tick_age_sec < 10
+            : actAge < 10
             ? "#00d4aa"
-            : d.last_tick_age_sec < 45
+            : actAge < 45
             ? "#ff9800"
             : "#ef5350";
-          parts.push('<span style="color:' + color + '">tick ' + d.last_tick_age_sec + "s ago</span>");
+          const label =
+            d.last_tick_age_sec != null && d.last_tick_age_sec < 15 ? "tick" : "link";
+          parts.push('<span style="color:' + color + '">' + label + ' ' + actAge + "s ago</span>");
         } else {
           stale = mktOpen;
-          parts.push('<span style="color:' + (mktOpen ? "#ef5350" : "#888") + '">no ticks</span>');
+          parts.push('<span style="color:' + (mktOpen ? "#ef5350" : "#888") + '">no data</span>');
         }
         if (!mktOpen) parts.push('<span style="color:#888">market closed</span>');
         if (d.subscribed != null) parts.push(d.subscribed + " subscribed");
@@ -308,7 +316,11 @@ export function bootConnection() {
         // streamed on (the case that used to need repeated Connect taps).
         const btn = $("connectBtn");
         const connected = btn && btn.textContent.indexOf("Connected") !== -1;
-        const notStreaming = d.feed_up === false;
+        // Only treat "not streaming" as broken if the socket is also silent;
+        // an alive socket with fresh heartbeats must not trigger a restart loop.
+        const notStreaming =
+          d.feed_up === false &&
+          (d.last_activity_age_sec == null || d.last_activity_age_sec > 30);
         if (
           (d.ws_running === false || notStreaming) &&
           d.reconnect_parked_sec <= 0 &&

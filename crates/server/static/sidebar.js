@@ -445,10 +445,9 @@ export function bootSidebar(api) {
   }
 
   function render() {
-    // While the feed is not live, keep the last fetched LTP / day-change frozen
-    // on screen (no repaint from cached, REST or daily-candle data). Painting
-    // resumes on the next tick once the link is live again.
-    if (window.__feedDown) return;
+    // Repaint whenever fresh quotes arrive. The live feed pushes ticks, and the
+    // REST fallback (see pollRestFallback) rebroadcasts Dhan REST quotes on /ws
+    // while the feed is rate-limited, so the day-change column keeps moving.
     const qm = state.quotes;
     publishSelection(qm);
     const sel = $("symbolSelect");
@@ -605,6 +604,31 @@ export function bootSidebar(api) {
     // Newly added watchlist rows / option strikes are announced over the same
     // socket; a light 2s resend keeps the feed's subscription set in sync.
     state.pollTimer = setInterval(sendSubscription, 2000);
+    // REST fallback for Dhan feed outages / rate-limit blocks: while the live
+    // link is down, ask the server to refresh these securities from Dhan's REST
+    // quote API. The server rebroadcasts them on /ws, so both the sidebar's
+    // day-change column and the chart's forming candle keep updating (slower
+    // than ticks, but live) instead of freezing until the feed returns.
+    state.restTimer = setInterval(pollRestFallback, 3000);
+  }
+
+  async function pollRestFallback() {
+    if (!window.__feedDown) return;
+    const secs = securitiesList();
+    // Include whatever the chart is showing so its forming candle also refreshes
+    // from the REST broadcast, not just the watchlist rows.
+    const cs = window.__chartSelection;
+    if (cs && cs.id) secs.push({ security_id: cs.id, exchange_segment: cs.exch });
+    if (!secs.length) return;
+    try {
+      await fetch("/api/quotes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ securities: secs }),
+      });
+    } catch (e) {
+      /* transient; the next tick retries */
+    }
   }
 
   // -------------------------------------------------------------------------

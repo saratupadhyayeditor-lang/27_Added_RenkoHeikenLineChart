@@ -36,15 +36,38 @@ struct Session {
     client_id: String,
 }
 
+/// Consecutive feed socket failures that trip the circuit-breaker.
+const MAX_FAIL_STREAK: u32 = 5;
+/// Quiet period (seconds) the circuit-breaker parks the feed for so Dhan can
+/// clear a rate-limit block instead of being hammered every few seconds.
+const LONG_PARK_SECS: u64 = 300;
+
 #[derive(Default)]
 struct FeedHealth {
     ws_running: bool,
     feed_up: bool,
     subscribed: usize,
     last_tick: Option<Instant>,
+    /// Last time ANY frame arrived on the socket (a trade packet, a PrevClose/OI
+    /// packet, or a websocket heartbeat). Dhan pings every ~10s, so this stays
+    /// fresh for a live socket even when the market is closed and no ticks flow.
+    /// The watchdog uses this, not `last_tick`, to decide a socket is stalled.
+    last_activity: Option<Instant>,
     /// When the current feed supervisor last (re)started. Lets the watchdog tell
     /// a socket that has simply not ticked yet from one that has gone silent.
     feed_started: Option<Instant>,
+    /// True while the supervisor currently holds an open, handshaken socket that
+    /// has not dropped yet. Stays false during reconnect backoff, so the
+    /// watchdog can avoid resetting a growing backoff.
+    socket_open: bool,
+    /// When the current socket was opened (for the connected-but-silent check).
+    connected_at: Option<Instant>,
+    /// Consecutive dropped/failed sockets since the last successful stream. When
+    /// Dhan rate-limits the client id it accepts a handshake, sends a packet or
+    /// two and then goes silent, so a naive reconnect flaps every few seconds and
+    /// keeps the block alive. Past a small threshold the consumer parks the feed
+    /// for a long quiet period instead of hammering (see `LONG_PARK`).
+    fail_streak: u32,
     parked_until: Option<Instant>,
     ws_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -78,6 +101,9 @@ impl FeedHealth {
             "subscribed": self.subscribed,
             "persist": self.subscribed,
             "last_tick_age_sec": age,
+            "last_activity_age_sec": self
+                .last_activity
+                .map(|t| (t.elapsed().as_secs_f64() * 10.0).round() / 10.0),
             "feed_started_age_sec": self
                 .feed_started
                 .map(|t| t.elapsed().as_secs_f64())
@@ -119,6 +145,13 @@ pub struct DhanState {
     /// strikes are added with a subscribe message instead of reopening the
     /// socket (Dhan allows only a handful of concurrent feeds).
     feed_tx: Arc<Mutex<Option<mpsc::UnboundedSender<FeedCommand>>>>,
+    /// Serialises `spawn_feed_task`. Two triggers (the watchdog and the browser's
+    /// reconnect nudge) can fire at once and run on different runtime threads;
+    /// without this lock both opened a supervisor, the second overwrote the first
+    /// task handle (so the first was never aborted) and the account ended up with
+    /// two concurrent Dhan feeds - exactly what trips Dhan's per-account
+    /// connection cap and yields "client id is blocked" 429s.
+    feed_spawn_lock: Arc<Mutex<()>>,
     /// Previous-session close per quote key, seeded from the REST quote API and
     /// the daily-candle backfill. Dhan's feed never sends a PrevClose packet, so
     /// the live loop reads this map to compute a real change / change_pct on
@@ -155,6 +188,7 @@ impl DhanState {
                 Instant::now() - Duration::from_secs(5),
             )),
             feed_tx: Arc::new(Mutex::new(None)),
+            feed_spawn_lock: Arc::new(Mutex::new(())),
             closes: Arc::new(Mutex::new(HashMap::new())),
             candle_cache: Arc::new(Mutex::new(HashMap::new())),
             last_user: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
@@ -605,14 +639,37 @@ impl DhanState {
         if groups.is_empty() {
             return None;
         }
-        self.throttle().await;
-        let resp = match client.market_feed_quote(&groups).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("Dhan market quote failed (segments={:?}): {e}", groups.keys());
-                return None;
+        // Dhan caps `/marketfeed/quote` at 1000 security ids per request
+        // ("Requested Number of SecurityId Limit exceeded"). A loaded option
+        // chain easily exceeds that, so split each segment into <=1000-id
+        // batches and merge the responses instead of failing the whole call.
+        const QUOTE_CHUNK: usize = 1000;
+        let mut resp: dhan_hq::MarketFeedResponse = std::collections::BTreeMap::new();
+        let mut any_ok = false;
+        for (seg, ids) in &groups {
+            for chunk in ids.chunks(QUOTE_CHUNK) {
+                self.throttle().await;
+                let one: dhan_hq::SegmentInstruments =
+                    std::iter::once((seg.clone(), chunk.to_vec())).collect();
+                match client.market_feed_quote(&one).await {
+                    Ok(r) => {
+                        any_ok = true;
+                        for (s, m) in r {
+                            resp.entry(s).or_default().extend(m);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Dhan market quote failed (segment={seg}, n={}): {e}",
+                            chunk.len()
+                        );
+                    }
+                }
             }
-        };
+        }
+        if !any_ok {
+            return None;
+        }
         let now = now_secs();
         let mut out: HashMap<String, Value> = HashMap::new();
         for (sid, exch) in secs {
@@ -1136,6 +1193,13 @@ impl DhanState {
     }
 
     async fn spawn_feed_task(&self, creds: Session) {
+        // Serialise the whole stop-then-spawn so two concurrent callers cannot
+        // each leave a live supervisor behind (see `feed_spawn_lock`). There is
+        // no await inside this method, so a std mutex guard is safe.
+        let _spawn_guard = self
+            .feed_spawn_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Single-flight: never let two supervisors run at once. Each one holds a
         // Dhan websocket slot, and Dhan caps concurrent feeds per account, so a
         // stray old supervisor makes the next connect come back rejected.
@@ -1180,6 +1244,8 @@ impl DhanState {
             g.ws_running = false;
             g.feed_up = false;
             g.feed_started = None;
+            g.socket_open = false;
+            g.connected_at = None;
         }
     }
 
@@ -1200,6 +1266,28 @@ impl DhanState {
                 .unwrap_or(false);
         }
         false
+    }
+
+    /// Counts one feed failure and trips the circuit-breaker once too many
+    /// happen in a row. Returns true when it parked the feed, so the caller must
+    /// NOT respawn immediately - the watchdog re-spawns only after the park.
+    fn note_feed_failure(&self) -> bool {
+        if let Ok(mut g) = self.health.lock() {
+            g.fail_streak = g.fail_streak.saturating_add(1);
+            if g.fail_streak >= MAX_FAIL_STREAK {
+                g.parked_until = Some(Instant::now() + Duration::from_secs(LONG_PARK_SECS));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Clears the failure streak after the watchdog observes a genuinely
+    /// streaming socket (so an occasional drop on a healthy feed never trips it).
+    fn clear_feed_streak(&self) {
+        if let Ok(mut g) = self.health.lock() {
+            g.fail_streak = 0;
+        }
     }
 
     /// Background watchdog: if a session exists but no supervisor is alive
@@ -1224,6 +1312,13 @@ impl DhanState {
                     continue;
                 };
                 if !st.feed_running() {
+                    if st.note_feed_failure() {
+                        tracing::warn!(
+                            "feed circuit-breaker: supervisor gone repeatedly, parking {}s",
+                            LONG_PARK_SECS
+                        );
+                        continue;
+                    }
                     if let Ok(mut g) = st.health.lock() {
                         g.parked_until = None;
                     }
@@ -1238,18 +1333,38 @@ impl DhanState {
                 if !market_open_now() {
                     continue;
                 }
-                let silent = st.health.lock().ok().map(|g| {
-                    if g.feed_up {
-                        g.last_tick
-                            .map(|t| t.elapsed() > Duration::from_secs(25))
-                            .unwrap_or(false)
-                    } else {
-                        g.feed_started
-                            .map(|t| t.elapsed() > Duration::from_secs(30))
-                            .unwrap_or(false)
+                let (silent, healthy) = st
+                    .health
+                    .lock()
+                    .map(|g| {
+                        let fresh = g.feed_up
+                            && g.last_tick
+                                .map(|t| t.elapsed() < Duration::from_secs(25))
+                                .unwrap_or(false);
+                        // A socket that has streamed but then received NOTHING at
+                        // all for a while is a stall. Crucially this watches any
+                        // frame (heartbeat / PrevClose / OI), not just trade ticks:
+                        // on a closed holiday the market is quiet yet Dhan keeps
+                        // pinging every ~10s, so a live socket never looks stalled.
+                        let silent = g.feed_up
+                            && g.last_activity
+                                .map(|t| t.elapsed() > Duration::from_secs(45))
+                                .unwrap_or(false);
+                        (silent, fresh)
+                    })
+                    .unwrap_or((false, false));
+                if healthy {
+                    st.clear_feed_streak();
+                }
+                if silent {
+                    if st.note_feed_failure() {
+                        tracing::warn!(
+                            "feed circuit-breaker: repeated silent sockets, parking {}s",
+                            LONG_PARK_SECS
+                        );
+                        st.stop_feed();
+                        continue;
                     }
-                });
-                if silent == Some(true) {
                     tracing::warn!("feed watchdog: socket alive but silent, restarting");
                     st.spawn_feed_task(session).await;
                 }
@@ -1400,6 +1515,11 @@ pub async fn connect(
     match client.profile().await {
         Ok(profile) => {
             st.set_auth_error(None);
+            // A fresh login is a clean slate: clear any accumulated failure streak
+            // so the circuit-breaker does not immediately re-park the new session.
+            if let Ok(mut g) = st.health.lock() {
+                g.fail_streak = 0;
+            }
             let id = if profile.dhan_client_id.is_empty() {
                 client_id.to_string()
             } else {
@@ -1451,10 +1571,22 @@ pub async fn feed_status(State(st): State<DhanState>) -> impl IntoResponse {
     // Derive the single link state the UI reacts to (popups + auto reconnect).
     let (feed_up, ws_running, age, started) = {
         let o = snap.as_object();
+        let tick_age = o.and_then(|o| o.get("last_tick_age_sec")).and_then(|v| v.as_f64());
+        let activity_age = o
+            .and_then(|o| o.get("last_activity_age_sec"))
+            .and_then(|v| v.as_f64());
+        // Liveness for the UI: a socket kept alive by Dhan's heartbeats (every
+        // ~10-15s) counts as streaming even when the market is quiet and trade
+        // ticks are sparse (holiday / off-hours), so the header does not flicker
+        // to a false "down" while the connection is actually healthy.
+        let age = match (tick_age, activity_age) {
+            (Some(t), Some(a)) => Some(t.min(a)),
+            (t, a) => t.or(a),
+        };
         (
             o.and_then(|o| o.get("feed_up")).and_then(|v| v.as_bool()).unwrap_or(false),
             o.and_then(|o| o.get("ws_running")).and_then(|v| v.as_bool()).unwrap_or(false),
-            o.and_then(|o| o.get("last_tick_age_sec")).and_then(|v| v.as_f64()),
+            age,
             o.and_then(|o| o.get("feed_started_age_sec")).and_then(|v| v.as_f64()),
         )
     };
@@ -1473,7 +1605,13 @@ pub async fn feed_reset(State(st): State<DhanState>) -> impl IntoResponse {
     st.stop_feed();
     if let Ok(mut g) = st.health.lock() {
         g.last_tick = None;
-        g.parked_until = Some(Instant::now() + Duration::from_secs(COOLDOWN));
+        // Never shorten an already-running (circuit-breaker) park: the browser's
+        // automatic reset repeatedly calls this, and shortening it would defeat
+        // the long quiet period Dhan needs to clear the rate limit.
+        let until = Instant::now() + Duration::from_secs(COOLDOWN);
+        if !g.parked_until.map(|u| u > until).unwrap_or(false) {
+            g.parked_until = Some(until);
+        }
     }
     Json(json!({
         "status": "success",
@@ -1486,8 +1624,26 @@ pub async fn feed_restart(State(st): State<DhanState>) -> (StatusCode, Json<Valu
     let sess = st.session.read().await.clone();
     match sess {
         Some(s) => {
-            if let Ok(mut g) = st.health.lock() {
-                g.parked_until = None;
+            // This endpoint is also the browser's automatic nudge. Two cases
+            // must NOT tear the supervisor down:
+            //  * an active cooldown is deliberate (/api/feed/reset parks the
+            //    feed so Dhan releases the connection slot). Clearing it here
+            //    reopened the socket mid-cooldown and immediately re-tripped the
+            //    block, so the cooldown could never complete.
+            //  * a supervisor is already alive - it reconnects on its own with a
+            //    growing backoff. Respawning resets that backoff to 2s and hammers
+            //    Dhan, which is what kept the client id blocked.
+            if st.park_active() {
+                return (
+                    StatusCode::OK,
+                    Json(json!({"status":"success","message":"Feed cooling down; leaving it parked"})),
+                );
+            }
+            if st.feed_running() {
+                return (
+                    StatusCode::OK,
+                    Json(json!({"status":"success","message":"Feed already running"})),
+                );
             }
             st.start_feed(s).await;
             (
@@ -1661,6 +1817,8 @@ async fn run_feed(
         // false until the first packet arrives - a spawned task that is stuck
         // reconnecting must not look healthy.
         g.feed_up = false;
+        g.socket_open = false;
+        g.connected_at = None;
         g.feed_started = Some(Instant::now());
         g.subscribed = count;
     }
@@ -1679,9 +1837,57 @@ async fn run_feed(
             maybe = rx.recv() => {
                 let Some(pkt) = maybe else { break };
                 let now = now_secs();
+                // Link is a control signal, not market data: it must not mark
+                // the feed as "up"/fresh (that made a socket stuck in reconnect
+                // backoff look live and masked the outage).
+                if let FeedPacket::Link { up } = pkt {
+                    let mut park_long = false;
+                    if let Ok(mut g) = health.lock() {
+                        g.socket_open = up;
+                        if up {
+                            g.connected_at = Some(Instant::now());
+                        } else {
+                            g.feed_up = false;
+                            g.fail_streak = g.fail_streak.saturating_add(1);
+                            if g.fail_streak >= MAX_FAIL_STREAK {
+                                g.parked_until =
+                                    Some(Instant::now() + Duration::from_secs(LONG_PARK_SECS));
+                                park_long = true;
+                            }
+                        }
+                    }
+                    if park_long {
+                        tracing::warn!(
+                            "feed circuit-breaker: {} consecutive failures, parking {}s so Dhan can clear the rate limit",
+                            MAX_FAIL_STREAK,
+                            LONG_PARK_SECS
+                        );
+                        // End this supervisor; the watchdog re-spawns only after
+                        // the park expires, giving Dhan a real quiet window.
+                        break;
+                    }
+                    continue;
+                }
+                // Only a real trade packet counts as "the feed is streaming". A
+                // PrevClose / OI / MarketStatus packet is sent even on a closed
+                // market, so treating those as ticks made a holiday socket look
+                // live and then "stall" 25s later, churning the connection.
+                let is_live_tick = matches!(
+                    &pkt,
+                    FeedPacket::Ticker { .. }
+                        | FeedPacket::Quote { .. }
+                        | FeedPacket::Full { .. }
+                );
+                if is_live_tick {
+                    if let Ok(mut g) = health.lock() {
+                        g.last_tick = Some(Instant::now());
+                        g.feed_up = true;
+                    }
+                }
+                // Any frame (trade tick, PrevClose/OI snapshot, or a later
+                // heartbeat) proves the socket is alive.
                 if let Ok(mut g) = health.lock() {
-                    g.last_tick = Some(Instant::now());
-                    g.feed_up = true;
+                    g.last_activity = Some(Instant::now());
                 }
                 match pkt {
                     FeedPacket::PrevClose { segment, security_id, prev_close, .. } => {
@@ -1748,6 +1954,9 @@ async fn run_feed(
                         }
                     }
                     FeedPacket::MarketStatus { .. } => {}
+                    FeedPacket::Heartbeat => {
+                        // Liveness only; `last_activity` was already refreshed.
+                    }
                     FeedPacket::Disconnect { .. } => {
                         // Dhan closes long-lived sockets periodically and the
                         // inner `MarketFeed` supervisor reconnects on its own
@@ -1760,6 +1969,9 @@ async fn run_feed(
                         if let Ok(mut g) = health.lock() {
                             g.feed_up = false;
                         }
+                    }
+                    FeedPacket::Link { .. } => {
+                        // Handled above (it is not market data).
                     }
                     FeedPacket::Unknown { .. } => {}
                 }
@@ -1776,6 +1988,8 @@ async fn run_feed(
         g.ws_running = false;
         g.feed_up = false;
         g.feed_started = None;
+        g.socket_open = false;
+        g.connected_at = None;
     }
 }
 

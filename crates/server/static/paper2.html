@@ -3,40 +3,43 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Paper Trade - Dhan Algo</title>
+<title>Paper Trade 2 - Dhan Algo</title>
 <link rel="stylesheet" href="./app.css?v=14">
 <style>
   body { display: flex; flex-direction: column; height: 100%; }
   .paper-banner {
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-    padding: 6px 10px; background: #1a1030; border-bottom: 1px solid #4a2d7e;
-    font-size: 11px; color: #c4a9ff;
+    padding: 6px 10px; background: #102030; border-bottom: 1px solid #2d5a7e;
+    font-size: 11px; color: #a9d0ff;
   }
-  .paper-banner b { color: #e6d9ff; letter-spacing: .3px; }
-  .paper-banner span { color: #9a86c8; }
+  .paper-banner b { color: #d9ecff; letter-spacing: .3px; }
+  .paper-banner span { color: #86a8c8; }
   .tab-content { flex: 1 1 auto; height: auto; min-height: 0; display: block; }
   #tab-realtime { overflow-y: auto; }
 </style>
 </head>
 <body data-tab="papertrade">
 <div class="paper-banner">
-  <b>Paper Trade</b>
-  <span>The AI Smart Trading engine runs on the live Dhan feed with simulated execution: entries, exits, margin and P&amp;L are booked locally - no real orders are ever sent.</span>
+  <b>Paper Trade 2</b>
+  <span>Independent paper engine: live Dhan feed ke saath simulated execution. Iska apna settings, strategies, positions aur P&amp;L book hai - Paper Trade (tab 1) se koi data share nahi hota. Koi real order nahi jata.</span>
 </div>
 <div class="tab-content" id="tab-realtime"></div>
 
 <script>
-  // Tell the shared realtime module it is rendering inside the Paper frame so
-  // its operator-facing wording (engine toggle, square-off, status pill) says
+  // Tell the shared realtime module it is rendering inside a Paper frame so its
+  // operator-facing wording (engine toggle, square-off, status pill) says
   // "simulated" instead of "LIVE Dhan orders".
   window.__PAPER__ = true;
-  // Route every /api/rt call made by the shared realtime UI to the paper engine
-  // (`/api/paper/*`), so the exact same pane logic drives the simulated book.
+  // This is the SECOND, fully independent paper engine: every shared-UI call is
+  // routed to `/api/paper2/*`, which persists to its own state file.
+  window.__PAPER_BASE__ = "/api/paper2";
+  // Route every /api/rt call made by the shared realtime UI to THIS paper engine
+  // (`/api/paper2/*`), so the exact same pane logic drives this simulated book.
   (function () {
     const orig = window.fetch.bind(window);
     window.fetch = function (u, o) {
       if (typeof u === "string" && u.indexOf("/api/rt") === 0) {
-        u = "/api/paper" + u.slice("/api/rt".length);
+        u = "/api/paper2" + u.slice("/api/rt".length);
       }
       return orig(u, o);
     };
@@ -57,8 +60,8 @@
     sync();
   })();
   // Bridge the main window's chart selection so "Use chart symbol" works inside
-  // the paper frame (same origin). Read on demand and re-dispatch when the parent
-  // announces a new chart selection so the order card re-prices live.
+  // this paper frame (same origin). Read on demand and re-dispatch when the
+  // parent announces a new chart selection so the order card re-prices live.
   (function () {
     try {
       Object.defineProperty(window, "__chartSelection", {
@@ -81,7 +84,7 @@
   bootRealtime();
   bootTextSize();
   const title = document.querySelector("#tab-realtime .rt-strip .rt-title");
-  if (title) title.textContent = "Paper Trade (Simulated)";
+  if (title) title.textContent = "Paper Trade 2 (Simulated)";
   // Paper-only controls: the simulated wallet + fill model. Each is a normal
   // `data-set` setting, so the shared pane reads the value back into the field
   // on every refresh and includes it in any full settings write. These settings

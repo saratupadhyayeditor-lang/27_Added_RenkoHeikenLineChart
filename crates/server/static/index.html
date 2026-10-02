@@ -31,6 +31,7 @@
       <button class="tab-btn" data-tab="account" title="Broker account - available balance, used margin, collateral, day P&amp;L, open positions and holdings (live Dhan account)">Account</button>
       <button class="tab-btn" data-tab="realtime" title="Realtime Trading Engine - executes REAL Dhan orders (no paper trades)">Realtime Trading Engine</button>
       <button class="tab-btn" data-tab="papertrade" title="Paper Trade - same AI Smart engine on live Dhan data, simulated execution (no real orders)">Paper Trade</button>
+      <button class="tab-btn" data-tab="papertrade2" title="Paper Trade 2 - independent paper engine with its own strategies, settings and simulated book; shares no data with Paper Trade">Paper Trade 2</button>
       <button class="tab-btn" data-tab="rtstats" title="Realtime Market Trade Stats - executed-trades report for the Realtime Trading Engine (real orders)">Realtime Market Trade Stats</button>
       <button class="tab-btn" data-tab="paperstats" title="Trade Stats - executed-trades report across the paper engines (simulated fills)">Trade Stats</button>
       <button class="tab-btn" data-tab="backup" title="Backup &amp; Restore - complete algo system backup (all tabs, engine settings, templates, strategies, P&amp;L records, monitor lists)">Backup &amp; Restore</button>
@@ -152,7 +153,10 @@
       </div>
     </div>
     <div class="tab-content" id="tab-papertrade">
-      <iframe class="paper-frame" data-src="./paper.html?v=57" title="Paper Trade (simulated engine)"></iframe>
+      <iframe class="paper-frame" data-src="./paper.html?v=59" title="Paper Trade (simulated engine)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-papertrade2">
+      <iframe class="paper-frame" data-src="./paper2.html?v=2" title="Paper Trade 2 (independent simulated engine)"></iframe>
     </div>
     <div class="tab-content" id="tab-rtstats"></div>
     <div class="tab-content" id="tab-paperstats">
@@ -250,9 +254,9 @@
 <script src="./vendor/chart.umd.min.js"></script>
 <script type="module">
   import init, { select_symbol, update_oc_quotes, open_option_chart_by_sid, set_oi_trend_enabled, set_trade_lines, clear_trade_lines } from "./pkg/algo_web.js?v=57";
-  import { bootSidebar } from "./sidebar.js?v=18";
-  import { bootConnection } from "./connection.js?v=10";
-  import { bootRealtime } from "./realtime.js?v=98";
+  import { bootSidebar } from "./sidebar.js?v=19";
+  import { bootConnection } from "./connection.js?v=11";
+  import { bootRealtime } from "./realtime.js?v=103";
   import { bootRtStats } from "./rtstats.js?v=6";
   import { bootBackup } from "./backup.js?v=3";
   import { bootAccount } from "./account.js?v=2";
@@ -298,20 +302,21 @@
     pane.querySelectorAll("iframe[data-src]").forEach((frame) => {
       if (!frame.getAttribute("src")) frame.setAttribute("src", frame.getAttribute("data-src"));
     });
-    // Push the current chart selection to the paper pane so its order card is
-    // priced off the symbol the user is viewing.
-    if (t === "papertrade" && pane.querySelector("iframe")) postChartSelection();
+    // Push the current chart selection to the paper panes so their order cards
+    // are priced off the symbol the user is viewing.
+    if ((t === "papertrade" || t === "papertrade2") && pane.querySelector("iframe")) postChartSelection();
   });
-  // Bridge the main window's live chart selection into the paper frame. The
-  // paper page reads window.__chartSelection on demand, so a re-dispatch is
-  // enough to make it re-price without reloading the frame.
+  // Bridge the main window's live chart selection into BOTH paper frames. The
+  // paper pages read window.__chartSelection on demand, so a re-dispatch is
+  // enough to make them re-price without reloading.
   function postChartSelection() {
-    const f = document.querySelector("#tab-papertrade iframe");
-    try { if (f && f.contentWindow) f.contentWindow.postMessage({ type: "chartselection" }, "*"); } catch (_) {}
+    document.querySelectorAll("#tab-papertrade iframe, #tab-papertrade2 iframe").forEach((f) => {
+      try { if (f && f.contentWindow) f.contentWindow.postMessage({ type: "chartselection" }, "*"); } catch (_) {}
+    });
   }
   window.addEventListener("chartselection", postChartSelection);
-  document.querySelectorAll("#tab-papertrade iframe, #tab-paperstats iframe").forEach((f) => {
-    f.addEventListener("load", () => { if (f.closest("#tab-papertrade")) postChartSelection(); });
+  document.querySelectorAll("#tab-papertrade iframe, #tab-papertrade2 iframe, #tab-paperstats iframe").forEach((f) => {
+    f.addEventListener("load", () => { if (f.closest("#tab-papertrade, #tab-papertrade2")) postChartSelection(); });
   });
   // Old-app global name for the option-premium chart opener (used by the
   // strategies/paper-trade modules).
@@ -337,7 +342,7 @@
       instrument: info.instrument || info.inst || "",
       label: info.tradingSymbol || info.label || info.name || String(sid),
     };
-    window.__rtChartOverlay = { paper: !!info.paper };
+    window.__rtChartOverlay = { paper: !!info.paper, base: info.paperBase || (info.paper ? "/api/paper" : "/api/rt") };
     chartLinesKey = "";
     // Show the chart tab before loading, so the canvas is measured against its
     // real, visible size instead of the hidden tab's zero-width container.
@@ -362,7 +367,7 @@
       const tab = document.getElementById("tab-chart");
       if (!tab || !tab.classList.contains("active")) return;
       const ov = window.__rtChartOverlay || {};
-      const base = ov.paper ? "/api/paper" : "/api/rt";
+      const base = ov.base || (ov.paper ? "/api/paper" : "/api/rt");
       const url = base + "/chart-lines?securityId=" + encodeURIComponent(t.securityId) +
         "&exchangeSegment=" + encodeURIComponent(t.exchangeSegment || "");
       fetch(url).then(r => r.json()).then(d => {

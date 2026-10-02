@@ -174,6 +174,7 @@ async fn main() {
     scrip::spawn_warm();
     let rt = RealtimeState::new(dhan.clone());
     let paper_rt = RealtimeState::new_paper(dhan.clone());
+    let paper2_rt = RealtimeState::new_paper2(dhan.clone());
     let state = AppState { dhan, rt };
 
     let app = Router::new()
@@ -210,6 +211,7 @@ async fn main() {
         .merge(realtime::router::<AppState>())
         .with_state(state)
         .merge(realtime::paper_router().with_state(paper_rt))
+        .merge(realtime::paper2_router().with_state(paper2_rt))
         .fallback_service(ServeDir::new(static_dir).fallback(index))
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::header::CACHE_CONTROL,

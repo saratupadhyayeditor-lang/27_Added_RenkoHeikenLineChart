@@ -1015,6 +1015,7 @@ function shell() {
           <span style="color:#c4a9ff;font-weight:700;font-size:12px;white-space:nowrap">Engine controls:</span>
           <span class="rtom-f" title="Live available balance (paper me virtual wallet, real me Dhan funds). Ye read-only hai.">Available balance <b id="rtEngAvailBal" style="color:#00d4aa">--</b></span>
           <label class="rtom-f" title="Available balance ka itna % margin budget ke roop me use hoga (locked across running trades). 0% = margin gate off, 100% = poora balance.">Margin to use <input type="number" data-set="marginPct" id="rtEngMarginPct" min="0" max="100" step="5" style="width:56px"> %</label>
+          <label class="rtom-f" title="ON: agar required margin available se zyada hai (ya margin cap / funds nahi), to signal turant SKIP ho jayega - wo tarde late/retry par KABHI nahi khulegi. OFF: purana behaviour (margin free hone par wahi signal baad me fill ho sakta hai)."><input type="checkbox" data-set="skipOnMarginBlock" style="accent-color:#00d4aa"> Skip if no margin (no late entry)</label>
           <label class="rtom-f"><input type="checkbox" data-set="slAuto"> SL auto (ATR-hunting-aware)</label>
           <label class="rtom-f"><input type="checkbox" data-set="tf1min"> 1 min</label>
           <label class="rtom-f"><input type="checkbox" data-set="tf5min"> 5 min</label>
@@ -1238,6 +1239,12 @@ function shell() {
         <label class="rtom-f" title="ON: NIFTY ka bullish/bearish side in confirmation indicators ke LINE COLOUR se decide hoga (green = rising = bullish, red = falling = bearish), last closed candle par, aur algo har 5 second me indicators ko scan karega. OFF: normal windowed trend read.">
           <input type="checkbox" data-set="niftyTrendColor" id="rtNiftyTrendColorCb" style="accent-color:#00d4aa"> Color based trend detection (green/red, 5s scan)
         </label>
+        <label class="rtom-f" style="color:#ffd700;font-weight:bold" title="Net-direction strict gate: jab ON ho, Top Gainers (CE) legs sirf tab banenge jab NIFTY ke assigned straight-line confirmation indicators ka NET direction bullish ho, aur Top Losers (PE) legs sirf tab jab net bearish ho. Mismatch ya tie (barabar) = us leg ko strictly block (majority / AI Brain bhi nahi bacha sakta). Yahi gate NIFTY-trend picks par bhi lagta hai. OFF = purana behaviour.">
+          <input type="checkbox" data-set="niftyNetStrict" id="rtNiftyNetStrictCb" style="accent-color:#ffd700"> Net direction strict gate (CE=bull, PE=bear)
+        </label>
+        <label class="rtom-f" style="color:#ffd700;font-weight:bold" title="All-lines-agree strict gate: jab ON ho, Top Gainers (CE) legs sirf tab banenge jab NIFTY ke assigned straight-line confirmation indicators me HAR line bullish (green) ho, aur Top Losers (PE) legs sirf tab jab HAR line bearish (red) ho. Ek bhi line ulti ya mixed = us leg ko strictly block. Yahi gate NIFTY-trend picks par bhi lagta hai. OFF = purana behaviour.">
+          <input type="checkbox" data-set="niftyAllAgreeStrict" id="rtNiftyAllAgreeStrictCb" style="accent-color:#ffd700"> All-lines-agree strict gate (every line must confirm)
+        </label>
       </div>
       <div id="rtNiftyTrendList" style="display:none;margin-top:4px;font-size:9px;color:#ccc;background:#12122a;border:1px solid #2d2d50;border-radius:4px;padding:6px 8px"></div>
 
@@ -1287,6 +1294,8 @@ function shell() {
       <div class="rt-engine-row" id="rtFilterRow" style="align-items:flex-start">
         <b class="rt-cap">Indicator filters:</b>
         <div style="flex-basis:100%;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+          <label class="rtom-f" style="color:#ffd700;font-weight:bold" title="Strict straight-line gate (Indicator-filters mode): scanner leg sirf tab execute hoga jab us side ke tick kiye gaye SAARE straight-line filters leg ki taraf hon - dono sections se: (1) 'Straight Line Indicators' ke line-trend/direction filters (Sl* + Volume line Vl), aur (2) 'Straight Line Indicator Color Detection' ke colour filters CE par GREEN / PE par RED. NOTE: NIFTY Trend Following ON hone par ye manual all-agree gate skip ho jata hai - opposite side ka strict block NIFTY ke ASSIGNED confirmation indicators (Net direction / All-lines-agree gated) se hota hai, taaki kuch ticked lines har stock par entry na rokein."><input type="checkbox" data-set="strictLineColor" id="rtStrictLineColorCb" style="accent-color:#ffd700"> Strict straight-line gate (CE=bull line, PE=bear line)</label>
+          <label class="rtom-f" style="color:#00d4aa;font-weight:bold" title="Ek strike par ek hi trade (fresh signal tak): ON karne par kisi bhi top gainer / top loser (ya NIFTY-trend) strike par ek bar trade execute hone ke baad, usi strike par dobara trade tabhi hoga jab us leg ki selected indicator-filter condition dobara meet ho (naya fresh signal). Gate lagataar true rahe ya position close hone ke turant baad re-entry ho - dono block. OFF = purana behaviour."><input type="checkbox" data-set="oncePerSignal" id="rtOncePerSignalCb" style="accent-color:#00d4aa"> Ek strike par ek trade (next fresh filter signal tak)</label>
           <label class="rtom-f"><input type="checkbox" data-set="allInOne"> All together (strict AND)</label>
           <label class="rtom-f"><input type="checkbox" data-set="dirGuard"> Direction Guard (no trade on opposite)</label>
           <label class="rtom-f"><input type="checkbox" data-set="overallDir"> Overall Bullish/Bearish idea</label>
@@ -1296,6 +1305,7 @@ function shell() {
           <label class="rtom-f">threshold <input type="number" data-set="brainThreshold" min="5" max="100" step="1" style="width:56px"> %</label>
           <label class="rtom-f" title="Opposite-side veto: Relative (default) = entry sirf tab veto hoti hai jab OPPOSITE side ke filters apni side se strictly zyada agree karein (kam se kam 1 filter aage). Barabar (tie) ya apni side aage ho to veto NAHI lagega, isliye symmetric Bull+Bear filter set dono side par deadlock nahi karega. OFF = koi opposite veto nahi, sirf apni side ka majority/strict/Brain rule.">Opposite veto
             <select data-set="oppositeVeto" style="width:180px"><option value="relative">Relative (stronger side wins)</option><option value="off">OFF</option></select></label>
+          <label class="rtom-f" style="color:#26a69a;font-weight:bold" title="Spot candle colour gate: ON karne par spot chart par chalne wali trade (strategy mode ya Indicator-filters mode) sirf tab execute hogi jab spot chart ki live FORMING candle trade ki direction me ho - Top Gainer (bullish / CE) ke liye GREEN candle, Top Loser (bearish / PE) ke liye RED candle. Galat colour par signal skip / held rehta hai (consume nahi hota), aur candle colour badalne par condition meet hone par trade execute ho jati hai. Doji (close = open) par bhi rukta hai. Execution ke exact waqt bhi dobara check hota hai. Manual orders par lagu nahi. Default OFF."><input type="checkbox" data-set="spotCandleGate" style="accent-color:#26a69a"> Spot candle gate (Gainer = green, Loser = red)</label>
         </div>
         <div id="rtBrainSummary" style="flex-basis:100%;font-size:9px;color:#b39ddb"></div>
         <div style="flex-basis:100%;display:flex;flex-wrap:wrap;gap:10px;align-items:flex-start">
@@ -3372,6 +3382,15 @@ function renderNiftyStatus() {
   const dir = nt.dir === 1 ? "BULLISH" : nt.dir === -1 ? "BEARISH" : "neutral";
   box.style.color = nt.dir === 1 ? "#00d4aa" : nt.dir === -1 ? "#ef5350" : "#ffd700";
   box.textContent = "Ensemble " + tfLabel + " -> " + dir;
+  // Surface the last committed flip so a trend change is visible even between
+  // snapshot ticks, not only as a momentary colour.
+  const fl = (STATE && STATE.niftyFlip) || {};
+  const flLabel = (v) => (v === 1 ? "BULL" : v === -1 ? "BEAR" : "NEUTRAL");
+  if (fl && fl.to != null && fl.at) {
+    const secs = Math.max(0, Math.round((Date.now() - fl.at) / 1000));
+    const ago = secs < 60 ? secs + "s" : Math.round(secs / 60) + "m";
+    box.textContent += "  - last flip " + flLabel(fl.from) + "->" + flLabel(fl.to) + " " + ago + " ago";
+  }
 }
 
 function renderRoutingStatus() {
@@ -3383,7 +3402,7 @@ function renderRoutingStatus() {
   const runLabel = (v) => (v === "both" ? "Both" : v === "premium" ? "Premium" : "Spot");
   if (checked("premiumOnly")) {
     box.style.color = "#ffd700";
-    box.textContent = "Premium chart only ON - every instrument runs AND trades on the option premium chart (run-in / trade-in choices locked)";
+    box.textContent = "Premium chart only ON - every instrument runs AND trades on the option premium chart (run-in / trade-in choices locked). Only BULLISH indicator filters apply, on both the CE and PE side.";
     return;
   }
   const run = "Run: indices " + runLabel(val("runIndex")) + ", F&O " + runLabel(val("runFno")) + ", commodities " + runLabel(val("runComm"));
@@ -3610,6 +3629,8 @@ function syncInterlocks() {
   dimRow("rtNiftyTrendConfIndSelect", !ntActive);
   dimRow("rtNiftyTrendConfIndAdd", !ntActive);
   dimRow("rtNiftyTrendColorCb", !ntActive);
+  dimRow("rtNiftyNetStrictCb", !ntActive);
+  dimRow("rtNiftyAllAgreeStrictCb", !ntActive);
 
   // --- Top Movers: independent of NIFTY trend-following. Both masters can be
   //     ON together and run side by side (they are connected), so there is no
@@ -3780,6 +3801,11 @@ function openChartForTrade(info) {
     instrument: info.instrument || info.inst || "",
     tradingSymbol: info.tradingSymbol || info.label || info.name || "",
     paper: !!window.__PAPER__,
+    // Engine base path for the parent's chart-overlay poller, so the second
+    // paper frame reads its own ledger (`/api/paper2`) instead of the first.
+    paperBase: window.__PAPER__
+      ? (window.__PAPER_BASE__ || "/api/paper")
+      : "/api/rt",
   };
   if (!payload.securityId) return;
   if (window.parent && window.parent !== window) {

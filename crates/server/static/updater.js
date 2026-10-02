@@ -18,7 +18,7 @@ const $ = (id) => document.getElementById(id);
 // Distribution repo baked into the desktop shell too (desktop/src/updater.rs).
 // Pre-filled so a fresh install can update with no manual repo setup.
 const DEFAULT_REPO =
-  "saratupadhyayeditor-lang/25_Added_ColorDetection_FixedPickedStrike";
+  "saratupadhyayeditor-lang/26_Added_PingTime5second";
 
 let booted = false;
 let logLines = [];

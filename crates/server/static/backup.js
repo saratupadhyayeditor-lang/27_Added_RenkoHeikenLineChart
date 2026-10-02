@@ -134,10 +134,15 @@ function gatherLS() {
  * capture both engines (real + paper) no matter which tab runs it. */
 function collectEngineState() {
   const grab = (url) => fetch(url).then(function (r) { return r.json(); }).catch(function () { return null; });
-  return Promise.all([grab("/api/rt/state/export"), grab("/api/paper/state/export")]).then(function (res) {
+  return Promise.all([
+    grab("/api/rt/state/export"),
+    grab("/api/paper/state/export"),
+    grab("/api/paper2/state/export"),
+  ]).then(function (res) {
     const engine = {};
     if (res[0] && res[0].ok && res[0].state) engine.realtime = res[0].state;
     if (res[1] && res[1].ok && res[1].state) engine.paper = res[1].state;
+    if (res[2] && res[2].ok && res[2].state) engine.paper2 = res[2].state;
     return engine;
   });
 }
@@ -157,7 +162,7 @@ function postEngineState(url, state) {
 function buildSnapshot(kind) {
   const ls = gatherLS();
   return collectEngineState().then(function (engine) {
-    const engines = (engine.realtime ? 1 : 0) + (engine.paper ? 1 : 0);
+    const engines = (engine.realtime ? 1 : 0) + (engine.paper ? 1 : 0) + (engine.paper2 ? 1 : 0);
     return {
       format: "algodhan_backup",
       version: 2,
@@ -184,6 +189,7 @@ function applyData(data) {
   const jobs = [];
   if (engine && engine.realtime) jobs.push(postEngineState("/api/rt/state/import", engine.realtime));
   if (engine && engine.paper) jobs.push(postEngineState("/api/paper/state/import", engine.paper));
+  if (engine && engine.paper2) jobs.push(postEngineState("/api/paper2/state/import", engine.paper2));
   return Promise.all(jobs).then(function (results) {
     results.forEach(function (r) {
       if (r && r.ok) n += (r.restored || 0);

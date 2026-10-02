@@ -246,6 +246,12 @@ pub struct Settings {
     /// `margin_pct`: the engine locks at most this many rupees (capped by the
     /// live available balance) across running trades. `0` = use the percentage.
     pub margin_amount: f64,
+    /// When ON, an entry signal that cannot be filled right now because the
+    /// margin budget is exhausted (required > available) is SKIPPED immediately:
+    /// the signal edge is consumed so the engine never re-queues/retries it and
+    /// never fills it minutes later at a worse price. Default OFF (legacy retry,
+    /// which releases the edge and lets the same signal fill once margin frees).
+    pub skip_on_margin_block: bool,
     pub sl_auto: bool,
     pub tf_1min: bool,
     pub tf_5min: bool,
@@ -379,6 +385,18 @@ pub struct Settings {
     /// last closed candle (green = bullish, red = bearish) instead of the windowed
     /// net move; when OFF the normal `nifty_trend_slope_len` window read is used.
     pub nifty_trend_color: bool,
+    /// Strict NET-direction gate for the NIFTY-trend universe (Top Movers
+    /// Gainers/Losers + NIFTY-trend picks). When ON, a Top Gainer (CE) leg may
+    /// only arm while the assigned straight-line confirmation indicators' NET
+    /// direction is bullish, and a Top Loser (PE) leg only while it is bearish.
+    /// A mismatch - including a tie (net 0) - blocks the leg outright, even when
+    /// the ordinary gate (majority / AI Brain) would otherwise allow it.
+    pub nifty_net_strict: bool,
+    /// Strict ALL-LINES-AGREE gate for the same universe. When ON, a Top Gainer
+    /// (CE) leg may only arm while EVERY assigned straight-line confirmation
+    /// indicator reads bullish (no dissenting/bearish line), and a Top Loser (PE)
+    /// leg only while EVERY assigned line reads bearish. Any mixed read blocks.
+    pub nifty_all_agree_strict: bool,
     // --- Commodities ---
     pub commodity_on: bool,
     pub commodity_list: Vec<i64>,
@@ -414,6 +432,39 @@ pub struct Settings {
     /// bearish simply fails its gate, so it never opens a PE trade (and vice
     /// versa). When OFF the normal multi-source routing applies.
     pub filter_side_route: bool,
+    /// Strict straight-line gate for the Indicator-filters scanner. When ON, every
+    /// scanner / NIFTY-trend leg must ALSO be confirmed by EVERY straight-line
+    /// filter ticked on its OWN side, from both list sections: the "Straight Line
+    /// Indicators" line-DIRECTION rows (`BullSl*` / `BearSl*`, Volume line `Vl`)
+    /// and the "Straight Line Indicator Color Detection" rows (`BullSlColor*` /
+    /// `BearSlColor*`, green on the CE side / red on the PE side). Any ticked line
+    /// reading the other way blocks the entry outright - even when the ordinary
+    /// gate (majority / AI Brain) would otherwise let the leg through. Normal-mode
+    /// strategies and cases with no line filter ticked are unaffected.
+    ///
+    /// NIFTY Trend Following exception: while `nifty_trend_on` is set, the
+    /// opposite-side block for the scanner universe is owned by the ASSIGNED NIFTY
+    /// confirmation indicators (the `nifty_net_strict` / `nifty_all_agree_strict`
+    /// gates), NOT by the manually ticked straight-line filters. This manual
+    /// all-agree gate is therefore skipped for scanner legs while NIFTY trend is
+    /// on, so a handful of ticked lines cannot stall every entry.
+    pub strict_line_color: bool,
+    /// "One trade per strike until the next fresh filter signal" for the
+    /// Indicator-filters scanner. When ON, once a top gainer / top loser (or
+    /// NIFTY-trend) leg has executed a trade on a strike, NO further entry is
+    /// placed on that same strike until the leg's selected indicator-filter
+    /// condition resets and meets again (a brand-new fresh signal). A gate that
+    /// stays true, or a re-entry right after the position closes, is blocked.
+    pub once_per_signal: bool,
+    /// Spot forming-candle colour gate. When ON, a bullish leg (Top Gainer / CE
+    /// side) may enter ONLY while the spot chart's live forming candle is GREEN,
+    /// and a bearish leg (Top Loser / PE side) ONLY while it is RED. Applies when
+    /// the run chart is the spot chart (strategy mode or Indicator-filters mode);
+    /// premium-only / futures-only runs are unaffected. A doji (close == open) is
+    /// neither green nor red, so the entry is held until a coloured candle forms.
+    /// The colour is re-checked at the actual execution instant as well, so a
+    /// candle that flips between the scan and the fill still blocks the trade.
+    pub spot_candle_gate: bool,
     /// Multi-position mode A: when a position is already open, allow a new
     /// position on the next fresh signal (the entry gate turning from not-met to
     /// met). Concurrent positions are unlimited, so a signal that keeps
@@ -550,6 +601,7 @@ impl Default for Settings {
             lots: 1.0,
             margin_pct: 100.0,
             margin_amount: 0.0,
+            skip_on_margin_block: false,
             sl_auto: true,
             tf_1min: false,
             tf_5min: true,
@@ -613,6 +665,8 @@ impl Default for Settings {
             nifty_trend_conf_inds: Vec::new(),
             nifty_trend_slope_len: 5,
             nifty_trend_color: false,
+            nifty_net_strict: false,
+            nifty_all_agree_strict: false,
             commodity_on: false,
             commodity_list: Vec::new(),
             commodity_legs: Vec::new(),
@@ -622,6 +676,9 @@ impl Default for Settings {
             dir_guard: false,
             overall_dir: true,
             filter_side_route: false,
+            strict_line_color: false,
+            once_per_signal: false,
+            spot_candle_gate: false,
             multi_fresh_on: true,
             multi_always_on: false,
             brain_mode: "off".into(),
@@ -1136,6 +1193,27 @@ fn margin_budget_of(margin_amount: f64, margin_pct: f64, available: f64) -> f64 
     }
 }
 
+/// Pure margin gate: the block reason when a leg's required margin exceeds the
+/// budget still free after the running trades, else `None`. In-memory arithmetic
+/// only (microseconds), so it can be called both as an early pre-check and at the
+/// actual fill without changing behaviour.
+fn margin_block_reason(required: f64, budget: f64, locked: f64, running: i64) -> Option<String> {
+    let available = (budget - locked).max(0.0);
+    if required > available {
+        Some(format!(
+            "trade blocked: required margin {} > available {} (Margin {} - locked {} by {} running trade{})",
+            round2(required),
+            round2(available),
+            round2(budget),
+            round2(locked),
+            running,
+            if running == 1 { "" } else { "s" }
+        ))
+    } else {
+        None
+    }
+}
+
 /// Paper wallet balance BEFORE the running trades' margin is committed:
 /// starting capital + realized P&L. The margin budget is sized against this so
 /// the locked margin of open positions is subtracted exactly once (by the entry
@@ -1154,11 +1232,18 @@ fn paper_available_of(cap: f64, closed: &[Value], positions: &[Value], charges_o
     (paper_wallet_of(cap, closed, charges_on) - locked).max(0.0)
 }
 
-fn state_path(paper: bool) -> PathBuf {
+/// Durable state file names, one per independent engine. The real engine's
+/// `ALGODHAN_STATE_PATH` override never applies to a paper engine, and each
+/// paper engine keeps its own file so their books can never share state.
+const STATE_FILE_REAL: &str = "algodhan_realtime_state.json";
+const STATE_FILE_PAPER: &str = "algodhan_paper_state.json";
+const STATE_FILE_PAPER2: &str = "algodhan_paper2_state.json";
+
+fn state_path(name: &str) -> PathBuf {
     // Durable location first: an explicit override, else a `data/` directory in
     // the process working dir. /tmp is only a last resort (wiped on reboot), so
     // the saved strategies/settings survive a restart.
-    if !paper {
+    if name == STATE_FILE_REAL {
         if let Ok(p) = std::env::var("ALGODHAN_STATE_PATH") {
             if !p.trim().is_empty() {
                 return PathBuf::from(p);
@@ -1170,11 +1255,6 @@ fn state_path(paper: bool) -> PathBuf {
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("data"));
-    let name = if paper {
-        "algodhan_paper_state.json"
-    } else {
-        "algodhan_realtime_state.json"
-    };
     if std::fs::create_dir_all(&dir).is_ok() {
         return dir.join(name);
     }
@@ -1206,6 +1286,9 @@ pub struct RealtimeState {
     /// execution touchpoint (entry fill, exit fill, broker reconciliation,
     /// account/margin wallet) is simulated locally instead of sent to Dhan.
     pub paper: bool,
+    /// Durable state-file name for THIS engine (see the `STATE_FILE_*` consts).
+    /// Stored so `save()` persists each independent engine to its own file.
+    state_file: &'static str,
     doc: Arc<Mutex<RtDoc>>,
     ltp: Arc<Mutex<HashMap<i64, f64>>>,
     broker_positions: Arc<Mutex<Vec<Value>>>,
@@ -1230,6 +1313,17 @@ pub struct RealtimeState {
     /// position is allowed only on the false -> true edge, so a gate that stays
     /// true opens exactly one position instead of one every scan cycle.
     sig_state: Arc<Mutex<HashMap<String, bool>>>,
+    /// "One trade per strike until the next fresh filter signal": strategy id ->
+    /// the option contracts already traded during the CURRENT signal pulse. A
+    /// contract is cleared the moment the leg's gate stops holding (the pulse
+    /// ends), so the next fresh signal may trade it again.
+    pulse_traded: Arc<Mutex<HashMap<String, std::collections::HashSet<i64>>>>,
+    /// Signal-end debounce: strategy id -> millisecond timestamp when its leg's
+    /// gate was FIRST seen failing on the current run of failures. A single-scan
+    /// flicker must not end the signal, so the pulse is only reset once the gate
+    /// has stayed false continuously for `SIGNAL_END_DEBOUNCE_MS`. The entry
+    /// clears the marker, so a brief dip inside one signal keeps it running.
+    sig_fail_since: Arc<Mutex<HashMap<String, i64>>>,
     /// Cached ATR per `security:segment:instrument:timeframe` `(at_ms, atr)`.
     /// AI SL/TP/trail reuse a recent ATR instead of paying a throttled Dhan
     /// candle round-trip on every entry (that fetch was a 3-10s entry lag).
@@ -1259,6 +1353,16 @@ pub struct RealtimeState {
     /// Straight-line indicators currently reading bearish - assigned to the Top
     /// Loser side.
     nifty_bear_filters: Arc<Mutex<Vec<String>>>,
+    /// Net direction of the COMMITTED straight-line read (0 = the committed side
+    /// read a tie / none). Refreshed from each confirmed read rather than the raw
+    /// per-tick flicker, so the strict net-direction gate blocks on a real change
+    /// of side - not on a millisecond wiggle of the live forming bar.
+    nifty_raw_net: Arc<AtomicI64>,
+    /// All-lines-agree state of the assigned straight-line confirmation
+    /// indicators: +1 when every line reads bullish (bull set non-empty, bear set
+    /// empty), -1 when every line reads bearish, 0 when the read is mixed / tied
+    /// / unavailable. Drives the strict all-lines-agree gate.
+    nifty_agree: Arc<AtomicI64>,
     last_trend: Arc<AtomicI64>,
     last_nifty_scan: Arc<AtomicI64>,
     /// Cached NIFTY-trend pick rows `(at_ms, payload)` for the UI + pick tagging.
@@ -1275,6 +1379,12 @@ pub struct RealtimeState {
     /// ON the assigned straight-line indicators' colour is re-read on this fixed
     /// cadence (see `COLOR_SCAN_MS`) instead of on every tick.
     last_color_scan: Arc<AtomicI64>,
+    /// Candidate next NIFTY direction awaiting confirmation (0 = none pending).
+    /// Set the first time a read disagrees with the committed side; only becomes
+    /// the committed side once it has persisted `NIFTY_FLIP_CONFIRM_MS`.
+    nifty_pending_dir: Arc<AtomicI64>,
+    /// Millisecond clock when `nifty_pending_dir` was first read.
+    nifty_pending_since: Arc<AtomicI64>,
     /// Order timestamps (ms) in the last second, powering the orders/sec cap.
     order_times: Arc<Mutex<Vec<i64>>>,
     /// Paper-only simulated entry latency: strategy id -> due ms for entries
@@ -1319,18 +1429,26 @@ pub struct RealtimeState {
 
 impl RealtimeState {
     pub fn new(dhan: DhanState) -> Self {
-        Self::new_mode(dhan, false)
+        Self::new_mode(dhan, false, STATE_FILE_REAL)
     }
 
     /// Paper-trade engine: identical logic, simulated execution + wallet, and a
     /// completely separate durable state file so paper strategies/settings never
     /// touch the real engine's book.
     pub fn new_paper(dhan: DhanState) -> Self {
-        Self::new_mode(dhan, true)
+        Self::new_mode(dhan, true, STATE_FILE_PAPER)
     }
 
-    fn new_mode(dhan: DhanState, paper: bool) -> Self {
-        let path = state_path(paper);
+    /// Second, fully independent paper-trade engine (`/api/paper2/*`): the same
+    /// logic and simulated execution as `new_paper`, but its own durable state
+    /// file and in-memory book, so it shares NO data with the first paper
+    /// engine.
+    pub fn new_paper2(dhan: DhanState) -> Self {
+        Self::new_mode(dhan, true, STATE_FILE_PAPER2)
+    }
+
+    fn new_mode(dhan: DhanState, paper: bool, state_file: &'static str) -> Self {
+        let path = state_path(state_file);
         // Read the durable file, else migrate a legacy /tmp state file if the
         // durable one does not exist yet.
         let mut doc = std::fs::read_to_string(&path)
@@ -1368,6 +1486,7 @@ impl RealtimeState {
         let st = Self {
             dhan,
             paper,
+            state_file,
             doc: Arc::new(Mutex::new(doc)),
             ltp: Arc::new(Mutex::new(HashMap::new())),
             broker_positions: Arc::new(Mutex::new(Vec::new())),
@@ -1382,6 +1501,8 @@ impl RealtimeState {
             was_feed: Arc::new(AtomicBool::new(false)),
             last_sig: Arc::new(Mutex::new(HashMap::new())),
             sig_state: Arc::new(Mutex::new(HashMap::new())),
+            pulse_traded: Arc::new(Mutex::new(HashMap::new())),
+            sig_fail_since: Arc::new(Mutex::new(HashMap::new())),
             atr_cache: Arc::new(Mutex::new(HashMap::new())),
             pool_cache: Arc::new(Mutex::new((0, Value::Null))),
             pool_busy: Arc::new(AtomicBool::new(false)),
@@ -1392,6 +1513,8 @@ impl RealtimeState {
             nifty_dir: Arc::new(AtomicI64::new(0)),
             nifty_bull_filters: Arc::new(Mutex::new(Vec::new())),
             nifty_bear_filters: Arc::new(Mutex::new(Vec::new())),
+            nifty_raw_net: Arc::new(AtomicI64::new(0)),
+            nifty_agree: Arc::new(AtomicI64::new(0)),
             last_trend: Arc::new(AtomicI64::new(0)),
             last_nifty_scan: Arc::new(AtomicI64::new(0)),
             nifty_picks: Arc::new(Mutex::new((0, Value::Null))),
@@ -1399,6 +1522,8 @@ impl RealtimeState {
             nifty_seq: Arc::new(AtomicI64::new(0)),
             last_nifty_flip: Arc::new(AtomicI64::new(0)),
             last_color_scan: Arc::new(AtomicI64::new(0)),
+            nifty_pending_dir: Arc::new(AtomicI64::new(0)),
+            nifty_pending_since: Arc::new(AtomicI64::new(0)),
             order_times: Arc::new(Mutex::new(Vec::new())),
             paper_pending: Arc::new(Mutex::new(HashMap::new())),
             paper_exit_pending: Arc::new(Mutex::new(HashMap::new())),
@@ -1432,7 +1557,7 @@ impl RealtimeState {
                 Err(_) => return,
             }
         };
-        let _ = write_atomic(&state_path(self.paper), bytes.as_bytes());
+        let _ = write_atomic(&state_path(self.state_file), bytes.as_bytes());
     }
 
     fn log(&self, level: &str, msg: &str) {
@@ -1749,6 +1874,59 @@ impl RealtimeState {
         locked_margin_of(&positions)
     }
 
+    /// Margin gate for an already-sized entry: `Some(reason)` when the required
+    /// margin (qty x price) exceeds the budget still free after the running
+    /// trades. Used by the "skip when margin unavailable" guard and by the live
+    /// entry gate, so both make the identical, deterministic decision.
+    fn margin_block_for_qty(&self, qty: i64, ltp: f64) -> Option<String> {
+        let budget = self.margin_budget();
+        if budget <= 0.0 || ltp <= 0.0 || qty <= 0 {
+            return None;
+        }
+        let (locked, running) = self.locked_margin();
+        margin_block_reason(qty as f64 * ltp, budget, locked, running)
+    }
+
+    /// Early "skip when margin unavailable" pre-check used before a signal is
+    /// queued. Mirrors the entry gate's qty sizing for the manual-lots case; when
+    /// Auto-Lots is on the qty is sized to fit the budget, so this returns `None`
+    /// and the exact gate inside `open_entry` still governs. Returns the block
+    /// reason when the signal would be rejected for margin, so the caller can
+    /// consume the signal instead of retrying it into a late fill.
+    fn early_margin_skip_reason(&self, strat: &Strategy, ltp: f64) -> Option<String> {
+        let (auto_lots, lots, lot_size) = self
+            .doc()
+            .map(|d| (d.auto_lots, d.settings.lots, d.settings.lot_size))
+            .unwrap_or((false, 1.0, 0.0));
+        if auto_lots {
+            return None;
+        }
+        let lot = if strat.lot > 0.0 {
+            strat.lot
+        } else if lot_size > 0.0 {
+            lot_size
+        } else {
+            scrip::get()
+                .and_then(|s| s.lot_for(&strat.trading_symbol, &strat.exchange_segment).map(|(l, _)| l))
+                .unwrap_or(1.0)
+        };
+        let qty = (lots.max(1.0) * lot).round() as i64;
+        self.margin_block_for_qty(qty, ltp)
+    }
+
+    /// Whether the operator enabled "skip trade when margin unavailable".
+    fn skip_margin_block_enabled(&self) -> bool {
+        self.doc().map(|d| d.settings.skip_on_margin_block).unwrap_or(false)
+    }
+
+    /// Consume a signal because margin blocked it: latch the fresh edge and mark
+    /// the strike traded for this pulse so the SAME signal can never re-queue and
+    /// fill late. A genuinely new signal (after the pulse ends) is still allowed.
+    fn consume_signal_for_margin(&self, strategy_id: &str, security_id: i64) {
+        self.set_sig_state(strategy_id, true);
+        self.pulse_mark(strategy_id, security_id);
+    }
+
     /// Entry-gate edge state for the multi-position "fresh signal" mode: whether
     /// the gate held on the previous scan for this strategy.
     fn sig_state_is_set(&self, strategy_id: &str) -> bool {
@@ -1778,7 +1956,68 @@ impl RealtimeState {
     /// stops trading until the gate happens to reset and print a brand-new
     /// signal.
     fn release_fresh_edge(&self, strategy_id: &str) {
+        self.clear_signal_edge(strategy_id);
+    }
+
+    /// End the current signal pulse for a strategy: the gate stopped holding, so
+    /// the next time it holds is a brand-new fresh signal. Clears both the
+    /// fresh-edge flag and the per-strike "already traded this pulse" memory.
+    fn clear_signal_edge(&self, strategy_id: &str) {
         self.set_sig_state(strategy_id, false);
+        self.pulse_reset(strategy_id);
+    }
+
+    /// Forget the contracts a strategy traded during its current signal pulse, so
+    /// the next fresh signal may trade them again.
+    fn pulse_reset(&self, strategy_id: &str) {
+        if let Ok(mut m) = self.pulse_traded.lock() {
+            m.remove(strategy_id);
+        }
+    }
+
+    /// True when this strategy has already traded this exact contract during the
+    /// CURRENT signal pulse (blocked until the pulse ends and a fresh signal
+    /// begins).
+    fn pulse_blocked(&self, strategy_id: &str, security_id: i64) -> bool {
+        self.pulse_traded
+            .lock()
+            .ok()
+            .and_then(|m| m.get(strategy_id).map(|s| s.contains(&security_id)))
+            .unwrap_or(false)
+    }
+
+    /// Record that this strategy traded this contract during the current pulse.
+    fn pulse_mark(&self, strategy_id: &str, security_id: i64) {
+        if security_id <= 0 {
+            return;
+        }
+        if let Ok(mut m) = self.pulse_traded.lock() {
+            if m.len() > 5000 {
+                m.clear();
+            }
+            m.entry(strategy_id.to_string()).or_default().insert(security_id);
+        }
+    }
+
+    /// The leg's gate held on this scan: cancel any pending signal-end debounce so
+    /// a brief dip inside one signal never ends it.
+    fn note_signal_pass(&self, strategy_id: &str) {
+        if let Ok(mut m) = self.sig_fail_since.lock() {
+            m.remove(strategy_id);
+        }
+    }
+
+    /// The leg's gate failed on this scan. Returns `true` only once the failure
+    /// has been continuous for [`SIGNAL_END_DEBOUNCE_MS`], i.e. a genuine signal
+    /// end (reset the pulse) rather than a single-scan flicker.
+    fn end_signal_if_due(&self, strategy_id: &str) -> bool {
+        let now = now_ms();
+        let Ok(mut m) = self.sig_fail_since.lock() else { return false };
+        if m.len() > 5000 {
+            m.clear();
+        }
+        let since = *m.entry(strategy_id.to_string()).or_insert(now);
+        now - since >= SIGNAL_END_DEBOUNCE_MS
     }
 
     /// Trades already taken for a strategy: open positions plus closed trades.
@@ -1790,6 +2029,52 @@ impl RealtimeState {
                     + d.closed.iter().filter(|c| js(c, "strategyId") == strategy_id).count()
             })
             .unwrap_or(0) as i64
+    }
+
+    /// True when a running position already holds this exact option contract
+    /// (same `securityId`). Used to stop the engine from opening a second entry
+    /// on a strike that is already being traded - a fresh-signal re-trigger, a
+    /// second strategy resolving to the same strike, or a scan after a restart
+    /// (which clears the in-memory signal edge) must not double the position.
+    fn contract_running(&self, security_id: i64) -> bool {
+        if security_id <= 0 {
+            return false;
+        }
+        self.doc()
+            .map(|d| d.positions.iter().any(|p| ji(p, "securityId") == security_id))
+            .unwrap_or(false)
+    }
+
+    /// Whether a new entry on `security_id` must be blocked as a duplicate of an
+    /// already-running position on the same contract. `guard` is false for the
+    /// operator-driven Manual Order Placement path; the explicit "repeat while
+    /// condition holds" stacking mode (multi-position B) is always exempt so it
+    /// can keep stacking as designed.
+    fn duplicate_entry_blocked(&self, settings: &Settings, security_id: i64, guard: bool) -> bool {
+        guard && !settings.multi_always_on && self.contract_running(security_id)
+    }
+
+    /// "One trade per signal" guard. Returns a human-readable reason when the
+    /// scanner leg must be blocked, else `None`. The rule is purely signal-scoped:
+    /// once a leg has traded a contract during the CURRENT signal pulse it is
+    /// held until that pulse ends, no matter whether the position is still open.
+    /// A genuinely new signal clears the pulse (see `note_signal_pass` /
+    /// `end_signal_if_due`), so the very next signal may trade the same strike
+    /// again. A running position therefore never blocks a fresh signal - only a
+    /// repeat inside the same pulse is blocked.
+    fn once_per_signal_block_reason(
+        &self,
+        settings: &Settings,
+        strat: &Strategy,
+        security_id: i64,
+    ) -> Option<&'static str> {
+        if !settings.once_per_signal || !strat.synthetic {
+            return None;
+        }
+        if self.pulse_blocked(&strat.id, security_id) {
+            return Some("already traded this strike on the current signal");
+        }
+        None
     }
 
     /// Margin bar readout for the Running Trades section. Takes the already
@@ -2330,7 +2615,12 @@ impl RealtimeState {
     /// direction, so the caller falls back to the strategy's own bullish/bearish
     /// side.
     fn auto_option_side(&self, settings: &Settings) -> Option<&'static str> {
-        if settings.movers_on {
+        // Selecting BOTH Top-Mover legs (a positive Top Gainers count AND a
+        // positive Top Losers count) is the operator's explicit instruction to
+        // work both the bullish (CE) and bearish (PE) legs at once, so the
+        // movers dominance bias must NOT collapse the scanner onto a single
+        // side. The bias still picks the side when exactly one leg is selected.
+        if settings.movers_on && !movers_both_legs(settings) {
             let b = self.mover_bias.load(Ordering::Relaxed);
             if b > 0 {
                 return Some("CE");
@@ -2356,6 +2646,41 @@ impl RealtimeState {
             d if d < 0 => Some("PE"),
             _ => None,
         }
+    }
+
+    /// Strict-gate check for the NIFTY-trend universe (Top Movers Gainers/Losers
+    /// + NIFTY-trend picks). `bull` = the leg being considered is a CE / Top
+    /// Gainer leg. Returns `false` (hard block) when either enabled strict gate
+    /// disagrees with the assigned straight-line confirmation indicators:
+    ///   * net gate  (`nifty_net_strict`)       - CE needs raw net > 0, PE < 0;
+    ///     a tie / dead-heat fails.
+    ///   * agree gate (`nifty_all_agree_strict`) - CE needs every assigned line
+    ///     bullish (+1), PE every line bearish (-1); a mixed read fails.
+    /// With the feature off, no gate enabled, or NIFTY Trend Following off this
+    /// is a no-op (`true`), so nothing else is affected.
+    fn nifty_line_side_ok(&self, settings: &Settings, bull: bool) -> bool {
+        if !settings.nifty_trend_on || (!settings.nifty_net_strict && !settings.nifty_all_agree_strict) {
+            return true;
+        }
+        if settings.nifty_net_strict {
+            let n = self.nifty_raw_net.load(Ordering::Relaxed);
+            if bull && n <= 0 {
+                return false;
+            }
+            if !bull && n >= 0 {
+                return false;
+            }
+        }
+        if settings.nifty_all_agree_strict {
+            let a = self.nifty_agree.load(Ordering::Relaxed);
+            if bull && a != 1 {
+                return false;
+            }
+            if !bull && a != -1 {
+                return false;
+            }
+        }
+        true
     }
 
     /// Strict NIFTY straight-line direction lock, applied to F&O stocks only.
@@ -2385,6 +2710,13 @@ impl RealtimeState {
             return None;
         }
         if settings.run_in_auto {
+            // Both Top-Mover legs selected: the auto side is deliberately
+            // undecided so both legs can run, so do NOT fall back to the manual
+            // "Run Strategy In" side - that would re-narrow the scanner to one
+            // leg and defeat the operator's both-legs selection.
+            if movers_both_legs(settings) {
+                return None;
+            }
             if let Some(side) = self.auto_option_side(settings) {
                 return Some(side);
             }
@@ -2885,19 +3217,65 @@ impl RealtimeState {
     /// Publish a resolved direction: store the per-leg filter split, swap the
     /// sign, and on a change re-arm the strike scan + emit the flip signal/log.
     fn apply_nifty_direction(&self, bull: Vec<String>, bear: Vec<String>, net: i64, tf: &str) {
-        // A tie (net 0) carries no committed direction. Keep the previous side and
-        // its filter split instead of dropping to NEUTRAL - a momentary dead-heat
-        // must never free BOTH legs and let the engine trade both directions.
-        if net == 0 {
+        let d = net.signum();
+        let cur = self.nifty_dir.load(Ordering::Relaxed);
+        let agree = if !bull.is_empty() && bear.is_empty() {
+            1
+        } else if bull.is_empty() && !bear.is_empty() {
+            -1
+        } else {
+            0
+        };
+        if d == cur {
+            // The live read agrees with the committed side. Refresh the strict-gate
+            // state and the filter split from this read, and drop any in-flight
+            // candidate - confirmation must be continuous, not cumulative.
+            self.nifty_pending_dir.store(0, Ordering::Relaxed);
+            self.nifty_raw_net.store(d, Ordering::Relaxed);
+            self.nifty_agree.store(agree, Ordering::Relaxed);
+            if d != 0 {
+                if let Ok(mut b) = self.nifty_bull_filters.lock() {
+                    *b = bull;
+                }
+                if let Ok(mut b) = self.nifty_bear_filters.lock() {
+                    *b = bear;
+                }
+            }
             return;
         }
+        if d == 0 {
+            // A dead-heat carries no committed direction. Hold the previous side
+            // and its gate state - a momentary tie must never free BOTH legs and
+            // let the engine trade both directions. Only forget a pending flip.
+            self.nifty_pending_dir.store(0, Ordering::Relaxed);
+            return;
+        }
+        // The read disagrees with the committed side. The lines are read off the
+        // live forming bar on every tick, so a single wiggle can net the opposite
+        // sign for a few milliseconds; require the new direction to PERSIST before
+        // it replaces the side, otherwise the leg/strikes flip CE<->PE too fast
+        // for any entry to survive. From NEUTRAL (no side committed yet) commit at
+        // once so startup is not delayed.
+        let now = now_ms();
+        let cand = self.nifty_pending_dir.load(Ordering::Relaxed);
+        if cand != d {
+            self.nifty_pending_dir.store(d, Ordering::Relaxed);
+            self.nifty_pending_since.store(now, Ordering::Relaxed);
+            if cur != 0 {
+                return;
+            }
+        } else if now - self.nifty_pending_since.load(Ordering::Relaxed) < NIFTY_FLIP_CONFIRM_MS {
+            return;
+        }
+        self.nifty_pending_dir.store(0, Ordering::Relaxed);
         if let Ok(mut b) = self.nifty_bull_filters.lock() {
             *b = bull;
         }
         if let Ok(mut b) = self.nifty_bear_filters.lock() {
             *b = bear;
         }
-        let d = if net > 0 { 1 } else { -1 };
+        self.nifty_raw_net.store(d, Ordering::Relaxed);
+        self.nifty_agree.store(agree, Ordering::Relaxed);
         let prev = self.nifty_dir.swap(d, Ordering::Relaxed);
         if prev == d {
             return;
@@ -2908,7 +3286,7 @@ impl RealtimeState {
         let seq = self.nifty_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let from = prev.signum();
         if let Ok(mut f) = self.nifty_flip.lock() {
-            *f = json!({ "from": from, "to": d, "at": now_ms(), "seq": seq, "tf": tf });
+            *f = json!({ "from": from, "to": d, "at": now, "seq": seq, "tf": tf });
         }
         self.log(
             "info",
@@ -2923,6 +3301,9 @@ impl RealtimeState {
 
     fn clear_nifty_direction(&self) {
         self.nifty_dir.store(0, Ordering::Relaxed);
+        self.nifty_raw_net.store(0, Ordering::Relaxed);
+        self.nifty_agree.store(0, Ordering::Relaxed);
+        self.nifty_pending_dir.store(0, Ordering::Relaxed);
         // Force the next colour scan to run immediately when the trend (or its
         // colour mode) is switched back on.
         self.last_color_scan.store(0, Ordering::Relaxed);
@@ -2972,6 +3353,11 @@ impl RealtimeState {
         let dir = self.nifty_dir.load(Ordering::Relaxed);
         let bull_on = dir > 0 && self.nifty_bull_filters.lock().map(|g| !g.is_empty()).unwrap_or(false);
         let bear_on = dir < 0 && self.nifty_bear_filters.lock().map(|g| !g.is_empty()).unwrap_or(false);
+        // Strict gate(s): a side that does not match the live assigned-line read
+        // (net / all-agree) is dropped here too, so the Picked-Strikes readout
+        // never lists a leg the engine would refuse to trade.
+        let bull_on = bull_on && self.nifty_line_side_ok(&settings, true);
+        let bear_on = bear_on && self.nifty_line_side_ok(&settings, false);
         // No committed direction (or no line assigned yet): nothing to assign.
         if !bull_on && !bear_on {
             self.update_picked("NIFTY trend", Vec::new());
@@ -3258,8 +3644,21 @@ impl RealtimeState {
     }
 
     fn scanner_targets(&self, settings: &Settings) -> Vec<Strategy> {
-        let bull_side = settings.filters.iter().any(|(k, v)| *v && filter_is_bull(k));
-        let bear_side = settings.filters.iter().any(|(k, v)| *v && filter_is_bear(k));
+        let (bull_side, bear_side) = if settings.premium_only {
+            // "Premium chart only": both sides gate on the bullish filter set, so
+            // a side is tradeable whenever ANY indicator filter is enabled. The
+            // operator's selected side still narrows this via `side_allowed`.
+            let any = settings
+                .filters
+                .iter()
+                .any(|(k, v)| *v && (filter_is_bull(k) || filter_is_bear(k)));
+            (any, any)
+        } else {
+            (
+                settings.filters.iter().any(|(k, v)| *v && filter_is_bull(k)),
+                settings.filters.iter().any(|(k, v)| *v && filter_is_bear(k)),
+            )
+        };
         // NIFTY-trend assignment: the bullish straight-line filters gate the Top
         // Gainer (CE) legs, the bearish ones the Top Loser (PE) legs. The engine
         // follows ONLY the net straight-line direction, so a bullish NIFTY runs
@@ -3390,13 +3789,34 @@ impl RealtimeState {
         }
 
         // Top Movers: gainers are bullish, losers bearish, plus operator indices.
+        // When the NIFTY-trend strict gate(s) are ON the forced gainer/loser legs
+        // are additionally bound to the assigned straight-line direction: a Top
+        // Gainer (CE) leg is dropped unless the lines confirm bullish, a Top Loser
+        // (PE) leg unless they confirm bearish. Operator-assigned index legs are
+        // explicit picks, so they are left untouched.
         if settings.movers_on {
             let payload = self.movers_cache.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
-            for r in jarr(&payload, "gainers") {
-                add(&mut out, &mut seen, ji(&r, "securityId"), Some(true), allow_bull, allow_bear);
+            // Once NIFTY Trend Following has committed a direction it OWNS this
+            // universe's side: a bullish NIFTY must arm the Top Gainer (CE) legs
+            // even when the Top-Movers auto bias happens to point PE (a down day
+            // with the index line rising), and vice versa. Otherwise the auto
+            // bias's global side gate silently cancelled the NIFTY call and the
+            // "bullish CE / Top Gainer" legs never ran. With no committed NIFTY
+            // direction the old global side gate applies unchanged.
+            let (mv_allow_bull, mv_allow_bear) = match self.nifty_dir.load(Ordering::Relaxed) {
+                d if settings.nifty_trend_on && d > 0 => (true, false),
+                d if settings.nifty_trend_on && d < 0 => (false, true),
+                _ => (allow_bull, allow_bear),
+            };
+            if mv_allow_bull && self.nifty_line_side_ok(settings, true) {
+                for r in jarr(&payload, "gainers") {
+                    add(&mut out, &mut seen, ji(&r, "securityId"), Some(true), true, true);
+                }
             }
-            for r in jarr(&payload, "losers") {
-                add(&mut out, &mut seen, ji(&r, "securityId"), Some(false), allow_bull, allow_bear);
+            if mv_allow_bear && self.nifty_line_side_ok(settings, false) {
+                for r in jarr(&payload, "losers") {
+                    add(&mut out, &mut seen, ji(&r, "securityId"), Some(false), true, true);
+                }
             }
             for id in &settings.movers_indices {
                 // Only the operator-assigned leg runs; an index with no leg is
@@ -3426,10 +3846,10 @@ impl RealtimeState {
                     continue;
                 }
                 if js(&p, "side").eq_ignore_ascii_case("CE") {
-                    if nifty_allow_bull {
+                    if nifty_allow_bull && self.nifty_line_side_ok(settings, true) {
                         add(&mut out, &mut seen, sid, Some(true), true, true);
                     }
-                } else if nifty_allow_bear {
+                } else if nifty_allow_bear && self.nifty_line_side_ok(settings, false) {
                     add(&mut out, &mut seen, sid, Some(false), true, true);
                 }
             }
@@ -3670,7 +4090,10 @@ impl RealtimeState {
             }
             let mut all_pass = true;
             let synth = strat.synthetic;
-            let gate_settings = self.template_for_direction(&settings, &strat).unwrap_or_else(|| settings.clone());
+            let mut gate_settings = self.template_for_direction(&settings, &strat).unwrap_or_else(|| settings.clone());
+            // "Premium chart only" is an engine-wide switch: a direction template
+            // must not silently turn the bullish-filter-only rule back off.
+            gate_settings.premium_only = settings.premium_only;
             for (s, c) in &eval {
                 // One memo scope per leg: conditions, indicator gate, direction
                 // guard and fresh-meet all read the same candle slice, so every
@@ -3682,10 +4105,11 @@ impl RealtimeState {
                 // own - the ticked indicator filters are the whole entry rule.
                 let cond_ok = synth || conditions_met(&s.conditions, c, offset);
                 let fg = filter_gate(&gate_settings, s, c, offset);
+                let slc = strict_line_gate_ok(&gate_settings, s, c, offset);
                 let dg = direction_opposite(&gate_settings, s, c, offset);
-                if !cond_ok || !fg || dg {
+                if !cond_ok || !fg || !slc || dg {
                     if strat.synthetic {
-                        let bull_s = strategy_is_bull(s);
+                        let bull_s = gate_settings.premium_only || strategy_is_bull(s);
                         let keys: Vec<String> = gate_settings
                             .filters
                             .iter()
@@ -3710,7 +4134,7 @@ impl RealtimeState {
                             &format!("gate:{}", strat.id),
                             60_000,
                             "info",
-                            &format!("scan gate fail {}: cond={cond_ok} filter={fg} dir={dg} overallDir={} dirGuard={dir_expl} arrow=[{arrow_on}/{arrow_pass}] gate=[{gate_expl}] keys={keys:?} failed={failed:?}", strat.name, settings.overall_dir),
+                            &format!("scan gate fail {}: cond={cond_ok} filter={fg} line={slc} dir={dg} overallDir={} dirGuard={dir_expl} arrow=[{arrow_on}/{arrow_pass}] gate=[{gate_expl}] keys={keys:?} failed={failed:?}", strat.name, settings.overall_dir),
                         );
                     }
                     all_pass = false;
@@ -3718,7 +4142,27 @@ impl RealtimeState {
                 }
             }
             if !all_pass {
-                self.set_sig_state(&strat.id, false);
+                if self.end_signal_if_due(&strat.id) {
+                    self.clear_signal_edge(&strat.id);
+                }
+                continue;
+            }
+            // Spot forming-candle colour gate: a Top Gainer (bullish) leg may enter
+            // only while the spot chart's live forming candle is GREEN, a Top Loser
+            // (bearish) leg only while it is RED. The signal is HELD (not consumed)
+            // while the candle is the wrong colour, so a still-met condition enters
+            // as soon as the colour flips. Runs only when the entry rule is on the
+            // spot chart and the checkbox is on.
+            if let Some(reason) = self.spot_candle_gate_skip(&settings, &strat).await {
+                self.log_throttled(
+                    &format!("candlegate:{}", strat.id),
+                    10_000,
+                    "info",
+                    &format!("skip entry {}: {reason}", strat.name),
+                );
+                if self.end_signal_if_due(&strat.id) {
+                    self.clear_signal_edge(&strat.id);
+                }
                 continue;
             }
             // Multi-TF confirm: the higher ticked timeframe must also satisfy the
@@ -3737,6 +4181,7 @@ impl RealtimeState {
                     };
                     if !(synth || conditions_met(&s.conditions, &tc, offset))
                         || !filter_gate(&gate_settings, s, &tc, offset)
+                        || !strict_line_gate_ok(&gate_settings, s, &tc, offset)
                         || direction_opposite(&gate_settings, s, &tc, offset)
                     {
                         all_pass = false;
@@ -3744,10 +4189,15 @@ impl RealtimeState {
                     }
                 }
                 if !all_pass {
-                    self.set_sig_state(&strat.id, false);
+                    if self.end_signal_if_due(&strat.id) {
+                        self.clear_signal_edge(&strat.id);
+                    }
                     continue;
                 }
             }
+            // The whole gate (spot + premium + multi-TF) held on this scan: the
+            // signal is still running, so cancel any pending signal-end debounce.
+            self.note_signal_pass(&strat.id);
             // Multi-position entry gate (replaces the old single-position rule).
             // Always-on stacks a position every scan while the gate holds; fresh
             // fires only on the false -> true edge, so a gate that stays true
@@ -3808,12 +4258,76 @@ impl RealtimeState {
             // Publish the chart the order will actually execute on, mirroring
             // the run leg above, so the Running Strategies view names both.
             self.record_strat_leg(&strat.id, "trade", &exec_strat);
+            // Same-strike guard: skip the entry when this exact option contract
+            // already has a running position. This catches a second strategy
+            // resolving to the same strike and a scan after a restart (which
+            // clears the in-memory signal edge). It is exempt for the operator's
+            // explicit "repeat while condition holds" stacking mode, and it defers
+            // entirely to the signal-scoped rule below when "one trade per signal"
+            // is ON: that rule permits a genuinely NEW signal to re-enter the same
+            // strike, so a running position must not veto it here.
+            let once_signal_rules = settings.once_per_signal && strat.synthetic;
+            if !once_signal_rules && self.duplicate_entry_blocked(&settings, exec_strat.security_id, true) {
+                self.log_throttled(
+                    &format!("dupe:{}", strat.id),
+                    10_000,
+                    "info",
+                    &format!(
+                        "skip duplicate entry {} -> {} (same strike already running)",
+                        strat.name, exec_strat.trading_symbol
+                    ),
+                );
+                continue;
+            }
+            // "One trade per signal": once a scanner leg has traded a contract in
+            // the current signal pulse, hold every further entry on that contract
+            // until the pulse ends. A pulse only ends after the gate has stayed
+            // false for the debounce window (see `end_signal_if_due`), so a single
+            // flicker can never re-arm the guard and repeat the same signal. When
+            // a new signal begins, a second entry - even on the same strike, even
+            // while the older position is still open - is allowed.
+            if let Some(reason) = self.once_per_signal_block_reason(&settings, &strat, exec_strat.security_id) {
+                self.log_throttled(
+                    &format!("once:{}", strat.id),
+                    10_000,
+                    "info",
+                    &format!(
+                        "skip repeat entry {} -> {} ({}; waiting for a fresh signal)",
+                        strat.name, exec_strat.trading_symbol, reason
+                    ),
+                );
+                continue;
+            }
             // Paper execution is fully REST-free, so make sure the leg it will
             // trade is streaming on the live websocket before the fill is booked.
             if self.paper {
                 self.dhan
                     .subscribe_options(&[(exec_strat.security_id, exec_strat.exchange_segment.clone())])
                     .await;
+            }
+            // "Skip when margin unavailable": decide BEFORE the signal is queued.
+            // The margin gate is pure in-memory arithmetic (microseconds), so when
+            // the leg's required margin already exceeds the free budget the signal
+            // is consumed here - it is never queued/retried, so it can never fill
+            // minutes later at a worse price once margin frees. A genuinely new
+            // signal after the pulse ends is still allowed.
+            if settings.skip_on_margin_block {
+                let leg_ltp = self.ltp_of(exec_strat.security_id, &exec_strat.exchange_segment);
+                if leg_ltp > 0.0 {
+                    if let Some(reason) = self.early_margin_skip_reason(&exec_strat, leg_ltp) {
+                        self.consume_signal_for_margin(&strat.id, exec_strat.security_id);
+                        self.log_throttled(
+                            &format!("marginskip:{}", strat.id),
+                            10_000,
+                            "warn",
+                            &format!(
+                                "skip (margin unavailable, no late entry) {} -> {}: {}",
+                                strat.name, exec_strat.trading_symbol, reason
+                            ),
+                        );
+                        continue;
+                    }
+                }
             }
             // Trades per strategy: hard cap counted across open + closed entries.
             // "AI auto trades" removes the cap when enabled.
@@ -3846,7 +4360,7 @@ impl RealtimeState {
                 self.queue_delayed_entry(&strat.id, &exec_strat, settings.paper_exec_delay_ms);
                 continue;
             }
-            match self.open_entry(&exec_strat).await {
+            match self.open_entry(&exec_strat, true).await {
                 Ok(()) => {
                     self.set_sig_state(&strat.id, true);
                     if strat.synthetic {
@@ -3855,7 +4369,22 @@ impl RealtimeState {
                     self.order_record();
                 }
                 Err(e) => {
-                    self.log("error", &format!("entry {} failed: {e}", strat.name));
+                    if settings.skip_on_margin_block && e.starts_with("trade blocked:") {
+                        // Consume the signal so the still-true gate cannot re-fire
+                        // every scan and eventually fill late once margin frees.
+                        self.consume_signal_for_margin(&strat.id, exec_strat.security_id);
+                        self.log_throttled(
+                            &format!("marginskip:{}", strat.id),
+                            10_000,
+                            "warn",
+                            &format!(
+                                "skip (margin unavailable, no late entry) {} -> {}: {e}",
+                                strat.name, exec_strat.trading_symbol
+                            ),
+                        );
+                    } else {
+                        self.log("error", &format!("entry {} failed: {e}", strat.name));
+                    }
                     if let Some(mut d) = self.doc() {
                         if let Some(s) = d.strategies.iter_mut().find(|s| s.id == strat.id) {
                             s.last_error = e.clone();
@@ -5387,7 +5916,7 @@ impl RealtimeState {
                 .map(|d| d.engine_on && d.armed)
                 .unwrap_or(false);
             if ready {
-                match me.open_entry(&strat).await {
+                match me.open_entry(&strat, true).await {
                     Ok(()) => {
                         me.order_record();
                         me.log_throttled(
@@ -5405,14 +5934,31 @@ impl RealtimeState {
                         // queued. If it never fills (margin block / rejection /
                         // no premium) release the edge so the still-true gate can
                         // re-trigger, instead of latching silent until the gate
-                        // happens to reset and print a new signal.
-                        me.release_fresh_edge(&strat.id);
-                        me.log_throttled(
-                            &format!("delay-fail:{}", strat.id),
-                            5_000,
-                            "error",
-                            &format!("delayed entry {} failed: {e}", strat.name),
-                        );
+                        // happens to reset and print a new signal. EXCEPTION:
+                        // when "skip when margin unavailable" is ON, a margin
+                        // block must NOT hand the edge back - doing so is exactly
+                        // what let the same signal re-queue and fill minutes later
+                        // at a worse price. Consume it instead.
+                        if me.skip_margin_block_enabled() && e.starts_with("trade blocked:") {
+                            me.consume_signal_for_margin(&strat.id, strat.security_id);
+                            me.log_throttled(
+                                &format!("marginskip:{}", strat.id),
+                                10_000,
+                                "warn",
+                                &format!(
+                                    "skip (margin unavailable, no late entry) {} -> {}: {e}",
+                                    strat.name, strat.trading_symbol
+                                ),
+                            );
+                        } else {
+                            me.release_fresh_edge(&strat.id);
+                            me.log_throttled(
+                                &format!("delay-fail:{}", strat.id),
+                                5_000,
+                                "error",
+                                &format!("delayed entry {} failed: {e}", strat.name),
+                            );
+                        }
                         if let Some(mut d) = me.doc() {
                             if let Some(s) = d.strategies.iter_mut().find(|s| s.id == strat.id) {
                                 s.last_error = e.clone();
@@ -5484,7 +6030,45 @@ impl RealtimeState {
         });
     }
 
-    async fn open_entry(&self, strat: &Strategy) -> Result<(), String> {
+    /// Spot forming-candle colour gate. Returns `Some(reason)` when an entry must
+    /// be skipped right now because the spot chart's live forming candle is the
+    /// wrong colour for this leg's direction: a bullish leg (Top Gainer) may enter
+    /// only on a GREEN candle, a bearish leg (Top Loser) only on a RED one. Returns
+    /// `None` when the gate is off, the order is the operator's manual order, the
+    /// entry rule is not evaluated on the spot chart, or the required colour is
+    /// present. A doji (close == open) is neither green nor red, so the entry is
+    /// held until a coloured candle forms.
+    async fn spot_candle_gate_skip(&self, settings: &Settings, strat: &Strategy) -> Option<String> {
+        if !settings.spot_candle_gate || strat.manual {
+            return None;
+        }
+        // Only when the entry rule runs on the spot chart. A premium-only or
+        // futures-only run has no spot candle to read, so the gate is a no-op.
+        let run_mode = run_mode_of(strat, settings);
+        if run_mode != "spot" && run_mode != "both" {
+            return None;
+        }
+        // The spot chart is the strategy's own chart for a cash/stock leg, and the
+        // resolved underlying spot for an option leg.
+        let spot = underlying_strategy(strat).unwrap_or_else(|| strat.clone());
+        let candles = self
+            .live_candles(spot.security_id, &spot.exchange_segment, &spot.instrument, &spot.timeframe)
+            .await
+            .ok()?;
+        // Offset 0 (the live forming bar) is the last candle in the series.
+        let last = candles.last()?;
+        let bull = strategy_is_bull(strat);
+        if !spot_candle_color_ok(bull, last.open, last.close) {
+            return Some(if bull {
+                "spot candle not green (Top Gainer needs green)".into()
+            } else {
+                "spot candle not red (Top Loser needs red)".into()
+            });
+        }
+        None
+    }
+
+    async fn open_entry(&self, strat: &Strategy, guard_duplicates: bool) -> Result<(), String> {
         let (mut settings, method, auto_lots, cfg) = {
             let Some(d) = self.doc() else { return Err("state lock".into()) };
             (
@@ -5573,6 +6157,38 @@ impl RealtimeState {
         if option_strike_type(&strat.trading_symbol).is_some() && !self.option_premium_sane(&strat, ltp) {
             return Err("stale option LTP (premium below intrinsic); entry skipped".into());
         }
+        // Execution-instant candle re-check: the candle can flip between the scan
+        // and the fill (especially for the 200ms delayed paper entry), so the same
+        // spot-candle rule is enforced here too - Top Gainer needs a green forming
+        // candle, Top Loser a red one. Returns an error so the caller releases the
+        // signal and retries on a later scan instead of consuming it.
+        if let Some(reason) = self.spot_candle_gate_skip(&settings, &strat).await {
+            return Err(format!("candle gate: {reason}"));
+        }
+        // Same-contract guard: never open a second entry on an option contract
+        // that already has a running position. Checked here (after the contract is
+        // fully resolved) so it covers index strategies too, and skipped for
+        // Manual Order Placement (operator-driven) and for the explicit
+        // "repeat while condition holds" stacking mode. When "one trade per signal"
+        // governs this scanner leg it defers to the signal-scoped rule below, which
+        // permits a genuinely new signal to re-enter the same strike.
+        let once_signal_rules = guard_duplicates && settings.once_per_signal && strat.synthetic;
+        if !once_signal_rules && self.duplicate_entry_blocked(&settings, strat.security_id, guard_duplicates) {
+            return Err(format!(
+                "duplicate: {} {} already running - second entry on the same strike skipped",
+                strat.trading_symbol, strat.instrument
+            ));
+        }
+        // "One trade per signal": the leg has already traded this exact contract in
+        // the current pulse, and the pulse has not ended since, so hold the entry.
+        // Engine-only (Manual Order Placement is exempt), matching the scan-loop
+        // pre-check.
+        if once_signal_rules && self.pulse_blocked(&strat.id, strat.security_id) {
+            return Err(format!(
+                "once-per-signal: {} already traded on this strike - waiting for a fresh filter signal",
+                strat.trading_symbol
+            ));
+        }
         // Publish the exact contract this entry executes on (option premium for
         // index/F&O, or the strategy's own spot) for the Running Strategies view.
         self.record_strat_leg(&strat.id, "trade", &strat);
@@ -5615,24 +6231,9 @@ impl RealtimeState {
         // AI Smart margin gate: the next trade is blocked + warned when its
         // required margin (qty x price) exceeds the budget still available after
         // the running trades. Disabled when no budget is configured.
-        let budget = self.margin_budget();
-        if budget > 0.0 {
-            let (locked, running) = self.locked_margin();
-            let required = qty as f64 * ltp;
-            let available = (budget - locked).max(0.0);
-            if required > available {
-                let msg = format!(
-                    "trade blocked: required margin {} > available {} (Margin {} - locked {} by {} running trade{})",
-                    round2(required),
-                    round2(available),
-                    round2(budget),
-                    round2(locked),
-                    running,
-                    if running == 1 { "" } else { "s" }
-                );
-                self.log("warn", &msg);
-                return Err(msg);
-            }
+        if let Some(msg) = self.margin_block_for_qty(qty, ltp) {
+            self.log("warn", &msg);
+            return Err(msg);
         }
 
         let side = if strat.side.eq_ignore_ascii_case("SELL") { "SELL" } else { "BUY" };
@@ -5917,6 +6518,12 @@ impl RealtimeState {
                     d.entry_timing.truncate(60);
                 }
             }
+        }
+        // Remember this strike as traded for the current signal pulse, so no
+        // further entry is placed on it until the leg's gate resets and meets
+        // again (a fresh signal). Only meaningful while the feature is on.
+        if settings.once_per_signal && strat.synthetic {
+            self.pulse_mark(&strat.id, strat.security_id);
         }
         self.save();
         self.log("info", &format!("opened {} {} {} @ {:.2}", strat.name, side, qty, ltp));
@@ -6387,8 +6994,10 @@ fn nifty_indicator_assignment(candles: &[Candle], conf: &[String], slope_len: i6
     for id in conf {
         let out = algo_core::compute(id, candles, &st);
         // Two reads:
-        // * normal (color = false): the line's trend over a window of points (net
-        //   move) - the same straight segment the chart draws.
+        // * normal (color = false): the direction of the line's LATEST segment
+        //   (newest point vs the one before it) - the slope the chart draws on the
+        //   right edge. Reading a net window of older legs could report the stale
+        //   side after a turn.
         // * color (color = true): the COLOUR the chart draws on the line's last
         //   closed candle - green = bullish, red = bearish. This is the colour the
         //   operator sees, read as-is (never derived from the value slope here).
@@ -6510,40 +7119,46 @@ enum SlTrend {
     Flat,
 }
 
-/// Read the TREND of a straight-line series from a window of its latest points.
+/// Read the CURRENT trend of a straight-line series: the direction of its latest
+/// drawn segment (`newest point - previous point`), i.e. the slope the chart paints
+/// on the right edge and the segment the newest colour belongs to.
 ///
-/// The line's direction is the net move across the window (`last - first`) - the
-/// same slope the chart draws between those points. A single bar's blip only
-/// shifts the read in proportion to its share of the window, so it can no longer
-/// flip the line the way the old neighbouring-point read did (that read saw only
-/// one step). This also matches zigzag structure lines, whose points alternate
-/// up/down and would otherwise average out to "flat".
+/// A straight-line overlay is a chain of segments through its vertices (pivots for
+/// zigzag / auto-trendline, structure points for price-action lines). The previous
+/// read used the NET move across the last `window` points, which averages several
+/// older legs together: a line that has clearly turned up (its latest segment
+/// rising) could still net down or flat through the older legs and report the
+/// WRONG side - exactly why NIFTY-trend stayed on PE through a bullish turn. The
+/// latest segment is the line's actual, visible trend.
 ///
-/// A near-flat line (net move within half an average step of zero) reads `Flat`
-/// so the caller holds its previous side. `None` = still warming up (fewer than
-/// 3 points / non-finite): warm-up must never fabricate a direction.
+/// A step within half an average step (the recent noise floor) reads `Flat`, so a
+/// genuinely flat line holds the previous side rather than flickering. `None` =
+/// still warming up (fewer than 3 points / non-finite): warm-up must never
+/// fabricate a direction.
 fn straight_line_trend(ser: &algo_core::model::SeriesOut, offset: usize, window: usize) -> Option<SlTrend> {
-    let n = ser.data.len();
-    let need = window.max(3);
-    // Last `need` points ending at `offset`, oldest -> newest.
-    let end = n.checked_sub(offset)?;
-    let start = end.saturating_sub(need);
-    if end - start < 3 {
+    let end = ser.data.len().checked_sub(offset)?;
+    if end < 3 {
         return None;
     }
+    let newest = ser.data[end - 1].value;
+    let previous = ser.data[end - 2].value;
+    if !newest.is_finite() || !previous.is_finite() {
+        return None;
+    }
+    let step = newest - previous;
+    // Noise floor: half an average absolute step over the recent window.
+    let need = window.max(3);
+    let start = end.saturating_sub(need + 1);
     let vals: Vec<f64> = (start..end).map(|i| ser.data[i].value).collect();
     if !vals.iter().all(|v| v.is_finite()) {
         return None;
     }
-    let span = vals[vals.len() - 1] - vals[0];
-    // Relative noise floor: the net move must beat half an average step, so a
-    // near-flat line of micro-steps reads Flat instead of flickering a side.
     let sum_step: f64 = vals.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
     let mean_step = sum_step / (vals.len() - 1) as f64;
     let eps = mean_step * 0.5;
-    if span > eps {
+    if step > eps {
         Some(SlTrend::Bull)
-    } else if span < -eps {
+    } else if step < -eps {
         Some(SlTrend::Bear)
     } else {
         Some(SlTrend::Flat)
@@ -6686,6 +7301,22 @@ const LIVE_BAR_TTL: Duration = Duration::from_secs(2);
 /// colour on this interval instead of on every tick.
 pub const COLOR_SCAN_MS: i64 = 1_000;
 
+/// How long a leg's gate must stay falsely BEFORE it counts as a new signal. A
+/// single stale / flickering scan must not end the current signal pulse, or the
+/// "one trade per signal" rule would re-arm and repeat entries on the same
+/// signal. Only a continuous failure of at least this long ends the signal and
+/// lets the next meet begin a fresh one.
+pub const SIGNAL_END_DEBOUNCE_MS: i64 = 3_000;
+
+/// How long a newly-read NIFTY direction must persist before it replaces the
+/// committed side. The assigned straight-line lines are read on every market tick
+/// (20 ms) off the live forming bar, so a single wiggle - one line stepping back
+/// across a pivot while the other sits flat - can net the opposite sign for a
+/// few milliseconds. Committing that flicker flipped the leg/strikes CE<->PE
+/// dozens of times a minute, so no side ever stayed armed long enough to trade.
+/// A genuine turn persists well beyond this window and still flips.
+pub const NIFTY_FLIP_CONFIRM_MS: i64 = 1_500;
+
 /// A sampled colour-filter decision plus when it was taken.
 #[derive(Clone)]
 struct ColorSample {
@@ -6706,6 +7337,19 @@ fn color_samples() -> &'static Mutex<HashMap<ColorSampleKey, ColorSample>> {
 /// True for the dedicated "Straight Line Indicator Color Detection" gate keys.
 fn is_color_filter(k: &str) -> bool {
     k.starts_with("BullSlColor") || k.starts_with("BearSlColor")
+}
+
+/// True for ANY straight-line indicator filter the strict line gate reads:
+///   * the "Straight Line Indicators" DIRECTION rows (`Sl*`, and the Volume line
+///     `Vl`), which fire on the line's trend/slope, and
+///   * the "Straight Line Indicator Color Detection" rows (`SlColor*`), which
+///     fire on the line's green/red colour.
+/// Both live in the Bullish/Bearish filter lists, so the gate covers whichever
+/// of them the operator ticked. Non-line filters (arrows, OI trend, Pbg, EMA
+/// families, ...) are excluded.
+fn is_straight_line_filter(k: &str) -> bool {
+    let base = k.strip_prefix("Bull").or_else(|| k.strip_prefix("Bear")).unwrap_or(k);
+    base.starts_with("Sl") || base == "Vl"
 }
 
 /// Evaluate a colour filter at most once per `COLOR_SCAN_MS`, so the algo reads
@@ -7932,6 +8576,18 @@ fn strategy_is_bull(strat: &Strategy) -> bool {
     }
 }
 
+/// Spot forming-candle colour rule for the `spot_candle_gate`: a bullish leg
+/// (Top Gainer) requires a GREEN candle (`close > open`), a bearish leg (Top
+/// Loser) a RED one (`close < open`). A doji (`close == open`) is neither, so it
+/// fails both directions and the entry is held until a coloured candle forms.
+fn spot_candle_color_ok(bull: bool, open: f64, close: f64) -> bool {
+    if bull {
+        close > open
+    } else {
+        close < open
+    }
+}
+
 /// True when the option leg must follow each strategy's own stock/filter side
 /// instead of a global scanner direction ("Filter-side routing" - bullish
 /// filters trade CE, bearish filters PE). When on, no NIFTY lock / Top-Movers
@@ -8153,7 +8809,12 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
     // pane lines) once instead of once per filter. This is the hot path of the
     // engine's entry decision.
     let _sc = IndScope::enter();
-    let bull = strategy_is_bull(strat);
+    // "Premium chart only (run + trade)": every strategy is analysed on its
+    // option-premium chart. A premium only rises while its own leg is in favour,
+    // so the entry is always gated by the BULLISH filter set - even when the
+    // operator routed the trade to the PE side. In this mode the bearish filters
+    // are not applied at all (and cannot veto through the opposite-side check).
+    let bull = settings.premium_only || strategy_is_bull(strat);
     let cons = consensus_cfg(settings);
     let sup = support_trend_cfg(settings);
     let res = resistance_trend_cfg(settings);
@@ -8189,17 +8850,21 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
     if arrow_pass == Some(true) {
         f.pass += 1;
     }
-    for (k, v) in settings.filters.iter() {
-        if !*v || is_stream_flag(k) {
-            continue;
-        }
-        let opp = if bull { filter_is_bear(k) } else { filter_is_bull(k) };
-        if !opp {
-            continue;
-        }
-        f.opp_total += 1;
-        if gate_filter_eval(k, candles, offset, cons, sup, res) == Some(true) {
-            f.opposite += 1;
+    // Premium-chart mode ignores the bearish filter set entirely, so it must not
+    // be counted as opposite-side agreement (that would veto every PE entry).
+    if !settings.premium_only {
+        for (k, v) in settings.filters.iter() {
+            if !*v || is_stream_flag(k) {
+                continue;
+            }
+            let opp = if bull { filter_is_bear(k) } else { filter_is_bull(k) };
+            if !opp {
+                continue;
+            }
+            f.opp_total += 1;
+            if gate_filter_eval(k, candles, offset, cons, sup, res) == Some(true) {
+                f.opposite += 1;
+            }
         }
     }
     // Opposite-side confirmation veto. The chart only "reads the other way" when
@@ -8252,6 +8917,53 @@ fn filter_gate_explain(settings: &Settings, strat: &Strategy, candles: &[Candle]
         "ok={ok} pass={}/{} score={:.0}% strict={} brain={} veto={} opp={}/{} thr={}",
         f.pass, f.total, score, f.strict, f.brain, f.veto, f.opposite, f.opp_total, settings.brain_threshold
     )
+}
+
+/// Strict straight-line gate (Indicator-filters mode, scanner / NIFTY-trend legs
+/// only). When `strict_line_color` is ON, the leg must be confirmed by EVERY
+/// straight-line filter ticked on its OWN side, from BOTH sections of the
+/// Bullish/Bearish lists:
+///   * "Straight Line Indicators" - the line DIRECTION rows (`BullSl*` / `BearSl*`
+///     and the Volume line `BullVl` / `BearVl`) must trend the leg's way.
+///   * "Straight Line Indicator Color Detection" - the line COLOUR rows
+///     (`BullSlColor*` / `BearSlColor*`) must read GREEN on the CE side, RED on
+///     the PE side.
+/// A ticked line reading the opposite way vetoes the entry outright, so a
+/// majority / AI-Brain gate can no longer let one dissenting line slip a leg
+/// through. Returns `true` (non-blocking) when the feature is off, when the
+/// strategy is not a scanner leg, or when no line filter is ticked on that side.
+fn strict_line_gate_ok(settings: &Settings, strat: &Strategy, candles: &[Candle], offset: usize) -> bool {
+    if !settings.strict_line_color || !strat.synthetic {
+        return true;
+    }
+    // NIFTY Trend Following owns the opposite-side block for its universe: the
+    // assigned NIFTY confirmation indicators decide which side may run (via the
+    // `niftyNetStrict` / `niftyAllAgreeStrict` gates, which drop the opposite
+    // side at scanner level). The manually ticked straight-line filters are the
+    // entry (majority) rule only, so their all-agree gate is skipped here while
+    // NIFTY trend is on - otherwise three ticked lines would need to agree on
+    // every stock and block essentially every trade.
+    if settings.nifty_trend_on {
+        return true;
+    }
+    let _sc = IndScope::enter();
+    let bull = settings.premium_only || strategy_is_bull(strat);
+    let cons = consensus_cfg(settings);
+    let sup = support_trend_cfg(settings);
+    let res = resistance_trend_cfg(settings);
+    for (k, v) in settings.filters.iter() {
+        if !*v || is_stream_flag(k) || !is_straight_line_filter(k) {
+            continue;
+        }
+        let on_side = if bull { filter_is_bull(k) } else { filter_is_bear(k) };
+        if !on_side {
+            continue;
+        }
+        if gate_filter_eval(k, candles, offset, cons, sup, res) == Some(false) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Direction Guard: block the entry when price action + EMA9/21 + EMA21/35 +
@@ -8436,12 +9148,21 @@ fn fno_segment(exch: &str) -> &'static str {
     }
 }
 
+/// True when the operator selected BOTH Top-Mover legs: a positive Top Gainers
+/// count AND a positive Top Losers count. Selecting both is an explicit call to
+/// work the bullish (CE) and bearish (PE) legs together, so the Top-Movers auto
+/// bias must not narrow the engine onto a single side.
+fn movers_both_legs(settings: &Settings) -> bool {
+    settings.movers_on && settings.movers_gainers > 0 && settings.movers_losers > 0
+}
+
 /// Auto CE/PE bias for the Top Movers scanner (old AST `autoRunInSide` parity).
 /// Classifies the ACTUAL traded universe - the operator's selected top gainers
 /// / top losers - rather than whole-market breadth, so switching the selection
 /// flips the auto side. Gainers -> +1 (CE), losers -> -1 (PE). When both legs
 /// are selected the one with more live rows wins; an exact tie falls back to
-/// market-wide breadth (`up`/`down`).
+/// market-wide breadth (`up`/`down`). NOTE: this bias is only applied when the
+/// operator selected a single leg - see [`movers_both_legs`] / `auto_option_side`.
 fn movers_auto_bias(want_g: bool, want_l: bool, pos: i64, neg: i64, up: i64, down: i64) -> i64 {
     if want_g && want_l {
         if pos > neg {
@@ -9392,7 +10113,7 @@ pub async fn entry_post(State(rt): State<RealtimeState>, Json(v): Json<Value>) -
     let Some(strat) = strat else {
         return Json(json!({ "ok": false, "error": "strategy not found" }));
     };
-    match rt.open_entry(&strat).await {
+    match rt.open_entry(&strat, false).await {
         Ok(_) => Json(json!({ "ok": true })),
         Err(e) => Json(json!({ "ok": false, "error": e })),
     }
@@ -10426,6 +11147,12 @@ pub fn paper_router() -> Router<RealtimeState> {
     rt_routes!("/api/paper")
 }
 
+/// Second independent paper-trading API (`/api/paper2/*`), routed to its own
+/// engine with a separate durable state file - shares no data with `/api/paper`.
+pub fn paper2_router() -> Router<RealtimeState> {
+    rt_routes!("/api/paper2")
+}
+
 // Keep an unused import from warning in some build profiles.
 #[allow(dead_code)]
 fn _touch(_: LegName, _: ModifyOrderRequest, _: MarketState) {}
@@ -10479,6 +11206,16 @@ mod gate_tests {
         Strategy { id: "t".into(), name: "T".into(), category: "BEARISH".into(), side: "SELL".into(), ..Default::default() }
     }
 
+    #[test]
+    fn independent_engines_use_distinct_state_files() {
+        // The real engine, the first paper engine and the second paper engine must
+        // each persist to their own file, so no engine can ever read another's
+        // strategies/settings/ledger.
+        assert_ne!(state_path(STATE_FILE_REAL), state_path(STATE_FILE_PAPER));
+        assert_ne!(state_path(STATE_FILE_PAPER), state_path(STATE_FILE_PAPER2));
+        assert_ne!(state_path(STATE_FILE_REAL), state_path(STATE_FILE_PAPER2));
+    }
+
     #[tokio::test]
     async fn blocked_delayed_entry_releases_the_fresh_edge() {
         // In "fresh signal" mode the entry edge is consumed the moment the order
@@ -10493,6 +11230,327 @@ mod gate_tests {
         assert!(rt.sig_state_is_set("scan:1:PE"), "edge is consumed at queue time");
         rt.release_fresh_edge("scan:1:PE");
         assert!(!rt.sig_state_is_set("scan:1:PE"), "an unfilled entry must release the edge");
+    }
+
+    #[tokio::test]
+    async fn duplicate_entry_on_the_same_contract_is_blocked() {
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        let s = Settings::default();
+        assert!(!rt.contract_running(12345), "no position yet");
+        assert!(!rt.duplicate_entry_blocked(&s, 12345, true), "nothing to dedupe against");
+        if let Some(mut d) = rt.doc() {
+            d.positions.push(json!({ "id": "p1", "securityId": 12345, "strategyId": "scan:1:CE" }));
+        }
+        assert!(rt.contract_running(12345), "running position is seen");
+        // A second entry on the same contract is blocked: fresh-signal
+        // re-trigger, a second strategy resolving to the strike, or a scan after
+        // a restart with a cleared in-memory signal edge.
+        assert!(rt.duplicate_entry_blocked(&s, 12345, true), "running contract blocks a duplicate");
+        // A different strike is unaffected.
+        assert!(!rt.duplicate_entry_blocked(&s, 99999, true), "another strike is fine");
+        // Manual Order Placement bypasses the guard (operator-driven).
+        assert!(!rt.duplicate_entry_blocked(&s, 12345, false), "manual placement is not deduped");
+        // The explicit "repeat while condition holds" stacking mode is exempt.
+        let mut stacking = s.clone();
+        stacking.multi_always_on = true;
+        assert!(!rt.duplicate_entry_blocked(&stacking, 12345, true), "always-on stacking is exempt");
+        // An unresolved security id (0) is never treated as a contract.
+        assert!(!rt.duplicate_entry_blocked(&s, 0, true), "unresolved id is not deduped");
+    }
+
+    #[tokio::test]
+    async fn once_per_signal_blocks_repeat_strikes_until_a_fresh_signal() {
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        let id = "scan:1:CE";
+        assert!(!rt.pulse_blocked(id, 111), "nothing traded yet");
+        // Trading a strike remembers it for the current signal pulse.
+        rt.pulse_mark(id, 111);
+        assert!(rt.pulse_blocked(id, 111), "same strike is blocked within the pulse");
+        assert!(!rt.pulse_blocked(id, 222), "a different strike is still allowed");
+        assert!(!rt.pulse_blocked("scan:2:CE", 111), "another leg has its own memory");
+        // A gate that stays true keeps the strike blocked until the pulse ends.
+        rt.set_sig_state(id, true);
+        assert!(!rt.sig_state_is_set("scan:2:CE"), "only this leg's edge was set");
+        // The gate stopping ends the pulse: next meet is a brand-new fresh signal.
+        rt.clear_signal_edge(id);
+        assert!(!rt.sig_state_is_set(id), "gate reset clears the fresh-edge flag");
+        assert!(!rt.pulse_blocked(id, 111), "a fresh signal may trade the strike again");
+    }
+
+    #[tokio::test]
+    async fn once_per_signal_is_signal_scoped_not_position_scoped() {
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        let mut s = Settings::default();
+        s.once_per_signal = true;
+        s.multi_always_on = true; // stacking mode must not change the signal rule
+        let strat = Strategy {
+            id: "scan:1:PE".into(),
+            security_id: 1,
+            category: "BEARISH".into(),
+            synthetic: true,
+            ..Default::default()
+        };
+        let contract = 116798;
+        // Nothing traded this signal yet: allowed even while a position runs.
+        if let Some(mut d) = rt.doc() {
+            d.positions.push(json!({ "id": "p1", "securityId": contract, "strategyId": strat.id }));
+        }
+        assert_eq!(
+            rt.once_per_signal_block_reason(&s, &strat, contract),
+            None,
+            "a running position alone never blocks - only a repeat inside the same signal does"
+        );
+        // The same contract already traded this signal: blocked.
+        rt.pulse_mark(&strat.id, contract);
+        assert_eq!(
+            rt.once_per_signal_block_reason(&s, &strat, contract),
+            Some("already traded this strike on the current signal")
+        );
+        // A new signal (pulse reset) may trade the same strike again, position or not.
+        rt.clear_signal_edge(&strat.id);
+        assert_eq!(rt.once_per_signal_block_reason(&s, &strat, contract), None);
+        // Non-synthetic (normal-mode) strategies are never held by this guard.
+        let mut norm = strat.clone();
+        norm.synthetic = false;
+        rt.pulse_mark(&norm.id, contract);
+        assert_eq!(rt.once_per_signal_block_reason(&s, &norm, contract), None);
+        // Feature off: no guard at all.
+        s.once_per_signal = false;
+        assert_eq!(rt.once_per_signal_block_reason(&s, &strat, contract), None);
+    }
+
+    #[tokio::test]
+    async fn signal_end_debounce_ignores_a_single_flicker() {
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        let id = "scan:1:PE";
+        // First failing scan starts the debounce; not due yet.
+        assert!(!rt.end_signal_if_due(id), "a lone failing scan does not end the signal");
+        // The gate recovers on the next scan: the debounce is cancelled...
+        rt.note_signal_pass(id);
+        // ...so the following failure starts a brand-new count, still not due.
+        assert!(!rt.end_signal_if_due(id), "the dip was cancelled, so the count restarts");
+        // Simulate a continuous failure older than the debounce window.
+        if let Ok(mut m) = rt.sig_fail_since.lock() {
+            m.insert(id.to_string(), now_ms() - SIGNAL_END_DEBOUNCE_MS - 1);
+        }
+        assert!(rt.end_signal_if_due(id), "a sustained failure ends the signal");
+    }
+
+    #[tokio::test]
+    async fn nifty_strict_gates_block_scanner_sides_on_line_disagreement() {
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        // Feature off: no gate ever applies.
+        let off = Settings::default();
+        assert!(rt.nifty_line_side_ok(&off, true));
+        assert!(rt.nifty_line_side_ok(&off, false));
+
+        // Trend on but no strict checkbox ticked: still a no-op.
+        let mut plain = Settings::default();
+        plain.nifty_trend_on = true;
+        assert!(rt.nifty_line_side_ok(&plain, true));
+        assert!(rt.nifty_line_side_ok(&plain, false));
+
+        // NET-direction gate: CE needs net > 0, PE needs net < 0; a tie blocks.
+        let mut net = Settings::default();
+        net.nifty_trend_on = true;
+        net.nifty_net_strict = true;
+        rt.nifty_raw_net.store(1, Ordering::Relaxed);
+        assert!(rt.nifty_line_side_ok(&net, true), "net bullish allows CE");
+        assert!(!rt.nifty_line_side_ok(&net, false), "net bullish blocks PE");
+        rt.nifty_raw_net.store(-1, Ordering::Relaxed);
+        assert!(!rt.nifty_line_side_ok(&net, true), "net bearish blocks CE");
+        assert!(rt.nifty_line_side_ok(&net, false), "net bearish allows PE");
+        rt.nifty_raw_net.store(0, Ordering::Relaxed);
+        assert!(!rt.nifty_line_side_ok(&net, true), "tie blocks CE");
+        assert!(!rt.nifty_line_side_ok(&net, false), "tie blocks PE");
+
+        // All-lines-agree gate: CE needs every line bull (+1), PE every bear (-1);
+        // a mixed read (0) blocks both.
+        let mut agree = Settings::default();
+        agree.nifty_trend_on = true;
+        agree.nifty_all_agree_strict = true;
+        rt.nifty_agree.store(1, Ordering::Relaxed);
+        assert!(rt.nifty_line_side_ok(&agree, true), "all-bull allows CE");
+        assert!(!rt.nifty_line_side_ok(&agree, false), "all-bull blocks PE");
+        rt.nifty_agree.store(-1, Ordering::Relaxed);
+        assert!(!rt.nifty_line_side_ok(&agree, true), "all-bear blocks CE");
+        assert!(rt.nifty_line_side_ok(&agree, false), "all-bear allows PE");
+        rt.nifty_agree.store(0, Ordering::Relaxed);
+        assert!(!rt.nifty_line_side_ok(&agree, true), "mixed blocks CE");
+        assert!(!rt.nifty_line_side_ok(&agree, false), "mixed blocks PE");
+
+        // Both ticked: BOTH must agree. Net bullish but a mixed line read fails
+        // the agree gate, so the CE leg is still blocked.
+        let mut both = Settings::default();
+        both.nifty_trend_on = true;
+        both.nifty_net_strict = true;
+        both.nifty_all_agree_strict = true;
+        rt.nifty_raw_net.store(1, Ordering::Relaxed);
+        rt.nifty_agree.store(0, Ordering::Relaxed);
+        assert!(!rt.nifty_line_side_ok(&both, true), "agree gate can veto a net-bullish CE");
+        rt.nifty_agree.store(1, Ordering::Relaxed);
+        assert!(rt.nifty_line_side_ok(&both, true), "both agree allows CE");
+    }
+
+    #[tokio::test]
+    async fn apply_nifty_direction_tracks_raw_net_and_agree_state() {
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        // All three lines bullish (net +3) from NEUTRAL commits at once: net +1,
+        // agree +1, side BULLISH.
+        rt.apply_nifty_direction(vec!["a".into(), "b".into(), "c".into()], vec![], 3, "5min");
+        assert_eq!(rt.nifty_raw_net.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.nifty_agree.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.nifty_dir.load(Ordering::Relaxed), 1);
+        // Mixed on the SAME side (2 bull / 1 bear, net +1): net stays +1 but agree
+        // drops to 0, so the all-lines-agree gate blocks even though net passes.
+        rt.apply_nifty_direction(vec!["a".into(), "b".into()], vec!["c".into()], 1, "5min");
+        assert_eq!(rt.nifty_raw_net.load(Ordering::Relaxed), 1);
+        assert_eq!(rt.nifty_agree.load(Ordering::Relaxed), 0);
+        // A lone opposite read must NOT flip the committed side - it starts the
+        // confirmation window instead, so a per-tick wiggle cannot switch legs.
+        rt.apply_nifty_direction(vec![], vec!["a".into(), "b".into()], -2, "5min");
+        assert_eq!(rt.nifty_dir.load(Ordering::Relaxed), 1, "one opposite read holds the side");
+        assert_eq!(rt.nifty_raw_net.load(Ordering::Relaxed), 1);
+        // Only once the new side has persisted past the confirm window does it
+        // commit: net -1, agree -1, side BEARISH.
+        rt.nifty_pending_since
+            .store(now_ms() - NIFTY_FLIP_CONFIRM_MS - 1, Ordering::Relaxed);
+        rt.apply_nifty_direction(vec![], vec!["a".into(), "b".into()], -2, "5min");
+        assert_eq!(rt.nifty_dir.load(Ordering::Relaxed), -1);
+        assert_eq!(rt.nifty_raw_net.load(Ordering::Relaxed), -1);
+        assert_eq!(rt.nifty_agree.load(Ordering::Relaxed), -1);
+        // A dead-heat tie holds the committed side and its gate state - a
+        // momentary tie must never free BOTH legs.
+        rt.apply_nifty_direction(vec!["a".into()], vec!["b".into()], 0, "5min");
+        assert_eq!(rt.nifty_dir.load(Ordering::Relaxed), -1);
+        assert_eq!(rt.nifty_raw_net.load(Ordering::Relaxed), -1);
+        assert_eq!(rt.nifty_agree.load(Ordering::Relaxed), -1);
+    }
+
+    #[tokio::test]
+    async fn nifty_strict_gate_blocks_the_opposite_movers_side() {
+        // With BOTH Top Gainers and Top Losers selected in Top Movers and the
+        // NIFTY-trend strict gate ON, only the side the assigned straight-line
+        // indicators confirm may build legs; the opposite side is dropped.
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        let gainer = 13061; // 360ONE (NSE_EQ EQUITY)
+        let loser = 21614; // ABCAPITAL (NSE_EQ EQUITY)
+        if let Ok(mut g) = rt.movers_cache.lock() {
+            *g = (
+                now_ms(),
+                json!({ "gainers": [{"securityId": gainer, "last": 100.0}], "losers": [{"securityId": loser, "last": 100.0}] }),
+            );
+        }
+        let mut s = Settings::default();
+        s.movers_on = true;
+        s.nifty_trend_on = true;
+        s.filters.insert("BullSlTrend".into(), true);
+        s.filters.insert("BearSlTrend".into(), true);
+        let ce = format!("scan:{}:CE", gainer);
+        let pe = format!("scan:{}:PE", loser);
+        let has = |out: &[Strategy], key: &str| out.iter().any(|t| t.id == key);
+
+        // No strict gate: the old behaviour builds BOTH sides.
+        assert!(has(&rt.scanner_targets(&s), &ce) && has(&rt.scanner_targets(&s), &pe), "baseline runs both sides");
+
+        // NET gate, NIFTY bearish: Top Losers (PE) run, Top Gainers (CE) blocked.
+        s.nifty_net_strict = true;
+        rt.nifty_raw_net.store(-1, Ordering::Relaxed);
+        let out = rt.scanner_targets(&s);
+        assert!(!has(&out, &ce), "bearish NIFTY strictly blocks the Top Gainer CE leg");
+        assert!(has(&out, &pe), "bearish NIFTY keeps the Top Loser PE leg");
+
+        // NET gate, NIFTY bullish: the mirror image.
+        rt.nifty_raw_net.store(1, Ordering::Relaxed);
+        let out = rt.scanner_targets(&s);
+        assert!(has(&out, &ce), "bullish NIFTY keeps the Top Gainer CE leg");
+        assert!(!has(&out, &pe), "bullish NIFTY strictly blocks the Top Loser PE leg");
+
+        // Tie (no committed direction): both sides blocked.
+        rt.nifty_raw_net.store(0, Ordering::Relaxed);
+        let out = rt.scanner_targets(&s);
+        assert!(!has(&out, &ce) && !has(&out, &pe), "a tie blocks both sides");
+
+        // ALL-LINES-AGREE gate: all-bearish keeps PE only, mixed blocks both.
+        s.nifty_net_strict = false;
+        s.nifty_all_agree_strict = true;
+        rt.nifty_agree.store(-1, Ordering::Relaxed);
+        let out = rt.scanner_targets(&s);
+        assert!(has(&out, &pe) && !has(&out, &ce), "all-bearish keeps PE, blocks CE");
+        rt.nifty_agree.store(0, Ordering::Relaxed);
+        let out = rt.scanner_targets(&s);
+        assert!(!has(&out, &ce) && !has(&out, &pe), "a mixed line read blocks both sides");
+
+        // Gate OFF again: both sides come back (no permanent lock).
+        s.nifty_all_agree_strict = false;
+        assert!(has(&rt.scanner_targets(&s), &ce) && has(&rt.scanner_targets(&s), &pe), "gate off restores both sides");
+    }
+
+    #[tokio::test]
+    async fn nifty_direction_owns_the_movers_side_over_the_auto_bias() {
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        let gainer = 13061; // 360ONE (NSE_EQ EQUITY)
+        let loser = 21614; // ABCAPITAL (NSE_EQ EQUITY)
+        if let Ok(mut g) = rt.movers_cache.lock() {
+            *g = (
+                now_ms(),
+                json!({ "gainers": [{"securityId": gainer, "last": 100.0}], "losers": [{"securityId": loser, "last": 100.0}] }),
+            );
+        }
+        let mut s = Settings::default();
+        s.movers_on = true;
+        s.nifty_trend_on = true;
+        s.filters.insert("BullSlTrend".into(), true);
+        s.filters.insert("BearSlTrend".into(), true);
+        // Auto Select Mode is ON and would pick the side from the movers bias.
+        s.run_in_enabled = true;
+        s.run_in_auto = true;
+        let ce = format!("scan:{}:CE", gainer);
+        let pe = format!("scan:{}:PE", loser);
+        let has = |out: &[Strategy], key: &str| out.iter().any(|t| t.id == key);
+
+        // A bullish NIFTY must arm the Top Gainer CE leg even though the movers
+        // auto bias points PE (a down day with the index line rising).
+        rt.mover_bias.store(-1, Ordering::Relaxed);
+        rt.nifty_dir.store(1, Ordering::Relaxed);
+        if let Ok(mut g) = rt.nifty_bull_filters.lock() {
+            *g = vec!["autotrend".into()];
+        }
+        if let Ok(mut g) = rt.nifty_bear_filters.lock() {
+            g.clear();
+        }
+        let out = rt.scanner_targets(&s);
+        assert!(has(&out, &ce), "bullish NIFTY owns the side: Top Gainer CE must run over a PE auto bias");
+        assert!(!has(&out, &pe), "bullish NIFTY must not arm the Top Loser PE leg");
+
+        // Mirror: a bearish NIFTY owns the PE leg over a CE auto bias.
+        rt.mover_bias.store(1, Ordering::Relaxed);
+        rt.nifty_dir.store(-1, Ordering::Relaxed);
+        if let Ok(mut g) = rt.nifty_bull_filters.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = rt.nifty_bear_filters.lock() {
+            *g = vec!["autotrend".into()];
+        }
+        let out = rt.scanner_targets(&s);
+        assert!(has(&out, &pe), "bearish NIFTY owns the side: Top Loser PE must run over a CE auto bias");
+        assert!(!has(&out, &ce), "bearish NIFTY must not arm the Top Gainer CE leg");
     }
 
     #[test]
@@ -10601,12 +11659,17 @@ mod gate_tests {
     }
 
     #[test]
-    fn line_trend_reads_the_line_not_the_last_blip() {
-        // Chronological values: a clear fall (5->4->3->2->1) then one up-tick to 2.
-        // The OLD neighbouring-point read (2 > 1) reported BULLISH; the windowed
-        // read follows the falling line and stays BEARISH.
-        let down_bounce = line_of(&[5.0, 4.0, 3.0, 2.0, 1.0, 2.0]);
-        assert_eq!(straight_line_trend(&down_bounce, 0, 5), Some(SlTrend::Bear));
+    fn line_trend_reads_the_lines_latest_segment() {
+        // The trend is the direction of the newest drawn segment - what the chart
+        // paints on the right edge - NOT the net across a window of older legs.
+        // A line that fell then turned up is BULLISH now, even though the net over
+        // the last few vertices is still down: the old windowed read reported the
+        // stale side here, which is why NIFTY-trend stuck on PE through a turn.
+        let turn_up = line_of(&[10.0, 6.0, 9.0, 5.0, 8.0]);
+        assert_eq!(straight_line_trend(&turn_up, 0, 5), Some(SlTrend::Bull));
+        // A line that rose then turned down is BEARISH now.
+        let turn_down = line_of(&[4.0, 8.0, 5.0, 9.0, 6.0]);
+        assert_eq!(straight_line_trend(&turn_down, 0, 5), Some(SlTrend::Bear));
         // A clear rise stays bullish.
         let rise = line_of(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(straight_line_trend(&rise, 0, 5), Some(SlTrend::Bull));
@@ -10827,6 +11890,49 @@ mod gate_tests {
         assert_eq!(movers_auto_bias(false, false, 0, 0, 9, 1), 0);
     }
 
+    #[tokio::test]
+    async fn both_movers_legs_disable_the_single_side_auto_bias() {
+        // Selecting BOTH the Top Gainers and Top Losers legs must let both the
+        // CE and PE scanner legs run instead of collapsing onto the movers
+        // dominance side. With a single leg selected the bias still picks it.
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+
+        let mut s = Settings::default();
+        s.movers_on = true;
+        s.movers_gainers = 5;
+        s.movers_losers = 5;
+        s.run_in_enabled = true;
+        s.run_in_auto = true;
+        s.run_in_side = "PE".into();
+        rt.mover_bias.store(1, Ordering::Relaxed);
+
+        // Both legs selected: no single auto side, and the manual run-in side
+        // must not re-narrow the scanner either.
+        assert_eq!(rt.auto_option_side(&s), None);
+        assert_eq!(rt.effective_run_in_side(&s), None);
+        assert_eq!(rt.active_side(&s), None);
+
+        // Only the gainer leg selected: the auto bias picks CE again.
+        s.movers_losers = 0;
+        assert_eq!(rt.auto_option_side(&s), Some("CE"));
+        assert_eq!(rt.active_side(&s), Some("CE"));
+
+        // Only the loser leg selected: the auto bias picks PE.
+        rt.mover_bias.store(-1, Ordering::Relaxed);
+        s.movers_gainers = 0;
+        s.movers_losers = 5;
+        assert_eq!(rt.auto_option_side(&s), Some("PE"));
+        assert_eq!(rt.active_side(&s), Some("PE"));
+
+        // Mover scan off: the manual run-in side takes over again.
+        rt.mover_bias.store(1, Ordering::Relaxed);
+        s.movers_on = false;
+        assert_eq!(rt.auto_option_side(&s), None);
+        assert_eq!(rt.effective_run_in_side(&s), Some("PE"));
+    }
+
     #[test]
     fn option_strike_type_parses_resolved_legs() {
         assert_eq!(option_strike_type("POLICYBZR-Sep2026-1900-PE"), Some((1900.0, "PE")));
@@ -10973,6 +12079,123 @@ mod gate_tests {
         assert!(!filter_gate(&s, &bear_strategy(), &c, 0), "met opposite filter vetoes");
         s.filters.insert("BearIncDown".into(), true);
         assert!(!filter_gate(&s, &bear_strategy(), &c, 0), "opposing down filter fails");
+    }
+
+    #[test]
+    fn premium_chart_only_gates_every_side_on_bull_filters() {
+        let c = ramp(60, 100.0, 1.0);
+        let mut s = Settings::default();
+        s.filters.insert("BullIncUp".into(), true);
+        // The operator also has a bearish filter ticked (e.g. for the PE side).
+        s.filters.insert("BearIncDown".into(), true);
+        // Normally a bearish strategy is gated by its own bearish filters; the
+        // failing bear filter plus the met opposite (bull) filter vetoes.
+        assert!(!filter_gate(&s, &bear_strategy(), &c, 0), "bear side uses bear filters normally");
+        // "Premium chart only (run + trade)": every side is gated by the bullish
+        // filter set, so the rising ramp passes on the PE side too and the ticked
+        // bearish filter can no longer veto it.
+        s.premium_only = true;
+        assert!(filter_gate(&s, &bear_strategy(), &c, 0), "premium chart uses bull filters on the PE side");
+        assert!(filter_gate(&s, &bull_strategy(), &c, 0), "premium chart uses bull filters on the CE side");
+    }
+
+    #[test]
+    fn strict_line_gate_covers_direction_and_colour_line_filters() {
+        let _g = ind_test_lock();
+        let up = ramp(400, 100.0, 0.6);
+        let down = ramp(400, 340.0, -0.6);
+        let tokens = [
+            "AutoTrendline", "ElliottWave", "ZigZag", "SupplyDemand", "PriceAction",
+            "GannFan", "Pitchfork", "TrendProjection",
+        ];
+        // A "Straight Line Indicators" DIRECTION row whose bull gate trends up on
+        // the rising ramp and down on the falling ramp...
+        let dir_tok = tokens
+            .iter()
+            .find(|tok| {
+                filter_eval(&format!("BullSl{tok}"), &up, 0) == Some(true)
+                    && filter_eval(&format!("BullSl{tok}"), &down, 0) == Some(false)
+            })
+            .expect("a bull line whose direction is up / down");
+        // ...and a COLOUR-detection row that reads green up / red down.
+        let col_tok = tokens
+            .iter()
+            .find(|tok| {
+                filter_eval(&format!("BullSlColor{tok}"), &up, 0) == Some(true)
+                    && filter_eval(&format!("BullSlColor{tok}"), &down, 0) == Some(false)
+            })
+            .expect("a bull line that is green up / red down");
+        color_samples().lock().unwrap().clear();
+
+        let mut bull = bull_strategy();
+        bull.synthetic = true;
+        let mut bear = bear_strategy();
+        bear.synthetic = true;
+
+        // Direction row only.
+        let mut s = Settings::default();
+        s.strict_line_color = true;
+        s.filters.insert(format!("BullSl{dir_tok}"), true);
+        assert!(strict_line_gate_ok(&s, &bull, &up, 0), "direction row confirms an up line");
+        assert!(!strict_line_gate_ok(&s, &bull, &down, 0), "direction row blocks a down line");
+        // The row is a bull filter, so it never gates the opposite PE leg.
+        assert!(strict_line_gate_ok(&s, &bear, &down, 0), "opposite-side row does not gate the PE leg");
+        color_samples().lock().unwrap().clear();
+
+        // Colour row only.
+        let mut s2 = Settings::default();
+        s2.strict_line_color = true;
+        s2.filters.insert(format!("BullSlColor{col_tok}"), true);
+        color_samples().lock().unwrap().clear();
+        assert!(strict_line_gate_ok(&s2, &bull, &up, 0), "colour row confirms a green line");
+        color_samples().lock().unwrap().clear();
+        assert!(!strict_line_gate_ok(&s2, &bull, &down, 0), "colour row blocks a red line");
+        color_samples().lock().unwrap().clear();
+
+        // Both sections together: either dissenting line vetoes the leg.
+        s.filters.insert(format!("BullSlColor{col_tok}"), true);
+        color_samples().lock().unwrap().clear();
+        assert!(!strict_line_gate_ok(&s, &bull, &down, 0), "either section can veto");
+        // A non-line filter (EMA family) that fails must NOT be read by this gate.
+        let mut s3 = Settings::default();
+        s3.strict_line_color = true;
+        s3.filters.insert("BullIncUp".into(), true);
+        assert!(strict_line_gate_ok(&s3, &bull, &down, 0), "non-line filters are not part of the strict gate");
+        color_samples().lock().unwrap().clear();
+
+        // Feature off -> non-blocking again.
+        s.strict_line_color = false;
+        assert!(strict_line_gate_ok(&s, &bull, &down, 0), "gate off -> no line veto");
+        // NIFTY Trend Following ON: the manual all-agree gate is skipped for
+        // scanner legs - the assigned NIFTY indicators own the opposite-side
+        // block (niftyNetStrict / niftyAllAgreeStrict), so ticked lines must not
+        // stall every entry.
+        s.strict_line_color = true;
+        s.nifty_trend_on = true;
+        assert!(strict_line_gate_ok(&s, &bull, &down, 0), "NIFTY trend owns the strict block");
+        s.nifty_trend_on = false;
+        // Normal-mode (non-synthetic) strategies are never line-gated.
+        s.strict_line_color = true;
+        bull.synthetic = false;
+        assert!(strict_line_gate_ok(&s, &bull, &down, 0), "normal-mode strategy is not line-gated");
+        color_samples().lock().unwrap().clear();
+    }
+
+    #[test]
+    fn straight_line_filter_predicate_matches_both_sections() {
+        for k in [
+            "BullSlAutoTrendline", "BearSlPitchfork", "BullVl", "BearVl",
+            "BullSlConsensus", "BearSlSupport", "BearSlResistance",
+            "BullSlColorAutoTrendline", "BearSlColorVl", "BearSlColorConsensus",
+        ] {
+            assert!(is_straight_line_filter(k), "{k} must be a straight-line filter");
+        }
+        for k in [
+            "BullArrowZigZag", "BearArrowVl", "BullIncUp", "BearIncDown", "BullOit",
+            "BearOit", "BullCandle", "BullEmaTrend9", "BearMacd", "BullMeetOvlHma",
+        ] {
+            assert!(!is_straight_line_filter(k), "{k} must NOT be a straight-line filter");
+        }
     }
 
     #[test]
@@ -11199,12 +12422,23 @@ mod gate_tests {
         let mut s = Settings::default();
         assert!(!s.filter_side_route);
         s.filter_side_route = true;
+        s.strict_line_color = true;
+        s.once_per_signal = true;
+        s.nifty_net_strict = true;
+        s.nifty_all_agree_strict = true;
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["filterSideRoute"], serde_json::json!(true));
+        assert_eq!(v["strictLineColor"], serde_json::json!(true));
+        assert_eq!(v["oncePerSignal"], serde_json::json!(true));
+        assert_eq!(v["niftyNetStrict"], serde_json::json!(true));
+        assert_eq!(v["niftyAllAgreeStrict"], serde_json::json!(true));
         let back: Settings = serde_json::from_value(v).unwrap();
         assert!(back.filter_side_route);
+        assert!(back.strict_line_color);
+        assert!(back.once_per_signal);
+        assert!(back.nifty_net_strict);
+        assert!(back.nifty_all_agree_strict);
     }
-
     #[test]
     fn movers_index_leg_settings_round_trip_uses_camel_case() {
         let mut s = Settings::default();
@@ -11837,6 +13071,24 @@ mod gate_tests {
     }
 
     #[test]
+    fn margin_block_reason_blocks_only_when_required_exceeds_free() {
+        // 500k budget, 100k locked by one running trade => 400k free.
+        assert!(margin_block_reason(300_000.0, 500_000.0, 100_000.0, 1).is_none());
+        // Exactly at the free amount is allowed (not strictly greater).
+        assert!(margin_block_reason(400_000.0, 500_000.0, 100_000.0, 1).is_none());
+        // A rupee over the free amount is blocked, and the reason names the lock.
+        let reason = margin_block_reason(400_001.0, 500_000.0, 100_000.0, 1)
+            .expect("over-budget entry must be blocked");
+        assert!(reason.contains("trade blocked"));
+        assert!(reason.contains("locked 100000"));
+        // Fully locked budget blocks any positive requirement.
+        assert!(margin_block_reason(1.0, 500_000.0, 500_000.0, 3).is_some());
+        // A zero requirement never blocks (the "no budget configured" guard
+        // lives in `margin_block_for_qty`, not in this pure reason helper).
+        assert!(margin_block_reason(0.0, 0.0, 0.0, 0).is_none());
+    }
+
+    #[test]
     fn paper_margin_budget_counts_locked_margin_once() {
         // 500k wallet, 100k of open notional: the budget must stay the full 500k
         // and "available" must be 500k - 100k = 400k. The old code sized the
@@ -12423,6 +13675,18 @@ mod gate_tests {
         assert_eq!(inr_group(1000.0), "1,000");
         assert_eq!(inr_group(123456.0), "1,23,456");
         assert_eq!(inr_group(1234567.0), "12,34,567");
+    }
+
+    #[test]
+    fn spot_candle_color_gate_needs_green_for_gainer_red_for_loser() {
+        // Top Gainer (bullish): only a green forming candle may enter.
+        assert!(spot_candle_color_ok(true, 100.0, 101.0), "bull + green");
+        assert!(!spot_candle_color_ok(true, 100.0, 99.0), "bull + red must skip");
+        assert!(!spot_candle_color_ok(true, 100.0, 100.0), "bull + doji must skip");
+        // Top Loser (bearish): only a red forming candle may enter.
+        assert!(spot_candle_color_ok(false, 100.0, 99.0), "bear + red");
+        assert!(!spot_candle_color_ok(false, 100.0, 101.0), "bear + green must skip");
+        assert!(!spot_candle_color_ok(false, 100.0, 100.0), "bear + doji must skip");
     }
 }
 
