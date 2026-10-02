@@ -9,7 +9,7 @@ Unicode True
 !include "MUI2.nsh"
 
 !ifndef STAGE
-  !define STAGE "..\..\dist-windows"
+  !define STAGE "../../dist-windows"
 !endif
 !ifndef OUTDIR
   !define OUTDIR "."
@@ -18,7 +18,7 @@ Unicode True
 !define APP_NAME "Algo Trading"
 !define APP_EXE "algo-desktop.exe"
 !define PUBLISHER "Sarat Upadhyay"
-!define VERSION "0.1.15"
+!define VERSION "0.1.16"
 !define REGKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\AlgoTrading"
 
 Name "${APP_NAME}"
@@ -42,11 +42,11 @@ SetCompressor /SOLID lzma
 
 Section "Install"
   SetOutPath "$INSTDIR"
-  File "${STAGE}\algo-desktop.exe"
-  File "${STAGE}\algo-server.exe"
+  File "${STAGE}/algo-desktop.exe"
+  File "${STAGE}/algo-server.exe"
 
   SetOutPath "$INSTDIR\static"
-  File /r "${STAGE}\static\*.*"
+  File /r "${STAGE}/static/*.*"
 
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
   CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}" "" "$INSTDIR\${APP_EXE}"

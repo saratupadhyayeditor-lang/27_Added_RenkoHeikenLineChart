@@ -39,6 +39,16 @@ enum UserEvent {
     ProbeUi,
     ProbeStatus,
     Quit,
+    /// Swap files + relaunch, handled on the event-loop thread so the child
+    /// `algo-server` can be terminated first. On Windows a running server locks
+    /// its own image, so copying over it silently failed (app closed, never
+    /// restarted, old UI still served).
+    ApplyUpdate {
+        staging: PathBuf,
+        install_dir: PathBuf,
+        data_dir: PathBuf,
+        tag: String,
+    },
 }
 
 fn main() {
@@ -250,6 +260,58 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Event::UserEvent(UserEvent::Quit) => {
                 *control_flow = ControlFlow::Exit;
+            }
+            Event::UserEvent(UserEvent::ApplyUpdate {
+                staging,
+                install_dir,
+                data_dir,
+                tag,
+            }) => {
+                // Kill the child server first so Windows releases the lock on
+                // `algo-server.exe`; otherwise the swap fails.
+                kill(&mut server);
+                std::thread::sleep(Duration::from_millis(600));
+                let log = data_dir.join("updater.log");
+                match updater::apply_and_restart(&staging, &install_dir, &data_dir) {
+                    Ok(()) => {
+                        updater::log_line(&log, &format!("apply helper launched for {tag}"));
+                        updater::append_history(
+                            &data_dir,
+                            updater::HistoryEntry {
+                                time_ms: updater::now_ms(),
+                                from: updater::current_version().to_string(),
+                                to: tag.clone(),
+                                status: "ok".into(),
+                                message: "Update apply ho gaya - app restart ho raha hai".into(),
+                            },
+                        );
+                        *control_flow = ControlFlow::Exit;
+                    }
+                    Err(e) => {
+                        updater::log_line(&log, &format!("apply failed: {e}"));
+                        updater::append_history(
+                            &data_dir,
+                            updater::HistoryEntry {
+                                time_ms: updater::now_ms(),
+                                from: updater::current_version().to_string(),
+                                to: tag.clone(),
+                                status: "error".into(),
+                                message: format!("Apply failed: {e}"),
+                            },
+                        );
+                        let js = format!(
+                            "window.__algoUpdater && window.__algoUpdater.status({})",
+                            serde_json::to_string(&json!({
+                                "state": "error",
+                                "message": format!("Apply failed: {e}"),
+                                "current": updater::current_version().to_string(),
+                                "history": history_json(&data_dir),
+                            }))
+                            .unwrap_or_else(|_| "{}".into())
+                        );
+                        let _ = webview.evaluate_script(&js);
+                    }
+                }
             }
             Event::UserEvent(UserEvent::ProbeUi) => {
                 let _ = webview.evaluate_script_with_callback(
@@ -469,18 +531,17 @@ fn run_update(proxy: EventLoopProxy<UserEvent>, repo: String, data_dir: PathBuf)
         Some(release.tag.clone()),
     );
 
-    match updater::apply_and_restart(&staging, &install_dir, &data_dir) {
-        Ok(()) => {
-            updater::log_line(&log, &format!("apply helper launched for {}", release.tag));
-            record("ok", &release.tag, "Update apply ho gaya - app restart ho raha hai");
-            let _ = proxy.send_event(UserEvent::Quit);
-        }
-        Err(e) => {
-            updater::log_line(&log, &format!("apply failed: {e}"));
-            record("error", &release.tag, &format!("Apply failed: {e}"));
-            send("error", format!("Apply failed: {e}"), Some(release.tag));
-        }
-    }
+    // Hand the swap to the event-loop thread, which owns the server child and
+    // kills it before copying (the helper then also force-kills any stray
+    // `algo-server.exe`). Doing the copy here on a worker thread used to race
+    // the still-running server and fail with a locked file.
+    updater::log_line(&log, &format!("requesting apply for {}", release.tag));
+    let _ = proxy.send_event(UserEvent::ApplyUpdate {
+        staging,
+        install_dir,
+        data_dir: data_dir.clone(),
+        tag: release.tag.clone(),
+    });
 }
 
 fn free_port() -> std::io::Result<u16> {

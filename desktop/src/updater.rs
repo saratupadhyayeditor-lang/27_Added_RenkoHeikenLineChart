@@ -431,7 +431,7 @@ fn process_alive(pid: u32) -> bool {
 /// Start the freshly-copied app again. Retries because antivirus / Defender can
 /// briefly lock a brand-new executable, and falls back to the shell on Windows.
 fn launch_app(launch: &Path, install_dir: &Path, log: &Path) -> bool {
-    for attempt in 0..15u32 {
+    for attempt in 0..40u32 {
         let mut cmd = std::process::Command::new(launch);
         cmd.current_dir(install_dir)
             .stdin(std::process::Stdio::null())
@@ -487,10 +487,16 @@ fn launch_app(launch: &Path, install_dir: &Path, log: &Path) -> bool {
 /// Spawn the detached helper that will swap the files after this process exits.
 pub fn apply_and_restart(staging: &Path, install_dir: &Path, data_dir: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let ext = if cfg!(windows) { "exe" } else { "" };
     let updates = data_dir.join("updates");
     let _ = std::fs::create_dir_all(&updates);
-    let helper = updates.join(format!("algodhan-updater.{ext}"));
+    // Unique name: a previous helper might still be running (it waits up to
+    // 10 min for the app to exit), and copying over a running exe fails.
+    let helper_name = if cfg!(windows) {
+        format!("algodhan-updater-{}.exe", now_ms())
+    } else {
+        format!("algodhan-updater-{}", now_ms())
+    };
+    let helper = updates.join(helper_name);
     std::fs::copy(&exe, &helper).map_err(|e| format!("helper copy failed: {e}"))?;
 
     let log = data_dir.join("updater.log");
@@ -564,6 +570,22 @@ pub fn run_apply_helper(staging: &Path, target: &Path, launch: &Path, pid: &str,
     // A short settle delay for the OS to release file handles / TCP ports.
     std::thread::sleep(Duration::from_millis(400));
 
+    // On Windows the `algo-server.exe` child can outlive the shell (or a second
+    // instance from a previous launch can still be up). A running exe cannot be
+    // overwritten, which made the swap fail while the app had already closed.
+    // Force-terminate it so the copy below always succeeds.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let killed = std::process::Command::new("taskkill")
+            .args(["/F", "/IM", "algo-server.exe"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+        log_line(log, &format!("taskkill algo-server.exe -> {killed:?}"));
+        std::thread::sleep(Duration::from_millis(700));
+    }
+
     let mut last = String::new();
     let mut copied = false;
     for attempt in 0..240u32 {
@@ -587,6 +609,10 @@ pub fn run_apply_helper(staging: &Path, target: &Path, launch: &Path, pid: &str,
         log_line(log, &format!("FATAL copy failed after retries: {last}"));
         std::process::exit(1);
     }
+
+    // Let antivirus / Defender finish scanning the freshly written binaries
+    // before we try to launch them; this is what made the relaunch flaky.
+    std::thread::sleep(Duration::from_millis(900));
 
     if !launch_app(launch, target, log) {
         log_line(log, "FATAL relaunch failed - app was not restarted");
