@@ -153,6 +153,20 @@
     color: #c8c8e0;
   }
   .ind-item:hover { background: #2d2d5e; color: #fff; }
+  .ct-opt {
+    padding: 6px 8px; border-radius: 3px; cursor: pointer; font-size: 11px;
+    color: #c8c8e0;
+  }
+  .ct-opt:hover { background: #2d2d5e; color: #fff; }
+  .ct-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 8px; margin: 6px 0;
+  }
+  .ct-row > label { color: #bbb; }
+  .ct-row select, .ct-row input[type=number] {
+    background: #0b0b1a; border: 1px solid var(--border2); color: var(--fg);
+    border-radius: 3px; padding: 3px 5px; font-size: 11px;
+  }
   .ind-group { display: flex; flex-direction: column; }
   .ind-cat {
     font-size: 10px; font-weight: 700; letter-spacing: .4px; text-transform: uppercase;

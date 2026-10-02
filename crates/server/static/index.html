@@ -70,6 +70,35 @@
         <span style="font-size:11px" id="chartTradePnl"></span>
         <div class="tf-grid chart-tf-grid" id="tfGrid"></div>
         <span style="font-size:10px;color:#666" id="chartTfLabel">5m</span>
+        <div class="menu-wrap">
+          <button class="btn-action" id="chartTypeBtn" title="Chart type: Candles / Heikin Ashi / Renko (TradingView jaisa)">Chart: Candles</button>
+          <div id="chartTypeMenu" class="ind-menu hidden" style="min-width:250px;padding:10px">
+            <div class="ct-opt" data-kind="candles">Candles</div>
+            <div class="ct-opt" data-kind="line">Line</div>
+            <div class="ct-opt" data-kind="heikin_ashi">Heikin Ashi</div>
+            <div class="ct-opt" data-kind="renko">Renko</div>
+            <div id="renkoSettings" style="display:none;border-top:1px solid #2d2d50;margin-top:8px;padding-top:8px;font-size:10px;color:#bbb">
+              <div class="ct-row"><label>Brick size</label>
+                <select id="renkoMode" style="width:110px">
+                  <option value="traditional">Traditional</option>
+                  <option value="atr">ATR</option>
+                  <option value="percentage">Percentage</option>
+                </select>
+              </div>
+              <div class="ct-row" id="renkoBoxRow"><label>Box size</label><input type="number" id="renkoBox" min="0.01" step="0.05" value="10" style="width:80px"></div>
+              <div class="ct-row" id="renkoAtrRow" style="display:none"><label>ATR length</label><input type="number" id="renkoAtr" min="1" max="200" step="1" value="14" style="width:80px"></div>
+              <div class="ct-row" id="renkoPctRow" style="display:none"><label>Percentage %</label><input type="number" id="renkoPct" min="0.01" step="0.05" value="1" style="width:80px"></div>
+              <div class="ct-row"><label>Source</label>
+                <select id="renkoSource" style="width:110px">
+                  <option value="close">Close</option>
+                  <option value="highlow">High / Low</option>
+                </select>
+              </div>
+              <div class="ct-row"><label><input type="checkbox" id="renkoWicks"> Wicks</label></div>
+              <div style="margin-top:6px;color:#888;font-size:9px">Renko settings turant apply hoti hain.</div>
+            </div>
+          </div>
+        </div>
         <span class="pos-tools" id="posTools">
           <button class="pos-btn" id="posLongBtn" title="Long Position: chart par entry se target tak drag karo, SL automatic mirror ho jata hai">Long Position</button>
           <button class="pos-btn" id="posShortBtn" title="Short Position: chart par entry se target tak drag karo, SL automatic mirror ho jata hai">Short Position</button>
@@ -153,10 +182,10 @@
       </div>
     </div>
     <div class="tab-content" id="tab-papertrade">
-      <iframe class="paper-frame" data-src="./paper.html?v=59" title="Paper Trade (simulated engine)"></iframe>
+      <iframe class="paper-frame" data-src="./paper.html?v=60" title="Paper Trade (simulated engine)"></iframe>
     </div>
     <div class="tab-content" id="tab-papertrade2">
-      <iframe class="paper-frame" data-src="./paper2.html?v=2" title="Paper Trade 2 (independent simulated engine)"></iframe>
+      <iframe class="paper-frame" data-src="./paper2.html?v=3" title="Paper Trade 2 (independent simulated engine)"></iframe>
     </div>
     <div class="tab-content" id="tab-rtstats"></div>
     <div class="tab-content" id="tab-paperstats">
@@ -253,14 +282,14 @@
 
 <script src="./vendor/chart.umd.min.js"></script>
 <script type="module">
-  import init, { select_symbol, update_oc_quotes, open_option_chart_by_sid, set_oi_trend_enabled, set_trade_lines, clear_trade_lines } from "./pkg/algo_web.js?v=57";
+  import init, { select_symbol, update_oc_quotes, open_option_chart_by_sid, set_oi_trend_enabled, set_trade_lines, clear_trade_lines, set_chart_kind, chart_kind_json } from "./pkg/algo_web.js?v=59";
   import { bootSidebar } from "./sidebar.js?v=19";
-  import { bootConnection } from "./connection.js?v=11";
-  import { bootRealtime } from "./realtime.js?v=103";
+  import { bootConnection } from "./connection.js?v=13";
+  import { bootRealtime } from "./realtime.js?v=107";
   import { bootRtStats } from "./rtstats.js?v=6";
   import { bootBackup } from "./backup.js?v=3";
   import { bootAccount } from "./account.js?v=2";
-  import { bootUpdater } from "./updater.js?v=2";
+  import { bootUpdater } from "./updater.js?v=3";
   import { bootTheme } from "./theme.js?v=4";
   import { bootTextSize } from "./textsize.js?v=1";
   import { bootIndGroup } from "./indgroup.js?v=1";
@@ -400,8 +429,101 @@
     const d = e.data || {};
     if (d && d.type === "openTradeChart") openTradeChart(d);
   });
-  init({ module_or_path: "./pkg/algo_web_bg.wasm?v=57" })
-    .then(() => { bootSidebar({ select_symbol, update_oc_quotes }); bootRealtime(); bootRtStats(); bootBackup(); bootAccount(); startChartLines(); })
+  // -------------------------------------------------------------------------
+  // Chart type: Candles / Heikin Ashi / Renko (TradingView-style settings).
+  // The transform itself lives in Rust/WASM; this only drives the dropdown,
+  // persists the choice, and pushes it to the chart.
+  // -------------------------------------------------------------------------
+  const CT_KEY = "chartType.v1";
+  let ctState = {
+    kind: "candles",
+    renko: { mode: "traditional", boxSize: 10, atrLength: 14, percentage: 1, wicks: false, source: "close" },
+  };
+  function ctLoad() {
+    let s = null;
+    try { s = JSON.parse(localStorage.getItem(CT_KEY) || "null"); } catch (_) {}
+    if (!s || !s.kind) {
+      try { s = JSON.parse(chart_kind_json()); } catch (_) {}
+    }
+    if (s && s.kind) ctState.kind = s.kind;
+    if (s && s.renko) Object.assign(ctState.renko, s.renko);
+  }
+  function ctSave() {
+    try { localStorage.setItem(CT_KEY, JSON.stringify(ctState)); } catch (_) {}
+  }
+  function ctSyncUI() {
+    const labels = { candles: "Candles", line: "Line", heikin_ashi: "Heikin Ashi", renko: "Renko" };
+    const btn = document.getElementById("chartTypeBtn");
+    if (btn) btn.textContent = "Chart: " + (labels[ctState.kind] || "Candles");
+    document.querySelectorAll("#chartTypeMenu .ct-opt").forEach((el) => {
+      const on = el.getAttribute("data-kind") === ctState.kind;
+      el.style.background = on ? "#2d2d5e" : "transparent";
+      el.style.color = on ? "#fff" : "#c8c8e0";
+    });
+    const rs = document.getElementById("renkoSettings");
+    if (rs) rs.style.display = ctState.kind === "renko" ? "block" : "none";
+    const r = ctState.renko;
+    const setv = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+    setv("renkoMode", r.mode);
+    setv("renkoBox", r.boxSize);
+    setv("renkoAtr", r.atrLength);
+    setv("renkoPct", r.percentage);
+    setv("renkoSource", r.source);
+    const w = document.getElementById("renkoWicks");
+    if (w) w.checked = !!r.wicks;
+    const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? "flex" : "none"; };
+    show("renkoBoxRow", r.mode === "traditional");
+    show("renkoAtrRow", r.mode === "atr");
+    show("renkoPctRow", r.mode === "percentage");
+  }
+  function ctApply() {
+    try { set_chart_kind(ctState.kind, JSON.stringify(ctState.renko)); }
+    catch (err) { console.warn("chart type apply failed", err); }
+    ctSave();
+    ctSyncUI();
+  }
+  function bootChartType() {
+    ctLoad();
+    const btn = document.getElementById("chartTypeBtn");
+    const menu = document.getElementById("chartTypeMenu");
+    if (btn && menu) {
+      btn.addEventListener("click", (e) => { e.stopPropagation(); menu.classList.toggle("hidden"); });
+      document.addEventListener("click", (e) => {
+        if (!menu.contains(e.target) && e.target !== btn) menu.classList.add("hidden");
+      });
+    }
+    document.querySelectorAll("#chartTypeMenu .ct-opt").forEach((el) => {
+      el.addEventListener("click", () => {
+        ctState.kind = el.getAttribute("data-kind") || "candles";
+        ctApply();
+        if (menu) menu.classList.add("hidden");
+      });
+    });
+    const bind = (id, ev, fn) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener(ev, fn);
+    };
+    bind("renkoMode", "change", () => { ctState.renko.mode = document.getElementById("renkoMode").value; ctApply(); });
+    bind("renkoSource", "change", () => { ctState.renko.source = document.getElementById("renkoSource").value; ctApply(); });
+    bind("renkoWicks", "change", () => { ctState.renko.wicks = document.getElementById("renkoWicks").checked; ctApply(); });
+    bind("renkoBox", "input", () => {
+      const v = parseFloat(document.getElementById("renkoBox").value);
+      if (v > 0) { ctState.renko.boxSize = v; ctApply(); }
+    });
+    bind("renkoAtr", "input", () => {
+      const v = parseInt(document.getElementById("renkoAtr").value, 10);
+      if (v >= 1) { ctState.renko.atrLength = v; ctApply(); }
+    });
+    bind("renkoPct", "input", () => {
+      const v = parseFloat(document.getElementById("renkoPct").value);
+      if (v > 0) { ctState.renko.percentage = v; ctApply(); }
+    });
+    ctSyncUI();
+    ctApply();
+  }
+
+  init({ module_or_path: "./pkg/algo_web_bg.wasm?v=59" })
+    .then(() => { bootSidebar({ select_symbol, update_oc_quotes }); bootRealtime(); bootRtStats(); bootBackup(); bootAccount(); startChartLines(); bootChartType(); })
     .catch(e => {
       document.getElementById("loading").textContent = "WASM load error: " + e;
       console.error(e);

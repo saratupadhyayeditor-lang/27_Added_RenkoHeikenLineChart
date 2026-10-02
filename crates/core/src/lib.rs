@@ -1,4 +1,5 @@
 pub mod engines;
+pub mod chart_type;
 pub mod indicators;
 pub mod math;
 pub mod model;

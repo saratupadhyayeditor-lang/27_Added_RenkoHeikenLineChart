@@ -287,8 +287,11 @@ export function bootConnection() {
         // as stale is what made Auto Reset stop the feed and show a disconnect.
         const actAge =
           d.last_activity_age_sec != null ? d.last_activity_age_sec : d.last_tick_age_sec;
+        // A deliberate park (rate-limit cool-down) is not a stall: resetting here
+        // would reopen the socket mid-cooldown and keep the Dhan IP block alive.
+        const parked = d.reconnect_parked_sec > 0;
         if (actAge != null) {
-          stale = mktOpen && actAge > AUTO_RESET_STALE_SEC;
+          stale = mktOpen && !parked && actAge > AUTO_RESET_STALE_SEC;
           const color = !mktOpen
             ? "#888"
             : actAge < 10
@@ -300,8 +303,11 @@ export function bootConnection() {
             d.last_tick_age_sec != null && d.last_tick_age_sec < 15 ? "tick" : "link";
           parts.push('<span style="color:' + color + '">' + label + ' ' + actAge + "s ago</span>");
         } else {
-          stale = mktOpen;
-          parts.push('<span style="color:' + (mktOpen ? "#ef5350" : "#888") + '">no data</span>');
+          // No frame at all yet (freshly opened socket / handshake in flight).
+          // This must NOT count as stale: an auto-reset here stops a perfectly
+          // healthy feed before it ever gets a chance to stream.
+          stale = false;
+          parts.push('<span style="color:' + (mktOpen ? "#ff9800" : "#888") + '">no data yet</span>');
         }
         if (!mktOpen) parts.push('<span style="color:#888">market closed</span>');
         if (d.subscribed != null) parts.push(d.subscribed + " subscribed");
@@ -316,11 +322,14 @@ export function bootConnection() {
         // streamed on (the case that used to need repeated Connect taps).
         const btn = $("connectBtn");
         const connected = btn && btn.textContent.indexOf("Connected") !== -1;
-        // Only treat "not streaming" as broken if the socket is also silent;
-        // an alive socket with fresh heartbeats must not trigger a restart loop.
+        // Only treat "not streaming" as broken if the socket is also silent AND
+        // has had time to settle; an alive socket with fresh heartbeats (or one
+        // that only just opened) must not trigger a restart loop.
+        const settled = d.feed_started_age_sec != null && d.feed_started_age_sec > 30;
         const notStreaming =
           d.feed_up === false &&
-          (d.last_activity_age_sec == null || d.last_activity_age_sec > 30);
+          (d.last_activity_age_sec == null || d.last_activity_age_sec > 30) &&
+          settled;
         if (
           (d.ws_running === false || notStreaming) &&
           d.reconnect_parked_sec <= 0 &&
@@ -337,7 +346,15 @@ export function bootConnection() {
             }).catch(() => {});
           }
         }
-        if (cb && cb.checked && stale && !resetCountdown && mktOpen && connected) {
+        if (
+          cb &&
+          cb.checked &&
+          stale &&
+          !resetCountdown &&
+          mktOpen &&
+          connected &&
+          d.reconnect_parked_sec <= 0
+        ) {
           const now = Date.now();
           if (now - autoResetLastAt >= AUTO_RESET_MIN_INTERVAL) {
             autoResetLastAt = now;

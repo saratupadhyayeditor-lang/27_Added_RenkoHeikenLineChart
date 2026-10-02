@@ -1294,17 +1294,11 @@ function shell() {
       <div class="rt-engine-row" id="rtFilterRow" style="align-items:flex-start">
         <b class="rt-cap">Indicator filters:</b>
         <div style="flex-basis:100%;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
-          <label class="rtom-f" style="color:#ffd700;font-weight:bold" title="Strict straight-line gate (Indicator-filters mode): scanner leg sirf tab execute hoga jab us side ke tick kiye gaye SAARE straight-line filters leg ki taraf hon - dono sections se: (1) 'Straight Line Indicators' ke line-trend/direction filters (Sl* + Volume line Vl), aur (2) 'Straight Line Indicator Color Detection' ke colour filters CE par GREEN / PE par RED. NOTE: NIFTY Trend Following ON hone par ye manual all-agree gate skip ho jata hai - opposite side ka strict block NIFTY ke ASSIGNED confirmation indicators (Net direction / All-lines-agree gated) se hota hai, taaki kuch ticked lines har stock par entry na rokein."><input type="checkbox" data-set="strictLineColor" id="rtStrictLineColorCb" style="accent-color:#ffd700"> Strict straight-line gate (CE=bull line, PE=bear line)</label>
-          <label class="rtom-f" style="color:#00d4aa;font-weight:bold" title="Ek strike par ek hi trade (fresh signal tak): ON karne par kisi bhi top gainer / top loser (ya NIFTY-trend) strike par ek bar trade execute hone ke baad, usi strike par dobara trade tabhi hoga jab us leg ki selected indicator-filter condition dobara meet ho (naya fresh signal). Gate lagataar true rahe ya position close hone ke turant baad re-entry ho - dono block. OFF = purana behaviour."><input type="checkbox" data-set="oncePerSignal" id="rtOncePerSignalCb" style="accent-color:#00d4aa"> Ek strike par ek trade (next fresh filter signal tak)</label>
           <label class="rtom-f"><input type="checkbox" data-set="allInOne"> All together (strict AND)</label>
-          <label class="rtom-f"><input type="checkbox" data-set="dirGuard"> Direction Guard (no trade on opposite)</label>
           <label class="rtom-f"><input type="checkbox" data-set="overallDir"> Overall Bullish/Bearish idea</label>
-          <label class="rtom-f" style="color:#00d4aa" title="Filter-side routing: ON karne par har trade ka CE/PE leg us strategy ke apne indicator filter se decide hoga. Bullish filter detect hone par CE leg execute hogi, bearish detect hone par trade nahi hogi; bearish filter ke liye isi tarah PE leg. NIFTY lock / Top Movers auto side / Run-Strategy-In override / Overall direction koi bhi is leg ko nahi badal sakta. OFF = purana normal routing."><input type="checkbox" data-set="filterSideRoute" id="rtFilterSideRouteCb" style="accent-color:#00d4aa"> Filter side routing (Bullish&rarr;CE, Bearish&rarr;PE)</label>
           <label class="rtom-f">AI Brain
-            <select data-set="brainMode" style="width:170px"><option value="off">OFF</option><option value="auto">Auto (score + conflict veto)</option></select></label>
+            <select data-set="brainMode" style="width:170px"><option value="off">OFF</option><option value="auto">Auto (score)</option></select></label>
           <label class="rtom-f">threshold <input type="number" data-set="brainThreshold" min="5" max="100" step="1" style="width:56px"> %</label>
-          <label class="rtom-f" title="Opposite-side veto: Relative (default) = entry sirf tab veto hoti hai jab OPPOSITE side ke filters apni side se strictly zyada agree karein (kam se kam 1 filter aage). Barabar (tie) ya apni side aage ho to veto NAHI lagega, isliye symmetric Bull+Bear filter set dono side par deadlock nahi karega. OFF = koi opposite veto nahi, sirf apni side ka majority/strict/Brain rule.">Opposite veto
-            <select data-set="oppositeVeto" style="width:180px"><option value="relative">Relative (stronger side wins)</option><option value="off">OFF</option></select></label>
           <label class="rtom-f" style="color:#26a69a;font-weight:bold" title="Spot candle colour gate: ON karne par spot chart par chalne wali trade (strategy mode ya Indicator-filters mode) sirf tab execute hogi jab spot chart ki live FORMING candle trade ki direction me ho - Top Gainer (bullish / CE) ke liye GREEN candle, Top Loser (bearish / PE) ke liye RED candle. Galat colour par signal skip / held rehta hai (consume nahi hota), aur candle colour badalne par condition meet hone par trade execute ho jati hai. Doji (close = open) par bhi rukta hai. Execution ke exact waqt bhi dobara check hota hai. Manual orders par lagu nahi. Default OFF."><input type="checkbox" data-set="spotCandleGate" style="accent-color:#26a69a"> Spot candle gate (Gainer = green, Loser = red)</label>
         </div>
         <div id="rtBrainSummary" style="flex-basis:100%;font-size:9px;color:#b39ddb"></div>
@@ -1346,7 +1340,7 @@ function shell() {
           <input type="checkbox" id="rtFilterModeCb"> Indicator-filters mode
         </label>
         <button class="btn-action" id="rtFilterPaperBtn" style="width:auto;padding:6px 16px;margin:0;background:#b39ddb;color:#0a0a18;font-weight:700">Place trades based on Indicator filters</button>
-        <span style="font-size:9px;color:#888;flex-basis:100%">Run the ticked strategies - normal mode runs the ticked strategies, Indicator-filters mode trades the scanner universe (Top Movers / NIFTY trend / Commodities) when the Indicator filters agree by majority; tick "All together (strict AND)" to require ALL selected filters, or enable AI Brain (score + conflict veto) for a confluence threshold. Paper trades are simulated (no real Dhan orders).</span>
+        <span style="font-size:9px;color:#888;flex-basis:100%">Run the ticked strategies - normal mode runs the ticked strategies, Indicator-filters mode trades the scanner universe (Top Movers / NIFTY trend / Commodities) when the Indicator filters agree by majority; tick "All together (strict AND)" to require ALL selected filters, or enable AI Brain (score) for a confluence threshold. Paper trades are simulated (no real Dhan orders).</span>
       </div>
 
       <div class="account-section" id="rtCondLogSection" style="overflow-y:auto;border-top:1px solid #ffd700;margin-top:8px;padding-top:6px">
@@ -5110,8 +5104,10 @@ function deriveLink(d) {
   if (d.link) return d.link;
   if (!d.connected) return "offline";
   if (!istMarketOpen()) return "closed";
-  const age = d.last_tick_age_sec;
-  if (d.feed_up && age != null && age < 15) return "live";
+  // Any frame (trade tick OR heartbeat) within 15s counts as live, so a quiet
+  // market with no trade ticks is not misread as a disconnect.
+  const age = d.last_activity_age_sec != null ? d.last_activity_age_sec : d.last_tick_age_sec;
+  if (age != null && age < 15) return "live";
   if (!d.feed_up && d.ws_running && d.feed_started_age_sec != null && d.feed_started_age_sec < 30) {
     return "connecting";
   }

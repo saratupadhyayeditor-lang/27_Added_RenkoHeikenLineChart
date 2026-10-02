@@ -20,6 +20,7 @@ use algo_core::oi_trend::{
     Regime, RegimeOpts, RegimeResult,
 };
 use algo_core::Candle;
+use algo_core::chart_type::{self, ChartKind, RenkoConfig, RenkoMode, RenkoSource};
 
 mod optionchain;
 
@@ -257,6 +258,13 @@ struct PosEdit {
 
 struct App {
     candles: Vec<Candle>,
+    /// Untransformed candles straight from history / the live feed. `candles`
+    /// above is always `chart_type::build(chart_kind, raw, renko)`, so switching
+    /// chart type (or a live tick) can rebuild the display series without
+    /// re-fetching.
+    raw: Vec<Candle>,
+    chart_kind: ChartKind,
+    renko: RenkoConfig,
     insts: Vec<Inst>,
     symbol_name: String,
     sec_id: i64,
@@ -339,6 +347,9 @@ impl App {
     fn new() -> Self {
         App {
             candles: Vec::new(),
+            raw: Vec::new(),
+            chart_kind: ChartKind::Candles,
+            renko: RenkoConfig::default(),
             insts: Vec::new(),
             symbol_name: "NIFTY 50".into(),
             sec_id: 13,
@@ -517,6 +528,12 @@ impl App {
         self.view_count = 120.0_f64.min(n as f64);
         self.view_start = (n as f64 - self.view_count).max(0.0);
     }
+
+    /// Rebuild the display series from the raw candles for the current chart
+    /// type using the current Renko settings.
+    fn rebuild_view(&mut self) {
+        self.candles = chart_type::build(self.chart_kind, &self.raw, &self.renko);
+    }
 }
 
 /// Exponential moving average over a `(time, value)` series, preserving the
@@ -687,7 +704,7 @@ fn load_chart_preserve(preserve_view: bool) {
     // A fresh (non-preserving) load is a different instrument/timeframe: drop the
     // old series right away so stale candles can't masquerade as the new symbol.
     if !preserve_view {
-        with_app(|a| a.candles.clear());
+        with_app(|a| { a.raw.clear(); a.candles.clear(); });
     }
     set_html(
         "loading",
@@ -737,7 +754,7 @@ fn load_chart_preserve(preserve_view: bool) {
             if preserve_view {
                 return;
             }
-            with_app(|a| a.candles.clear());
+            with_app(|a| { a.raw.clear(); a.candles.clear(); });
             set_html(
                 "loading",
                 "<div style='color:#ef5350;font-size:12px;padding:20px'>No candles returned. Tap Refresh Chart to retry.</div>",
@@ -750,7 +767,8 @@ fn load_chart_preserve(preserve_view: bool) {
             // a rolling bar does not slide off the right edge.
             let old_n = app.candles.len() as f64;
             let anchored = old_n > 0.0 && app.view_start + app.view_count >= old_n - 1.0;
-            app.candles = candles;
+            app.raw = candles;
+            app.rebuild_view();
             // Fresh history resets the in-memory roll state: the ticker will
             // roll onto the current bucket from here on (no more REST).
             let step = tf_step(&app.timeframe).max(1);
@@ -912,7 +930,7 @@ pub fn chart_feed_connect() {
 /// delta of the feed's cumulative day volume.
 fn roll_live_bar(bar_start: i64, cum_vol: f64) -> bool {
     with_app_ret(|app| {
-        let Some(last) = app.candles.last() else {
+        let Some(last) = app.raw.last() else {
             return false;
         };
         let open = if last.close > 0.0 { last.close } else { last.open };
@@ -932,7 +950,7 @@ fn roll_live_bar(bar_start: i64, cum_vol: f64) -> bool {
         // stays zoomed onto a single giant candle.
         let old_n = app.candles.len() as f64;
         let anchored = app.view_start + app.view_count >= old_n - 1.0;
-        app.candles.push(Candle {
+        app.raw.push(Candle {
             time: t,
             open,
             high: open,
@@ -940,6 +958,7 @@ fn roll_live_bar(bar_start: i64, cum_vol: f64) -> bool {
             close: open,
             volume: 0.0,
         });
+        app.rebuild_view();
         let new_n = app.candles.len() as f64;
         if anchored {
             if app.view_count + 0.5 >= old_n {
@@ -970,7 +989,7 @@ fn apply_live_tick() -> bool {
         with_app(|a| a.last_bar = bar);
     }
     let changed = with_app_ret(|app| {
-        let Some(last) = app.candles.last_mut() else {
+        let Some(last) = app.raw.last_mut() else {
             return false;
         };
         let mut ch = false;
@@ -994,6 +1013,7 @@ fn apply_live_tick() -> bool {
             }
         }
         if ch {
+            app.rebuild_view();
             app.recompute_all();
         }
         ch
@@ -2014,25 +2034,43 @@ fn draw_main() {
         ctx.line_to(plot.right, plot.bottom);
         ctx.stroke();
 
-        // candles
+        // price series: line chart, or candles / Heikin-Ashi / Renko bars
         let (a, b) = visible_range(app);
-        for i in a..b {
-            let c = app.candles[i];
-            let x = x_for(&plot, app, i);
-            let color = if c.close >= c.open { "#00d4aa" } else { "#ff5252" };
-            set_stroke(&ctx, color);
-            set_fill(&ctx, color);
-            ctx.set_line_width(1.0);
-            ctx.begin_path();
-            ctx.move_to(x, y_for(&plot, lo, hi, c.high));
-            ctx.line_to(x, y_for(&plot, lo, hi, c.low));
-            ctx.stroke();
-            let y_open = y_for(&plot, lo, hi, c.open);
-            let y_close = y_for(&plot, lo, hi, c.close);
-            let top = y_open.min(y_close);
-            let bh = (y_open - y_close).abs().max(1.0);
-            let bw = (plot.bar_w * 0.7).max(1.0);
-            ctx.fill_rect(x - bw / 2.0, top, bw, bh);
+        if app.chart_kind == ChartKind::Line {
+            if b > a {
+                set_stroke(&ctx, "#4fc3f7");
+                ctx.set_line_width(1.5);
+                ctx.begin_path();
+                for i in a..b {
+                    let x = x_for(&plot, app, i);
+                    let y = y_for(&plot, lo, hi, app.candles[i].close);
+                    if i == a {
+                        ctx.move_to(x, y);
+                    } else {
+                        ctx.line_to(x, y);
+                    }
+                }
+                ctx.stroke();
+            }
+        } else {
+            for i in a..b {
+                let c = app.candles[i];
+                let x = x_for(&plot, app, i);
+                let color = if c.close >= c.open { "#00d4aa" } else { "#ff5252" };
+                set_stroke(&ctx, color);
+                set_fill(&ctx, color);
+                ctx.set_line_width(1.0);
+                ctx.begin_path();
+                ctx.move_to(x, y_for(&plot, lo, hi, c.high));
+                ctx.line_to(x, y_for(&plot, lo, hi, c.low));
+                ctx.stroke();
+                let y_open = y_for(&plot, lo, hi, c.open);
+                let y_close = y_for(&plot, lo, hi, c.close);
+                let top = y_open.min(y_close);
+                let bh = (y_open - y_close).abs().max(1.0);
+                let bw = (plot.bar_w * 0.7).max(1.0);
+                ctx.fill_rect(x - bw / 2.0, top, bw, bh);
+            }
         }
 
         // overlay indicators
@@ -4474,6 +4512,79 @@ pub fn clear_trade_lines() {
     render_all();
 }
 
+/// Parse the Renko settings payload (`{mode, boxSize, atrLength, percentage,
+/// wicks, source}`, or a wrapper `{renko:{...}}`). Missing / invalid fields keep
+/// the defaults so a partial payload can never produce a zero-size brick.
+fn parse_renko_config(json: &str) -> RenkoConfig {
+    let mut cfg = RenkoConfig::default();
+    let Ok(v) = serde_json::from_str::<Value>(json) else {
+        return cfg;
+    };
+    let r = v.get("renko").unwrap_or(&v);
+    if let Some(m) = r.get("mode").and_then(|x| x.as_str()) {
+        cfg.mode = RenkoMode::parse(m);
+    }
+    if let Some(b) = r.get("boxSize").and_then(|x| x.as_f64()) {
+        if b > 0.0 {
+            cfg.box_size = b;
+        }
+    }
+    if let Some(a) = r.get("atrLength").and_then(|x| x.as_f64()) {
+        if a >= 1.0 {
+            cfg.atr_length = a as usize;
+        }
+    }
+    if let Some(p) = r.get("percentage").and_then(|x| x.as_f64()) {
+        if p > 0.0 {
+            cfg.percentage = p;
+        }
+    }
+    if let Some(w) = r.get("wicks").and_then(|x| x.as_bool()) {
+        cfg.wicks = w;
+    }
+    if let Some(s) = r.get("source").and_then(|x| x.as_str()) {
+        cfg.source = RenkoSource::parse(s);
+    }
+    cfg
+}
+
+/// Switch the chart type (`candles` / `heikin_ashi` / `renko`) and apply the
+/// Renko settings, rebuilding the display series from the raw candles. The
+/// open indicators are recomputed on the new series, exactly as TradingView
+/// does when the chart type changes.
+#[wasm_bindgen]
+pub fn set_chart_kind(kind: &str, json: &str) {
+    let cfg = parse_renko_config(json);
+    let k = ChartKind::parse(kind);
+    with_app(|app| {
+        app.chart_kind = k;
+        app.renko = cfg;
+        app.rebuild_view();
+        app.recompute_all();
+    });
+    render_all();
+}
+
+/// Current chart kind + Renko settings as JSON, so the UI can restore its state.
+#[wasm_bindgen]
+pub fn chart_kind_json() -> String {
+    read_app(|app| {
+        let c = &app.renko;
+        json!({
+            "kind": app.chart_kind.as_str(),
+            "renko": {
+                "mode": c.mode.as_str(),
+                "boxSize": c.box_size,
+                "atrLength": c.atr_length,
+                "percentage": c.percentage,
+                "wicks": c.wicks,
+                "source": c.source.as_str(),
+            }
+        })
+        .to_string()
+    })
+}
+
 /// Replace the option-chain level lines (separate registry from trade lines so
 /// the two never wipe each other; old app's `setOcLevelLines`).
 #[wasm_bindgen]
@@ -5475,5 +5586,52 @@ mod pos_tests {
         assert_eq!(pos_hit(&app, &plot, lo, hi, x, y_mid), Some((0, PosEditKind::Move)));
         // far away -> nothing
         assert_eq!(pos_hit(&app, &plot, lo, hi, x - 400.0, y_e), None);
+    }
+
+    #[test]
+    fn rebuild_view_applies_the_chart_kind() {
+        let mut a = app_with(30);
+        a.raw = a.candles.clone();
+        // Candles: identity.
+        a.chart_kind = ChartKind::Candles;
+        a.rebuild_view();
+        assert_eq!(a.candles.len(), a.raw.len());
+        assert!((a.candles[5].close - a.raw[5].close).abs() < 1e-9);
+        // Line: identity OHLC (drawn as a polyline), same length.
+        a.chart_kind = ChartKind::Line;
+        a.rebuild_view();
+        assert_eq!(a.candles.len(), a.raw.len());
+        assert!((a.candles[5].close - a.raw[5].close).abs() < 1e-9);
+        // Heikin Ashi: rewritten OHLC, same length / timestamps.
+        a.chart_kind = ChartKind::HeikinAshi;
+        a.rebuild_view();
+        assert_eq!(a.candles.len(), a.raw.len());
+        assert_eq!(a.candles[5].time, a.raw[5].time);
+        let ha_close = (a.raw[5].open + a.raw[5].high + a.raw[5].low + a.raw[5].close) / 4.0;
+        assert!((a.candles[5].close - ha_close).abs() < 1e-9);
+        // Renko: rebuilt into bricks.
+        a.chart_kind = ChartKind::Renko;
+        a.renko = RenkoConfig { box_size: 2.0, ..Default::default() };
+        a.rebuild_view();
+        assert!(!a.candles.is_empty());
+        for b in &a.candles {
+            assert!(((b.close - b.open).abs() - 2.0).abs() < 1e-9 || (b.close - b.open).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn parse_renko_config_defaults_and_overrides() {
+        let d = parse_renko_config("not json");
+        assert_eq!(d.mode, RenkoMode::Traditional);
+        assert!((d.box_size - 10.0).abs() < 1e-9);
+        let c = parse_renko_config(
+            r#"{"renko":{"mode":"atr","atrLength":7,"percentage":0.5,"wicks":true,"source":"high/low","boxSize":-1}}"#,
+        );
+        assert_eq!(c.mode, RenkoMode::Atr);
+        assert_eq!(c.atr_length, 7);
+        assert!((c.percentage - 0.5).abs() < 1e-9);
+        assert!(c.wicks);
+        assert_eq!(c.source, RenkoSource::HighLow);
+        assert!((c.box_size - 10.0).abs() < 1e-9, "non-positive box keeps the default");
     }
 }

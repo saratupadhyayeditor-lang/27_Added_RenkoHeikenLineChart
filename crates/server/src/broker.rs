@@ -38,9 +38,23 @@ struct Session {
 
 /// Consecutive feed socket failures that trip the circuit-breaker.
 const MAX_FAIL_STREAK: u32 = 5;
-/// Quiet period (seconds) the circuit-breaker parks the feed for so Dhan can
-/// clear a rate-limit block instead of being hammered every few seconds.
+/// First quiet period (seconds) the circuit-breaker parks the feed for so Dhan
+/// can clear a rate-limit block instead of being hammered every few seconds.
 const LONG_PARK_SECS: u64 = 300;
+/// Ceiling for the adaptive (doubling) park. A Dhan IP / client-id block can
+/// outlast the first 5-minute park; repeatedly retrying too soon keeps poking
+/// Dhan and can extend the block, so each consecutive park doubles the wait up
+/// to this cap. Any successful stream resets it back to `LONG_PARK_SECS`.
+const MAX_PARK_SECS: u64 = 1800;
+
+/// Next park duration given the previous one (0 = first park).
+fn next_park_secs(prev: u64) -> u64 {
+    if prev == 0 {
+        LONG_PARK_SECS
+    } else {
+        prev.saturating_mul(2).min(MAX_PARK_SECS)
+    }
+}
 
 #[derive(Default)]
 struct FeedHealth {
@@ -66,9 +80,12 @@ struct FeedHealth {
     /// Dhan rate-limits the client id it accepts a handshake, sends a packet or
     /// two and then goes silent, so a naive reconnect flaps every few seconds and
     /// keeps the block alive. Past a small threshold the consumer parks the feed
-    /// for a long quiet period instead of hammering (see `LONG_PARK`).
+    /// for a long quiet period instead of hammering (see `LONG_PARK_SECS`).
     fail_streak: u32,
     parked_until: Option<Instant>,
+    /// Duration of the most recent park, so consecutive parks can double it
+    /// (`MAX_PARK_SECS` cap). Reset to 0 once a socket streams again.
+    park_secs: u64,
     ws_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -1246,6 +1263,9 @@ impl DhanState {
             g.feed_started = None;
             g.socket_open = false;
             g.connected_at = None;
+            // Drop the heartbeat clock with the socket, so a just-stopped feed
+            // cannot read "live" off a stale Pong while it is actually down.
+            g.last_activity = None;
         }
     }
 
@@ -1271,11 +1291,17 @@ impl DhanState {
     /// Counts one feed failure and trips the circuit-breaker once too many
     /// happen in a row. Returns true when it parked the feed, so the caller must
     /// NOT respawn immediately - the watchdog re-spawns only after the park.
+    /// The streak is reset when it trips so the next round after the cool-down
+    /// gets a fresh budget (otherwise the watchdog would re-park instantly and
+    /// the feed would never be retried again).
     fn note_feed_failure(&self) -> bool {
         if let Ok(mut g) = self.health.lock() {
             g.fail_streak = g.fail_streak.saturating_add(1);
             if g.fail_streak >= MAX_FAIL_STREAK {
-                g.parked_until = Some(Instant::now() + Duration::from_secs(LONG_PARK_SECS));
+                let secs = next_park_secs(g.park_secs);
+                g.park_secs = secs;
+                g.parked_until = Some(Instant::now() + Duration::from_secs(secs));
+                g.fail_streak = 0;
                 return true;
             }
         }
@@ -1287,7 +1313,17 @@ impl DhanState {
     fn clear_feed_streak(&self) {
         if let Ok(mut g) = self.health.lock() {
             g.fail_streak = 0;
+            // A healthy stream resets the adaptive park back to the minimum.
+            g.park_secs = 0;
         }
+    }
+
+    /// The duration of the most recent park (for accurate log lines).
+    fn current_park_secs(&self) -> u64 {
+        self.health
+            .lock()
+            .map(|g| g.park_secs)
+            .unwrap_or(LONG_PARK_SECS)
     }
 
     /// Background watchdog: if a session exists but no supervisor is alive
@@ -1315,7 +1351,7 @@ impl DhanState {
                     if st.note_feed_failure() {
                         tracing::warn!(
                             "feed circuit-breaker: supervisor gone repeatedly, parking {}s",
-                            LONG_PARK_SECS
+                            st.current_park_secs()
                         );
                         continue;
                     }
@@ -1360,7 +1396,7 @@ impl DhanState {
                     if st.note_feed_failure() {
                         tracing::warn!(
                             "feed circuit-breaker: repeated silent sockets, parking {}s",
-                            LONG_PARK_SECS
+                            st.current_park_secs()
                         );
                         st.stop_feed();
                         continue;
@@ -1379,10 +1415,11 @@ impl DhanState {
     /// the user pressed Connect again.
     ///
     /// This watchdog re-runs the exact `profile()` authentication that Connect
-    /// uses - every 2s while the link is down during exchange hours - so a
-    /// transient disconnect heals with no user action. It never touches a feed
-    /// supervisor that is already alive (that one has its own capped backoff, and
-    /// forcing it would only re-trip Dhan's connection limit), and it honours the
+    /// uses, but ONLY when no feed supervisor is alive (a live supervisor heals
+    /// itself with its own capped backoff). Calls are backed off (5s doubling to
+    /// 60s) and a 429 / rate-limit reply parks the feed for `LONG_PARK_SECS`
+    /// instead of retrying - hammering `/profile` while Dhan is rate-limiting is
+    /// what kept the IP / client id blocked. It also honours the
     /// `/api/feed/reset` park cooldown.
     ///
     /// Note: an *expired daily token* still needs a fresh paste - the app holds no
@@ -1393,44 +1430,86 @@ impl DhanState {
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut last_err: Option<String> = None;
+            let mut next_try = Instant::now();
+            let mut backoff = 5u64;
             loop {
                 tick.tick().await;
                 if st.park_active() || !market_open_now() {
                     continue;
                 }
+                // Never add REST pressure while a feed supervisor is alive: it
+                // owns reconnection with its own capped backoff. The old code
+                // called `/profile` every 2s here even during a feed outage,
+                // which is exactly the flood that made Dhan answer "too many
+                // requests from this IP hence client id is blocked".
+                if st.feed_running() {
+                    continue;
+                }
+                if Instant::now() < next_try {
+                    continue;
+                }
                 let Some(session) = st.session.read().await.clone() else {
                     continue;
                 };
-                // Already streaming: nothing to reconnect.
+                // Already alive: any frame (trade tick OR heartbeat) within 15s
+                // means there is nothing to reconnect - a quiet market must not
+                // launch a reconnect storm.
                 let live = st
                     .health
                     .lock()
                     .map(|g| {
-                        g.feed_up
-                            && g.last_tick
-                                .map(|t| t.elapsed() < Duration::from_secs(15))
-                                .unwrap_or(false)
+                        g.last_activity
+                            .map(|t| t.elapsed() < Duration::from_secs(15))
+                            .unwrap_or(false)
                     })
                     .unwrap_or(false);
                 if live {
+                    backoff = 5;
+                    next_try = Instant::now();
                     continue;
                 }
                 match session.client.profile().await {
                     Ok(_) => {
                         st.set_auth_error(None);
                         last_err = None;
-                        if !st.feed_running() {
-                            tracing::warn!("api auto-reconnect: session valid, restarting feed");
-                            st.spawn_feed_task(session).await;
-                        }
+                        backoff = 5;
+                        next_try = Instant::now();
+                        tracing::warn!("api auto-reconnect: session valid, restarting feed");
+                        st.spawn_feed_task(session).await;
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        if last_err.as_deref() != Some(msg.as_str()) {
+                        let rate_limited = e.is_rate_limit()
+                            || msg.contains("429")
+                            || msg.to_ascii_lowercase().contains("too many");
+                        if rate_limited {
+                            // A Dhan IP / client-id block needs a long quiet
+                            // window; park so neither this loop nor the feed
+                            // watchdog keeps poking it (each poke can extend
+                            // the block). Consecutive parks double up to
+                            // MAX_PARK_SECS. The frontend honours this cooldown.
+                            let secs = {
+                                let mut g = st.health.lock().unwrap_or_else(|e| e.into_inner());
+                                let secs = next_park_secs(g.park_secs);
+                                g.park_secs = secs;
+                                g.parked_until =
+                                    Some(Instant::now() + Duration::from_secs(secs));
+                                secs
+                            };
+                            if last_err.as_deref() != Some(msg.as_str()) {
+                                tracing::warn!(
+                                    "api auto-reconnect rate-limited; parking {}s: {msg}",
+                                    secs
+                                );
+                                last_err = Some(msg.clone());
+                            }
+                        } else if last_err.as_deref() != Some(msg.as_str()) {
                             tracing::warn!("api auto-reconnect failed: {msg}");
                             last_err = Some(msg.clone());
                         }
                         st.set_auth_error(Some(msg));
+                        next_try = Instant::now() + Duration::from_secs(backoff);
+                        backoff = (backoff * 2).min(60);
                     }
                 }
             }
@@ -1456,14 +1535,17 @@ fn market_open_now() -> bool {
 /// monitor. Pure (no state) so it can be unit-tested exhaustively:
 /// - `offline`    no Dhan session at all -> needs Client ID + Token
 /// - `closed`     session exists but the exchange is closed -> idle, not an error
-/// - `live`       socket streaming and a tick landed within the last 15s
+/// - `live`       socket streaming: a frame (trade tick OR heartbeat) landed
+///                within the last 15s. Heartbeats deliberately count, so a quiet
+///                market with no trade ticks is never reported as disconnected
+///                (that false "down" is what triggered the auto-reset disconnect).
 /// - `connecting` socket is up but has not delivered its first packet yet
-/// - `down`       connected + market open, but the feed is silent/not streaming
+/// - `down`       connected + market open, but nothing has arrived for >15s
 fn link_state(
     connected: bool,
     market_open: bool,
     feed_up: bool,
-    last_tick_age_sec: Option<f64>,
+    last_frame_age_sec: Option<f64>,
     ws_running: bool,
     feed_started_age_sec: Option<f64>,
 ) -> &'static str {
@@ -1473,7 +1555,10 @@ fn link_state(
     if !market_open {
         return "closed";
     }
-    let fresh = feed_up && last_tick_age_sec.map(|a| a < 15.0).unwrap_or(false);
+    // Liveness is "any frame in the last 15s", not "a trade tick in the last
+    // 15s": our 5s keepalive ping and Dhan's own heartbeats refresh this even
+    // when the exchange sends nothing (off-hours / illiquid strikes / holiday).
+    let fresh = last_frame_age_sec.map(|a| a < 15.0).unwrap_or(false);
     if fresh {
         return "live";
     }
@@ -1605,6 +1690,9 @@ pub async fn feed_reset(State(st): State<DhanState>) -> impl IntoResponse {
     st.stop_feed();
     if let Ok(mut g) = st.health.lock() {
         g.last_tick = None;
+        // Clear the heartbeat clock too: otherwise a socket we just tore down
+        // would keep its last Pong fresh for up to 15s and briefly read "live".
+        g.last_activity = None;
         // Never shorten an already-running (circuit-breaker) park: the browser's
         // automatic reset repeatedly calls this, and shortening it would defeat
         // the long quiet period Dhan needs to clear the rate limit.
@@ -1841,7 +1929,7 @@ async fn run_feed(
                 // the feed as "up"/fresh (that made a socket stuck in reconnect
                 // backoff look live and masked the outage).
                 if let FeedPacket::Link { up } = pkt {
-                    let mut park_long = false;
+                    let mut park_long = 0u64;
                     if let Ok(mut g) = health.lock() {
                         g.socket_open = up;
                         if up {
@@ -1850,17 +1938,21 @@ async fn run_feed(
                             g.feed_up = false;
                             g.fail_streak = g.fail_streak.saturating_add(1);
                             if g.fail_streak >= MAX_FAIL_STREAK {
+                                let secs = next_park_secs(g.park_secs);
+                                g.park_secs = secs;
                                 g.parked_until =
-                                    Some(Instant::now() + Duration::from_secs(LONG_PARK_SECS));
-                                park_long = true;
+                                    Some(Instant::now() + Duration::from_secs(secs));
+                                // Fresh budget for the next round after the park.
+                                g.fail_streak = 0;
+                                park_long = secs;
                             }
                         }
                     }
-                    if park_long {
+                    if park_long > 0 {
                         tracing::warn!(
                             "feed circuit-breaker: {} consecutive failures, parking {}s so Dhan can clear the rate limit",
                             MAX_FAIL_STREAK,
-                            LONG_PARK_SECS
+                            park_long
                         );
                         // End this supervisor; the watchdog re-spawns only after
                         // the park expires, giving Dhan a real quiet window.
@@ -2252,6 +2344,16 @@ mod link_state_tests {
     }
 
     #[test]
+    fn heartbeat_keeps_a_tickless_socket_live() {
+        // No trade tick has landed yet (feed_up=false), but the 5s keepalive /
+        // Dhan heartbeat arrived 5s ago: the socket is alive and must stay
+        // "live" so the UI never trips its auto-reset while the market is quiet.
+        assert_eq!(link_state(true, true, false, Some(5.0), true, Some(120.0)), "live");
+        // Same, past the 30s handshake window: activity still wins.
+        assert_eq!(link_state(true, true, false, Some(2.5), true, Some(600.0)), "live");
+    }
+
+    #[test]
     fn stale_tick_is_down_not_live() {
         // feed_up but the last tick is too old: a stalled socket must not look live.
         assert_eq!(link_state(true, true, true, Some(15.0), true, Some(600.0)), "down");
@@ -2266,6 +2368,18 @@ mod link_state_tests {
         assert_eq!(link_state(true, true, false, None, true, Some(31.0)), "down");
         // socket not running at all -> outage.
         assert_eq!(link_state(true, true, false, None, false, Some(5.0)), "down");
+    }
+
+    #[test]
+    fn park_backoff_doubles_then_caps() {
+        // First park is the baseline, then it doubles up to MAX_PARK_SECS so a
+        // long Dhan IP block is not poked every few minutes.
+        assert_eq!(next_park_secs(0), LONG_PARK_SECS);
+        assert_eq!(next_park_secs(LONG_PARK_SECS), LONG_PARK_SECS * 2);
+        assert_eq!(next_park_secs(LONG_PARK_SECS * 2), LONG_PARK_SECS * 4);
+        assert_eq!(next_park_secs(LONG_PARK_SECS * 4), MAX_PARK_SECS);
+        assert_eq!(next_park_secs(MAX_PARK_SECS), MAX_PARK_SECS);
+        assert!(MAX_PARK_SECS >= LONG_PARK_SECS * 4);
     }
 }
 

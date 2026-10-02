@@ -1,6 +1,11 @@
 /* tslint:disable */
 /* eslint-disable */
 
+/**
+ * Current chart kind + Renko settings as JSON, so the UI can restore its state.
+ */
+export function chart_kind_json(): string;
+
 export function clear_dir_overlay(): void;
 
 export function clear_oc_level_lines(): void;
@@ -28,6 +33,14 @@ export function open_option_chart_by_sid(sid: number, exchange_segment: string, 
  * f64 so JS can pass a plain number (i64 would require a BigInt).
  */
 export function select_symbol(sec_id: number, exch: string, inst_type: string, name: string): void;
+
+/**
+ * Switch the chart type (`candles` / `heikin_ashi` / `renko`) and apply the
+ * Renko settings, rebuilding the display series from the raw candles. The
+ * open indicators are recomputed on the new series, exactly as TradingView
+ * does when the chart type changes.
+ */
+export function set_chart_kind(kind: string, json: string): void;
 
 /**
  * Trend arrows / labels for the direction overlay (merged alongside the
@@ -72,12 +85,14 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly chart_kind_json: () => [number, number];
     readonly clear_dir_overlay: () => void;
     readonly clear_oc_level_lines: () => void;
     readonly clear_trade_lines: () => void;
     readonly live_tick: () => void;
     readonly open_option_chart_by_sid: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly select_symbol: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly set_chart_kind: (a: number, b: number, c: number, d: number) => void;
     readonly set_dir_markers: (a: number, b: number) => void;
     readonly set_dir_series: (a: number, b: number, c: number, d: number, e: number) => void;
     readonly set_oc_level_lines: (a: number, b: number) => void;
@@ -85,13 +100,13 @@ export interface InitOutput {
     readonly set_trade_lines: (a: number, b: number) => void;
     readonly start: () => void;
     readonly update_oc_quotes: (a: number, b: number) => void;
-    readonly wasm_bindgen_9a02351949df677f___convert__closures_____invoke___js_sys_20b195a33992fea5___Function_fn_wasm_bindgen_9a02351949df677f___JsValue_____wasm_bindgen_9a02351949df677f___sys__Undefined___js_sys_20b195a33992fea5___Function_fn_wasm_bindgen_9a02351949df677f___JsValue_____wasm_bindgen_9a02351949df677f___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen_9a02351949df677f___convert__closures_____invoke___wasm_bindgen_9a02351949df677f___JsValue__core_ed718c3d60ebd546___result__Result_____wasm_bindgen_9a02351949df677f___JsError___true_: (a: number, b: number, c: any) => [number, number];
-    readonly wasm_bindgen_9a02351949df677f___convert__closures_____invoke___web_sys_8c07f19814ebe7a0___features__gen_MouseEvent__MouseEvent______true_: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_9a02351949df677f___convert__closures_____invoke___web_sys_8c07f19814ebe7a0___features__gen_MouseEvent__MouseEvent______true__16: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_9a02351949df677f___convert__closures_____invoke___web_sys_8c07f19814ebe7a0___features__gen_MouseEvent__MouseEvent______true__17: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_9a02351949df677f___convert__closures_____invoke___web_sys_8c07f19814ebe7a0___features__gen_MouseEvent__MouseEvent______true__18: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen_9a02351949df677f___convert__closures_____invoke_______true_: (a: number, b: number) => void;
+    readonly wasm_bindgen_7005259d21a40caf___convert__closures_____invoke___js_sys_74bf28d486ca7ec2___Function_fn_wasm_bindgen_7005259d21a40caf___JsValue_____wasm_bindgen_7005259d21a40caf___sys__Undefined___js_sys_74bf28d486ca7ec2___Function_fn_wasm_bindgen_7005259d21a40caf___JsValue_____wasm_bindgen_7005259d21a40caf___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
+    readonly wasm_bindgen_7005259d21a40caf___convert__closures_____invoke___wasm_bindgen_7005259d21a40caf___JsValue__core_608f92abc48d28da___result__Result_____wasm_bindgen_7005259d21a40caf___JsError___true_: (a: number, b: number, c: any) => [number, number];
+    readonly wasm_bindgen_7005259d21a40caf___convert__closures_____invoke___web_sys_f91a6cb96ff99210___features__gen_MouseEvent__MouseEvent______true_: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_7005259d21a40caf___convert__closures_____invoke___web_sys_f91a6cb96ff99210___features__gen_MouseEvent__MouseEvent______true__18: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_7005259d21a40caf___convert__closures_____invoke___web_sys_f91a6cb96ff99210___features__gen_MouseEvent__MouseEvent______true__19: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_7005259d21a40caf___convert__closures_____invoke___web_sys_f91a6cb96ff99210___features__gen_MouseEvent__MouseEvent______true__20: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen_7005259d21a40caf___convert__closures_____invoke_______true_: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

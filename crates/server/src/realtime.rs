@@ -422,40 +422,7 @@ pub struct Settings {
     pub filter_mode: bool,
     // --- Entry gate modes ---
     pub all_in_one: bool,
-    pub dir_guard: bool,
     pub overall_dir: bool,
-    /// "Filter-side routing": when ON, the executed option leg is decided SOLELY
-    /// by the strategy's own filter side - a bullish-filtered strategy trades CE,
-    /// a bearish-filtered one trades PE - and no other direction source (NIFTY
-    /// straight-line lock, Top-Movers auto side, Run-Strategy-In override or the
-    /// Overall Bullish/Bearish toggle) may flip it. A bullish filter that detects
-    /// bearish simply fails its gate, so it never opens a PE trade (and vice
-    /// versa). When OFF the normal multi-source routing applies.
-    pub filter_side_route: bool,
-    /// Strict straight-line gate for the Indicator-filters scanner. When ON, every
-    /// scanner / NIFTY-trend leg must ALSO be confirmed by EVERY straight-line
-    /// filter ticked on its OWN side, from both list sections: the "Straight Line
-    /// Indicators" line-DIRECTION rows (`BullSl*` / `BearSl*`, Volume line `Vl`)
-    /// and the "Straight Line Indicator Color Detection" rows (`BullSlColor*` /
-    /// `BearSlColor*`, green on the CE side / red on the PE side). Any ticked line
-    /// reading the other way blocks the entry outright - even when the ordinary
-    /// gate (majority / AI Brain) would otherwise let the leg through. Normal-mode
-    /// strategies and cases with no line filter ticked are unaffected.
-    ///
-    /// NIFTY Trend Following exception: while `nifty_trend_on` is set, the
-    /// opposite-side block for the scanner universe is owned by the ASSIGNED NIFTY
-    /// confirmation indicators (the `nifty_net_strict` / `nifty_all_agree_strict`
-    /// gates), NOT by the manually ticked straight-line filters. This manual
-    /// all-agree gate is therefore skipped for scanner legs while NIFTY trend is
-    /// on, so a handful of ticked lines cannot stall every entry.
-    pub strict_line_color: bool,
-    /// "One trade per strike until the next fresh filter signal" for the
-    /// Indicator-filters scanner. When ON, once a top gainer / top loser (or
-    /// NIFTY-trend) leg has executed a trade on a strike, NO further entry is
-    /// placed on that same strike until the leg's selected indicator-filter
-    /// condition resets and meets again (a brand-new fresh signal). A gate that
-    /// stays true, or a re-entry right after the position closes, is blocked.
-    pub once_per_signal: bool,
     /// Spot forming-candle colour gate. When ON, a bullish leg (Top Gainer / CE
     /// side) may enter ONLY while the spot chart's live forming candle is GREEN,
     /// and a bearish leg (Top Loser / PE side) ONLY while it is RED. Applies when
@@ -476,15 +443,6 @@ pub struct Settings {
     pub multi_always_on: bool,
     pub brain_mode: String,
     pub brain_threshold: i64,
-    /// Opposite-side filter veto mode:
-    /// * `relative` (default) - veto the entry only when the OPPOSITE side's
-    ///   enabled filters agree STRICTLY more than the trade side's own filters
-    ///   (i.e. the opposite read is stronger). A tie, or the trade side leading,
-    ///   never vetoes, so a symmetric two-sided filter set can no longer deadlock
-    ///   into "no trade at all" on either side.
-    /// * `off` - disable the opposite-side veto entirely; the own-side strict /
-    ///   majority / Brain gate is the only entry rule.
-    pub opposite_veto: String,
     /// Option side for index/underlying strategies: `both` | `CE` | `PE`.
     pub option_side: String,
     /// NIFTY ensemble trend timeframe: `1min` | `5min` | `15min` | `both`.
@@ -554,6 +512,13 @@ pub struct Settings {
     /// Paper-trading starting capital (virtual wallet). Realized paper P&L is
     /// added/subtracted from this to derive the available paper balance.
     pub paper_capital: f64,
+    /// Dynamic margin mode (paper only). When ON, the wallet's starting balance
+    /// is the manual "Margin ₹" amount (`margin_amount`) instead of
+    /// `paper_capital`, and realized paper P&L grows/shrinks it exactly like a
+    /// real account: a loss reduces the tradable margin, a profit increases it,
+    /// and it stays that way until the operator resets the book. OFF keeps the
+    /// legacy static paper capital (the margin amount remains a hard cap).
+    pub dynamic_margin_on: bool,
     /// Paper fills: adverse slippage applied to every simulated fill, in basis
     /// points of the traded price (e.g. 5 = 0.05%). 0 disables slippage.
     pub paper_slippage_bps: f64,
@@ -673,17 +638,12 @@ impl Default for Settings {
             scanner_exclude: Vec::new(),
             filter_mode: false,
             all_in_one: false,
-            dir_guard: false,
             overall_dir: true,
-            filter_side_route: false,
-            strict_line_color: false,
-            once_per_signal: false,
             spot_candle_gate: false,
             multi_fresh_on: true,
             multi_always_on: false,
             brain_mode: "off".into(),
             brain_threshold: 65,
-            opposite_veto: "relative".into(),
             option_side: "both".into(),
             nifty_tf: "5min".into(),
             filters: BTreeMap::new(),
@@ -729,6 +689,7 @@ impl Default for Settings {
             run_in_side: "CE".into(),
             run_in_auto: false,
             paper_capital: 200_000.0,
+            dynamic_margin_on: false,
             paper_slippage_bps: 5.0,
             paper_reject_pct: 0.0,
             paper_exec_delay_on: false,
@@ -797,6 +758,13 @@ pub struct Strategy {
     /// (BUY = CE, SELL = PE) instead of reading the global Option Type setting.
     #[serde(default)]
     pub manual: bool,
+    /// Top Movers gainer/loser scanner leg. Its execution side is bound to the
+    /// leg itself - a Top Gainer always buys CE, a Top Loser always PE - so no
+    /// global direction source (Run Strategy In / Option Type / Top-Movers auto
+    /// bias / NIFTY lock / Overall direction) may flip it. Operator-assigned
+    /// index/commodity legs still win (see `routed_option_side`).
+    #[serde(default)]
+    pub movers_leg: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1223,6 +1191,31 @@ fn paper_wallet_of(cap: f64, closed: &[Value], charges_on: bool) -> f64 {
     (cap + realized_pnl(closed, charges_on)).max(0.0)
 }
 
+/// Paper wallet base balance (before realized P&L). Dynamic margin mode ties it
+/// to the operator's manual "Margin ₹" amount so P&L moves the same money the
+/// operator set; otherwise it is the static paper capital. A dynamic mode with
+/// no margin amount set falls back to the capital so the wallet never collapses
+/// to zero.
+fn paper_base_of(s: &Settings) -> f64 {
+    if s.dynamic_margin_on && s.margin_amount > 0.0 {
+        s.margin_amount
+    } else {
+        s.paper_capital
+    }
+}
+
+/// In dynamic margin mode the manual margin amount is the wallet base, so it
+/// must not ALSO be applied as a hard cap (that would freeze the balance at the
+/// starting amount and hide profits). Returns the effective cap: `0` disables
+/// the cap, letting the percentage/budget logic use the whole running wallet.
+fn paper_margin_cap_of(s: &Settings) -> f64 {
+    if s.dynamic_margin_on && s.margin_amount > 0.0 {
+        0.0
+    } else {
+        s.margin_amount
+    }
+}
+
 /// Paper wallet free cash: balance - margin locked by the open paper positions.
 /// Derived (never stored) so it can never drift. This is the amount shown as the
 /// account's available balance; the margin budget is sized against
@@ -1313,11 +1306,6 @@ pub struct RealtimeState {
     /// position is allowed only on the false -> true edge, so a gate that stays
     /// true opens exactly one position instead of one every scan cycle.
     sig_state: Arc<Mutex<HashMap<String, bool>>>,
-    /// "One trade per strike until the next fresh filter signal": strategy id ->
-    /// the option contracts already traded during the CURRENT signal pulse. A
-    /// contract is cleared the moment the leg's gate stops holding (the pulse
-    /// ends), so the next fresh signal may trade it again.
-    pulse_traded: Arc<Mutex<HashMap<String, std::collections::HashSet<i64>>>>,
     /// Signal-end debounce: strategy id -> millisecond timestamp when its leg's
     /// gate was FIRST seen failing on the current run of failures. A single-scan
     /// flicker must not end the signal, so the pulse is only reset once the gate
@@ -1501,7 +1489,6 @@ impl RealtimeState {
             was_feed: Arc::new(AtomicBool::new(false)),
             last_sig: Arc::new(Mutex::new(HashMap::new())),
             sig_state: Arc::new(Mutex::new(HashMap::new())),
-            pulse_traded: Arc::new(Mutex::new(HashMap::new())),
             sig_fail_since: Arc::new(Mutex::new(HashMap::new())),
             atr_cache: Arc::new(Mutex::new(HashMap::new())),
             pool_cache: Arc::new(Mutex::new((0, Value::Null))),
@@ -1811,13 +1798,15 @@ impl RealtimeState {
             .unwrap_or(0.0)
     }
 
-    /// Paper wallet: starting capital + realized P&L - margin locked by the open
-    /// paper positions. Derived (never stored) so it can never drift.
+    /// Paper wallet: base balance + realized P&L - margin locked by the open
+    /// paper positions. The base is the static capital, or the manual margin
+    /// amount in dynamic margin mode. Derived (never stored) so it can never
+    /// drift.
     fn paper_available(&self) -> f64 {
         self.doc()
             .map(|d| {
                 paper_available_of(
-                    d.settings.paper_capital,
+                    paper_base_of(&d.settings),
                     &d.closed,
                     &d.positions,
                     d.settings.broker_charges,
@@ -1853,9 +1842,9 @@ impl RealtimeState {
                 .doc()
                 .map(|d| {
                     (
-                        d.settings.margin_amount,
+                        paper_margin_cap_of(&d.settings),
                         d.settings.margin_pct,
-                        paper_wallet_of(d.settings.paper_capital, &d.closed, d.settings.broker_charges),
+                        paper_wallet_of(paper_base_of(&d.settings), &d.closed, d.settings.broker_charges),
                     )
                 })
                 .unwrap_or((0.0, 100.0, 200_000.0));
@@ -1919,12 +1908,11 @@ impl RealtimeState {
         self.doc().map(|d| d.settings.skip_on_margin_block).unwrap_or(false)
     }
 
-    /// Consume a signal because margin blocked it: latch the fresh edge and mark
-    /// the strike traded for this pulse so the SAME signal can never re-queue and
-    /// fill late. A genuinely new signal (after the pulse ends) is still allowed.
-    fn consume_signal_for_margin(&self, strategy_id: &str, security_id: i64) {
+    /// Consume a signal because margin blocked it: latch the fresh edge so the
+    /// SAME signal can never re-queue and fill late. A genuinely new signal
+    /// (after the gate resets) is still allowed.
+    fn consume_signal_for_margin(&self, strategy_id: &str) {
         self.set_sig_state(strategy_id, true);
-        self.pulse_mark(strategy_id, security_id);
     }
 
     /// Entry-gate edge state for the multi-position "fresh signal" mode: whether
@@ -1959,44 +1947,10 @@ impl RealtimeState {
         self.clear_signal_edge(strategy_id);
     }
 
-    /// End the current signal pulse for a strategy: the gate stopped holding, so
-    /// the next time it holds is a brand-new fresh signal. Clears both the
-    /// fresh-edge flag and the per-strike "already traded this pulse" memory.
+    /// End the current signal for a strategy: the gate stopped holding, so the
+    /// next time it holds is a brand-new fresh signal. Clears the fresh-edge flag.
     fn clear_signal_edge(&self, strategy_id: &str) {
         self.set_sig_state(strategy_id, false);
-        self.pulse_reset(strategy_id);
-    }
-
-    /// Forget the contracts a strategy traded during its current signal pulse, so
-    /// the next fresh signal may trade them again.
-    fn pulse_reset(&self, strategy_id: &str) {
-        if let Ok(mut m) = self.pulse_traded.lock() {
-            m.remove(strategy_id);
-        }
-    }
-
-    /// True when this strategy has already traded this exact contract during the
-    /// CURRENT signal pulse (blocked until the pulse ends and a fresh signal
-    /// begins).
-    fn pulse_blocked(&self, strategy_id: &str, security_id: i64) -> bool {
-        self.pulse_traded
-            .lock()
-            .ok()
-            .and_then(|m| m.get(strategy_id).map(|s| s.contains(&security_id)))
-            .unwrap_or(false)
-    }
-
-    /// Record that this strategy traded this contract during the current pulse.
-    fn pulse_mark(&self, strategy_id: &str, security_id: i64) {
-        if security_id <= 0 {
-            return;
-        }
-        if let Ok(mut m) = self.pulse_traded.lock() {
-            if m.len() > 5000 {
-                m.clear();
-            }
-            m.entry(strategy_id.to_string()).or_default().insert(security_id);
-        }
     }
 
     /// The leg's gate held on this scan: cancel any pending signal-end debounce so
@@ -2052,29 +2006,6 @@ impl RealtimeState {
     /// can keep stacking as designed.
     fn duplicate_entry_blocked(&self, settings: &Settings, security_id: i64, guard: bool) -> bool {
         guard && !settings.multi_always_on && self.contract_running(security_id)
-    }
-
-    /// "One trade per signal" guard. Returns a human-readable reason when the
-    /// scanner leg must be blocked, else `None`. The rule is purely signal-scoped:
-    /// once a leg has traded a contract during the CURRENT signal pulse it is
-    /// held until that pulse ends, no matter whether the position is still open.
-    /// A genuinely new signal clears the pulse (see `note_signal_pass` /
-    /// `end_signal_if_due`), so the very next signal may trade the same strike
-    /// again. A running position therefore never blocks a fresh signal - only a
-    /// repeat inside the same pulse is blocked.
-    fn once_per_signal_block_reason(
-        &self,
-        settings: &Settings,
-        strat: &Strategy,
-        security_id: i64,
-    ) -> Option<&'static str> {
-        if !settings.once_per_signal || !strat.synthetic {
-            return None;
-        }
-        if self.pulse_blocked(&strat.id, security_id) {
-            return Some("already traded this strike on the current signal");
-        }
-        None
     }
 
     /// Margin bar readout for the Running Trades section. Takes the already
@@ -2401,16 +2332,18 @@ impl RealtimeState {
                 let avail = self.paper_available();
                 let cap = self
                     .doc()
-                    .map(|d| d.settings.paper_capital)
+                    .map(|d| paper_base_of(&d.settings))
                     .filter(|c| *c > 0.0)
                     .unwrap_or(200_000.0);
                 let realized = self.paper_realized();
+                let dynamic = self.doc().map(|d| d.settings.dynamic_margin_on).unwrap_or(false);
                 if let Ok(mut g) = self.funds.lock() {
                     *g = json!({
                         "availabelBalance": round2(avail),
                         "availableBalance": round2(avail),
                         "openingBalance": round2(cap),
                         "realizedPnl": round2(realized),
+                        "dynamicMargin": dynamic,
                         "paper": true,
                     });
                 }
@@ -2691,11 +2624,6 @@ impl RealtimeState {
     /// the strategy is not an F&O stock, or the lines are tied (no committed
     /// direction), so callers keep their normal resolution.
     fn nifty_locked_side(&self, strat: &Strategy, settings: &Settings) -> Option<&'static str> {
-        // Per-strategy side routing owns the direction: the strategy's own
-        // stock/filter side decides the leg, so the NIFTY lock must not flip it.
-        if per_strategy_side(settings) {
-            return None;
-        }
         self.nifty_side_for(strat, settings)
     }
 
@@ -2705,8 +2633,7 @@ impl RealtimeState {
     /// available). `None` when the override is off - callers then keep their
     /// normal option-side resolution.
     fn effective_run_in_side(&self, settings: &Settings) -> Option<&'static str> {
-        // Per-strategy side routing disables the "Run Strategy In" CE/PE override.
-        if per_strategy_side(settings) || !settings.run_in_enabled {
+        if !settings.run_in_enabled {
             return None;
         }
         if settings.run_in_auto {
@@ -2735,12 +2662,6 @@ impl RealtimeState {
     /// single source, otherwise the filter side and the traded contract can
     /// disagree and an entry fires opposite to the filter that gated it.
     fn active_side(&self, settings: &Settings) -> Option<&'static str> {
-        // Per-strategy side routing is per strategy: there is no single global
-        // side to narrow the scanner/Overall-direction with, so report
-        // "undecided" and let each strategy's own side drive its leg.
-        if per_strategy_side(settings) {
-            return None;
-        }
         self.effective_run_in_side(settings)
             .or_else(|| self.auto_option_side(settings))
     }
@@ -2769,6 +2690,9 @@ impl RealtimeState {
     fn desired_option_side(&self, settings: &Settings, strat: &Strategy) -> String {
         if let Some(side) = routed_option_side(settings, strat) {
             return side.to_string();
+        }
+        if strat.movers_leg {
+            return if strategy_is_bull(strat) { "CE" } else { "PE" }.to_string();
         }
         if let Some(side) = self.nifty_locked_side(strat, settings) {
             return side.to_string();
@@ -3461,16 +3385,7 @@ impl RealtimeState {
     /// saved settings, which override the manual gate/filter set for this entry.
     fn template_for_direction(&self, settings: &Settings, strat: &Strategy) -> Option<Settings> {
         let mut name = String::new();
-        if per_strategy_side(settings) {
-            // Per-strategy side routing: the strategy's own side selects the
-            // template, never the Top-Movers bias (which could disagree with the
-            // routed leg).
-            name = if strategy_is_bull(strat) {
-                settings.bull_template.clone()
-            } else {
-                settings.bear_template.clone()
-            };
-        } else if assigned_leg(settings, strat).is_none()
+        if assigned_leg(settings, strat).is_none()
             && settings.movers_on
             && !settings.manual_strikes_enabled
         {
@@ -3513,9 +3428,6 @@ impl RealtimeState {
         let bull = side == "CE";
         let mut s2 = settings.clone();
         s2.run_in_enabled = false;
-        // The readout lists each pick's own side explicitly, so keep the
-        // per-strategy side routing from collapsing both rows onto one side.
-        s2.filter_side_route = false;
         s2.option_side = side.to_string();
         let base = Strategy {
             id: format!("pick:{}:{side}", sid),
@@ -3535,6 +3447,7 @@ impl RealtimeState {
             lot: 0.0,
             group: String::new(),
             manual: false,
+            movers_leg: false,
         };
         self.resolve_option_strategy(&base, spot, &s2, true)
     }
@@ -3688,6 +3601,7 @@ impl RealtimeState {
             force: Option<bool>,
             allow_bull: bool,
             allow_bear: bool,
+            movers_leg: bool,
         ) {
             if sid <= 0 {
                 return;
@@ -3719,6 +3633,7 @@ impl RealtimeState {
                     lot,
                     group: String::new(),
                     manual: false,
+                    movers_leg,
                 });
             };
             match force {
@@ -3755,10 +3670,10 @@ impl RealtimeState {
         if settings.manual_strikes_enabled {
             for (sid, has_ce, has_pe) in manual_target_specs(&settings.manual_strikes) {
                 if has_ce {
-                    add(&mut out, &mut seen, sid, Some(true), allow_bull, allow_bear);
+                    add(&mut out, &mut seen, sid, Some(true), allow_bull, allow_bear, false);
                 }
                 if has_pe {
-                    add(&mut out, &mut seen, sid, Some(false), allow_bull, allow_bear);
+                    add(&mut out, &mut seen, sid, Some(false), allow_bull, allow_bear, false);
                 }
             }
             return out;
@@ -3781,41 +3696,38 @@ impl RealtimeState {
                 // are the whole entry rule. A commodity with no assignment keeps
                 // the old global-side behaviour.
                 if let Some(bull) = commodity_target_side(settings, c.security_id) {
-                    add(&mut out, &mut seen, c.security_id, Some(bull), true, true);
+                    add(&mut out, &mut seen, c.security_id, Some(bull), true, true, false);
                 } else {
-                    add(&mut out, &mut seen, c.security_id, None, allow_bull, allow_bear);
+                    add(&mut out, &mut seen, c.security_id, None, allow_bull, allow_bear, false);
                 }
             }
         }
 
         // Top Movers: gainers are bullish, losers bearish, plus operator indices.
-        // When the NIFTY-trend strict gate(s) are ON the forced gainer/loser legs
-        // are additionally bound to the assigned straight-line direction: a Top
-        // Gainer (CE) leg is dropped unless the lines confirm bullish, a Top Loser
-        // (PE) leg unless they confirm bearish. Operator-assigned index legs are
-        // explicit picks, so they are left untouched.
+        // Each forced gainer/loser leg is hard-bound to its own side (gainer = CE,
+        // loser = PE); the global Run-in / auto side must NOT narrow this universe,
+        // so with NIFTY Trend Following off both selected legs run and each buys
+        // its own side. When a NIFTY direction is committed it OWNS the arming:
+        // bullish NIFTY arms only the CE (gainer) legs, bearish only the PE
+        // (loser) legs - the each-leg side binding still applies either way.
+        // Operator-assigned index legs are explicit picks and stay untouched.
         if settings.movers_on {
             let payload = self.movers_cache.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
-            // Once NIFTY Trend Following has committed a direction it OWNS this
-            // universe's side: a bullish NIFTY must arm the Top Gainer (CE) legs
-            // even when the Top-Movers auto bias happens to point PE (a down day
-            // with the index line rising), and vice versa. Otherwise the auto
-            // bias's global side gate silently cancelled the NIFTY call and the
-            // "bullish CE / Top Gainer" legs never ran. With no committed NIFTY
-            // direction the old global side gate applies unchanged.
             let (mv_allow_bull, mv_allow_bear) = match self.nifty_dir.load(Ordering::Relaxed) {
                 d if settings.nifty_trend_on && d > 0 => (true, false),
                 d if settings.nifty_trend_on && d < 0 => (false, true),
-                _ => (allow_bull, allow_bear),
+                // NIFTY off (or a tie): each selected leg runs on its own side,
+                // never narrowed by the global Run-in / auto side.
+                _ => (bull_side, bear_side),
             };
             if mv_allow_bull && self.nifty_line_side_ok(settings, true) {
                 for r in jarr(&payload, "gainers") {
-                    add(&mut out, &mut seen, ji(&r, "securityId"), Some(true), true, true);
+                    add(&mut out, &mut seen, ji(&r, "securityId"), Some(true), true, true, true);
                 }
             }
             if mv_allow_bear && self.nifty_line_side_ok(settings, false) {
                 for r in jarr(&payload, "losers") {
-                    add(&mut out, &mut seen, ji(&r, "securityId"), Some(false), true, true);
+                    add(&mut out, &mut seen, ji(&r, "securityId"), Some(false), true, true, true);
                 }
             }
             for id in &settings.movers_indices {
@@ -3824,7 +3736,7 @@ impl RealtimeState {
                 // assigned leg is authoritative, so it bypasses the global side
                 // gates (both allow flags are passed as true).
                 if let Some(bull) = index_target_side(settings, *id) {
-                    add(&mut out, &mut seen, *id, Some(bull), true, true);
+                    add(&mut out, &mut seen, *id, Some(bull), true, true, false);
                 }
             }
         }
@@ -3847,10 +3759,10 @@ impl RealtimeState {
                 }
                 if js(&p, "side").eq_ignore_ascii_case("CE") {
                     if nifty_allow_bull && self.nifty_line_side_ok(settings, true) {
-                        add(&mut out, &mut seen, sid, Some(true), true, true);
+                        add(&mut out, &mut seen, sid, Some(true), true, true, false);
                     }
                 } else if nifty_allow_bear && self.nifty_line_side_ok(settings, false) {
-                    add(&mut out, &mut seen, sid, Some(false), true, true);
+                    add(&mut out, &mut seen, sid, Some(false), true, true, false);
                 }
             }
         }
@@ -4019,8 +3931,14 @@ impl RealtimeState {
             // Overall Bullish/Bearish idea: when on, only the overall direction's
             // side is traded (NIFTY trend / top-movers decide the overall side).
             // An operator-assigned index/commodity leg is authoritative, so it is
-            // never overridden by the overall direction.
-            if settings.overall_dir && assigned_leg(&settings, &strat).is_none() {
+            // never overridden by the overall direction. Top Movers gainer/loser
+            // legs are likewise exempt: their side is bound to the leg itself, so
+            // a global overall-direction must not skip them (e.g. a Top Loser must
+            // still run PE even when the overall read is bullish).
+            if settings.overall_dir
+                && !strat.movers_leg
+                && assigned_leg(&settings, &strat).is_none()
+            {
                 if let Some(side) = self.active_side(&settings) {
                     let want_bull = side == "CE";
                     if strategy_is_bull(&strat) != want_bull {
@@ -4095,19 +4013,17 @@ impl RealtimeState {
             // must not silently turn the bullish-filter-only rule back off.
             gate_settings.premium_only = settings.premium_only;
             for (s, c) in &eval {
-                // One memo scope per leg: conditions, indicator gate, direction
-                // guard and fresh-meet all read the same candle slice, so every
-                // shared indicator is derived once instead of once per check.
-                // The scope drops at the end of this iteration (no await inside),
-                // so it can never outlive the borrowed candles.
+                // One memo scope per leg: conditions, indicator gate and
+                // fresh-meet all read the same candle slice, so every shared
+                // indicator is derived once instead of once per check. The scope
+                // drops at the end of this iteration (no await inside), so it can
+                // never outlive the borrowed candles.
                 let _gate_scope = IndScope::enter();
                 // Synthetic scanner instruments carry no entry conditions of their
                 // own - the ticked indicator filters are the whole entry rule.
                 let cond_ok = synth || conditions_met(&s.conditions, c, offset);
                 let fg = filter_gate(&gate_settings, s, c, offset);
-                let slc = strict_line_gate_ok(&gate_settings, s, c, offset);
-                let dg = direction_opposite(&gate_settings, s, c, offset);
-                if !cond_ok || !fg || !slc || dg {
+                if !cond_ok || !fg {
                     if strat.synthetic {
                         let bull_s = gate_settings.premium_only || strategy_is_bull(s);
                         let keys: Vec<String> = gate_settings
@@ -4129,12 +4045,11 @@ impl RealtimeState {
                             .cloned()
                             .collect();
                         let gate_expl = filter_gate_explain(&gate_settings, s, c, offset);
-                        let dir_expl = if gate_settings.dir_guard { "on" } else { "off" };
                         self.log_throttled(
                             &format!("gate:{}", strat.id),
                             60_000,
                             "info",
-                            &format!("scan gate fail {}: cond={cond_ok} filter={fg} line={slc} dir={dg} overallDir={} dirGuard={dir_expl} arrow=[{arrow_on}/{arrow_pass}] gate=[{gate_expl}] keys={keys:?} failed={failed:?}", strat.name, settings.overall_dir),
+                            &format!("scan gate fail {}: cond={cond_ok} filter={fg} overallDir={} arrow=[{arrow_on}/{arrow_pass}] gate=[{gate_expl}] keys={keys:?} failed={failed:?}", strat.name, settings.overall_dir),
                         );
                     }
                     all_pass = false;
@@ -4181,8 +4096,6 @@ impl RealtimeState {
                     };
                     if !(synth || conditions_met(&s.conditions, &tc, offset))
                         || !filter_gate(&gate_settings, s, &tc, offset)
-                        || !strict_line_gate_ok(&gate_settings, s, &tc, offset)
-                        || direction_opposite(&gate_settings, s, &tc, offset)
                     {
                         all_pass = false;
                         break;
@@ -4262,12 +4175,8 @@ impl RealtimeState {
             // already has a running position. This catches a second strategy
             // resolving to the same strike and a scan after a restart (which
             // clears the in-memory signal edge). It is exempt for the operator's
-            // explicit "repeat while condition holds" stacking mode, and it defers
-            // entirely to the signal-scoped rule below when "one trade per signal"
-            // is ON: that rule permits a genuinely NEW signal to re-enter the same
-            // strike, so a running position must not veto it here.
-            let once_signal_rules = settings.once_per_signal && strat.synthetic;
-            if !once_signal_rules && self.duplicate_entry_blocked(&settings, exec_strat.security_id, true) {
+            // explicit "repeat while condition holds" stacking mode.
+            if self.duplicate_entry_blocked(&settings, exec_strat.security_id, true) {
                 self.log_throttled(
                     &format!("dupe:{}", strat.id),
                     10_000,
@@ -4275,25 +4184,6 @@ impl RealtimeState {
                     &format!(
                         "skip duplicate entry {} -> {} (same strike already running)",
                         strat.name, exec_strat.trading_symbol
-                    ),
-                );
-                continue;
-            }
-            // "One trade per signal": once a scanner leg has traded a contract in
-            // the current signal pulse, hold every further entry on that contract
-            // until the pulse ends. A pulse only ends after the gate has stayed
-            // false for the debounce window (see `end_signal_if_due`), so a single
-            // flicker can never re-arm the guard and repeat the same signal. When
-            // a new signal begins, a second entry - even on the same strike, even
-            // while the older position is still open - is allowed.
-            if let Some(reason) = self.once_per_signal_block_reason(&settings, &strat, exec_strat.security_id) {
-                self.log_throttled(
-                    &format!("once:{}", strat.id),
-                    10_000,
-                    "info",
-                    &format!(
-                        "skip repeat entry {} -> {} ({}; waiting for a fresh signal)",
-                        strat.name, exec_strat.trading_symbol, reason
                     ),
                 );
                 continue;
@@ -4315,7 +4205,7 @@ impl RealtimeState {
                 let leg_ltp = self.ltp_of(exec_strat.security_id, &exec_strat.exchange_segment);
                 if leg_ltp > 0.0 {
                     if let Some(reason) = self.early_margin_skip_reason(&exec_strat, leg_ltp) {
-                        self.consume_signal_for_margin(&strat.id, exec_strat.security_id);
+                        self.consume_signal_for_margin(&strat.id);
                         self.log_throttled(
                             &format!("marginskip:{}", strat.id),
                             10_000,
@@ -4372,7 +4262,7 @@ impl RealtimeState {
                     if settings.skip_on_margin_block && e.starts_with("trade blocked:") {
                         // Consume the signal so the still-true gate cannot re-fire
                         // every scan and eventually fill late once margin frees.
-                        self.consume_signal_for_margin(&strat.id, exec_strat.security_id);
+                        self.consume_signal_for_margin(&strat.id);
                         self.log_throttled(
                             &format!("marginskip:{}", strat.id),
                             10_000,
@@ -5296,6 +5186,15 @@ impl RealtimeState {
         if let Some(side) = routed_option_side(settings, strat) {
             return side;
         }
+        // Top Movers gainer/loser legs are hard-bound to their own side: a Top
+        // Gainer always buys CE, a Top Loser always PE. This sits above the NIFTY
+        // lock / Run-in / Option Type / auto-bias chain so no global direction
+        // source can flip a loser onto CE (or a gainer onto PE), in forced and
+        // normal modes alike. Operator-assigned index/commodity legs already won
+        // above via `routed_option_side`.
+        if strat.movers_leg {
+            return if strategy_is_bull(strat) { "CE" } else { "PE" };
+        }
         if let Some(side) = self.nifty_locked_side(strat, settings) {
             return side;
         }
@@ -5940,7 +5839,7 @@ impl RealtimeState {
                         // what let the same signal re-queue and fill minutes later
                         // at a worse price. Consume it instead.
                         if me.skip_margin_block_enabled() && e.starts_with("trade blocked:") {
-                            me.consume_signal_for_margin(&strat.id, strat.security_id);
+                            me.consume_signal_for_margin(&strat.id);
                             me.log_throttled(
                                 &format!("marginskip:{}", strat.id),
                                 10_000,
@@ -6169,24 +6068,11 @@ impl RealtimeState {
         // that already has a running position. Checked here (after the contract is
         // fully resolved) so it covers index strategies too, and skipped for
         // Manual Order Placement (operator-driven) and for the explicit
-        // "repeat while condition holds" stacking mode. When "one trade per signal"
-        // governs this scanner leg it defers to the signal-scoped rule below, which
-        // permits a genuinely new signal to re-enter the same strike.
-        let once_signal_rules = guard_duplicates && settings.once_per_signal && strat.synthetic;
-        if !once_signal_rules && self.duplicate_entry_blocked(&settings, strat.security_id, guard_duplicates) {
+        // "repeat while condition holds" stacking mode.
+        if self.duplicate_entry_blocked(&settings, strat.security_id, guard_duplicates) {
             return Err(format!(
                 "duplicate: {} {} already running - second entry on the same strike skipped",
                 strat.trading_symbol, strat.instrument
-            ));
-        }
-        // "One trade per signal": the leg has already traded this exact contract in
-        // the current pulse, and the pulse has not ended since, so hold the entry.
-        // Engine-only (Manual Order Placement is exempt), matching the scan-loop
-        // pre-check.
-        if once_signal_rules && self.pulse_blocked(&strat.id, strat.security_id) {
-            return Err(format!(
-                "once-per-signal: {} already traded on this strike - waiting for a fresh filter signal",
-                strat.trading_symbol
             ));
         }
         // Publish the exact contract this entry executes on (option premium for
@@ -6518,12 +6404,6 @@ impl RealtimeState {
                     d.entry_timing.truncate(60);
                 }
             }
-        }
-        // Remember this strike as traded for the current signal pulse, so no
-        // further entry is placed on it until the leg's gate resets and meets
-        // again (a fresh signal). Only meaningful while the feature is on.
-        if settings.once_per_signal && strat.synthetic {
-            self.pulse_mark(&strat.id, strat.security_id);
         }
         self.save();
         self.log("info", &format!("opened {} {} {} @ {:.2}", strat.name, side, qty, ltp));
@@ -7337,19 +7217,6 @@ fn color_samples() -> &'static Mutex<HashMap<ColorSampleKey, ColorSample>> {
 /// True for the dedicated "Straight Line Indicator Color Detection" gate keys.
 fn is_color_filter(k: &str) -> bool {
     k.starts_with("BullSlColor") || k.starts_with("BearSlColor")
-}
-
-/// True for ANY straight-line indicator filter the strict line gate reads:
-///   * the "Straight Line Indicators" DIRECTION rows (`Sl*`, and the Volume line
-///     `Vl`), which fire on the line's trend/slope, and
-///   * the "Straight Line Indicator Color Detection" rows (`SlColor*`), which
-///     fire on the line's green/red colour.
-/// Both live in the Bullish/Bearish filter lists, so the gate covers whichever
-/// of them the operator ticked. Non-line filters (arrows, OI trend, Pbg, EMA
-/// families, ...) are excluded.
-fn is_straight_line_filter(k: &str) -> bool {
-    let base = k.strip_prefix("Bull").or_else(|| k.strip_prefix("Bear")).unwrap_or(k);
-    base.starts_with("Sl") || base == "Vl"
 }
 
 /// Evaluate a colour filter at most once per `COLOR_SCAN_MS`, so the algo reads
@@ -8588,31 +8455,16 @@ fn spot_candle_color_ok(bull: bool, open: f64, close: f64) -> bool {
     }
 }
 
-/// True when the option leg must follow each strategy's own stock/filter side
-/// instead of a global scanner direction ("Filter-side routing" - bullish
-/// filters trade CE, bearish filters PE). When on, no NIFTY lock / Top-Movers
-/// auto side / Run-in / Overall direction may flip the leg.
-fn per_strategy_side(settings: &Settings) -> bool {
-    settings.filter_side_route
-}
-
-/// Option side forced by per-strategy routing: bullish strategies trade CE,
-/// bearish ones PE. `None` when neither feature is on, so callers keep their
-/// normal multi-source resolution.
+/// Option side explicitly assigned by the operator for a scanner index/commodity
+/// leg. `None` when the strategy has no assigned leg, so callers keep their normal
+/// multi-source resolution.
 fn routed_option_side(settings: &Settings, strat: &Strategy) -> Option<&'static str> {
     // Operator-assigned leg (Top Movers "Indices" / "Commodities"): an explicitly
     // assigned CE/PE is authoritative and wins over every other direction source -
     // the NIFTY straight-line lock, the "Run Strategy In" override and the auto
     // scanner bias - for that instrument only. It also fixes the indicator-filter
     // side (CE = bullish filters, PE = bearish filters).
-    if let Some(side) = assigned_leg(settings, strat) {
-        return Some(side);
-    }
-    if per_strategy_side(settings) {
-        Some(if strategy_is_bull(strat) { "CE" } else { "PE" })
-    } else {
-        None
-    }
+    assigned_leg(settings, strat)
 }
 
 /// Parse the CE/PE leg out of one leg-assignment list (`movers_index_legs` /
@@ -8781,11 +8633,8 @@ fn stream_allows(settings: &Settings, strat: &Strategy) -> bool {
 struct GateFacts {
     pass: usize,
     total: usize,
-    opposite: usize,
-    opp_total: usize,
     strict: bool,
     brain: bool,
-    veto: bool,
 }
 
 /// Indicator-filter gate for one side. Every enabled entry-gate mechanism is
@@ -8794,9 +8643,8 @@ struct GateFacts {
 ///   * "All together (strict AND)" -> every enabled filter on the strategy's
 ///     side must pass. This is gated ONLY by the checkbox; the Indicator-filters
 ///     run mode does NOT by itself force strict AND.
-///   * AI Brain AUTO (score + conflict veto) -> the weighted own-side confluence
-///     must also reach the threshold, and a strongly-opposite filter set (at
-///     least half of that side's enabled filters agreeing) vetoes the entry.
+///   * AI Brain AUTO (score) -> the weighted own-side confluence must also reach
+///     the threshold.
 /// Without strict AND the gate falls back to a majority of the enabled filters
 /// (subject to Brain when it is enabled).
 fn filter_gate(settings: &Settings, strat: &Strategy, candles: &[Candle], offset: usize) -> bool {
@@ -8813,7 +8661,7 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
     // option-premium chart. A premium only rises while its own leg is in favour,
     // so the entry is always gated by the BULLISH filter set - even when the
     // operator routed the trade to the PE side. In this mode the bearish filters
-    // are not applied at all (and cannot veto through the opposite-side check).
+    // are not applied at all.
     let bull = settings.premium_only || strategy_is_bull(strat);
     let cons = consensus_cfg(settings);
     let sup = support_trend_cfg(settings);
@@ -8850,35 +8698,6 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
     if arrow_pass == Some(true) {
         f.pass += 1;
     }
-    // Premium-chart mode ignores the bearish filter set entirely, so it must not
-    // be counted as opposite-side agreement (that would veto every PE entry).
-    if !settings.premium_only {
-        for (k, v) in settings.filters.iter() {
-            if !*v || is_stream_flag(k) {
-                continue;
-            }
-            let opp = if bull { filter_is_bear(k) } else { filter_is_bull(k) };
-            if !opp {
-                continue;
-            }
-            f.opp_total += 1;
-            if gate_filter_eval(k, candles, offset, cons, sup, res) == Some(true) {
-                f.opposite += 1;
-            }
-        }
-    }
-    // Opposite-side confirmation veto. The chart only "reads the other way" when
-    // the OPPOSITE side's enabled filters agree STRICTLY more than this trade
-    // side's own filters (relative veto, the default): opposite must lead by at
-    // least one filter. A tie - or this side leading - never vetoes, so a
-    // symmetric Bull+Bear filter set can no longer deadlock into "no trade at
-    // all" on both sides. Mode `off` disables the veto entirely and lets the
-    // own-side strict / majority / Brain gate stand alone.
-    let opposite_veto_on = !settings.opposite_veto.eq_ignore_ascii_case("off");
-    if opposite_veto_on && f.opp_total > 0 && f.opposite > f.pass {
-        f.veto = true;
-        return (false, f);
-    }
     // "All together (strict AND)" requires every enabled filter on the
     // strategy's side to pass.
     f.strict = settings.all_in_one;
@@ -8899,9 +8718,12 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
     }
     if f.total == 0 {
         // No same-side filter is ticked. Non-blocking only when the operator has
-        // enabled no filters at all; if opposite filters are enabled there is no
-        // same-side confirmation, so the entry is blocked.
-        return (f.opp_total == 0, f);
+        // enabled no filters at all; if filters are configured on the opposite
+        // side only, there is no same-side confirmation, so the entry is blocked.
+        let any_opposite = settings.filters.iter().any(|(k, v)| {
+            *v && !is_stream_flag(k) && (if bull { filter_is_bear(k) } else { filter_is_bull(k) })
+        });
+        return (!any_opposite, f);
     }
     // Not strict AND: a majority of the enabled filters must still agree.
     (f.pass * 2 > f.total, f)
@@ -8909,93 +8731,14 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
 
 /// One-line breakdown of a `filter_gate` decision for the gate-fail log, so the
 /// operator can see exactly which mechanism (strict AND / brain threshold /
-/// conflict veto / majority) allowed or blocked the entry.
+/// majority) allowed or blocked the entry.
 fn filter_gate_explain(settings: &Settings, strat: &Strategy, candles: &[Candle], offset: usize) -> String {
     let (ok, f) = filter_gate_facts(settings, strat, candles, offset);
     let score = if f.total > 0 { f.pass as f64 / f.total as f64 * 100.0 } else { 100.0 };
     format!(
-        "ok={ok} pass={}/{} score={:.0}% strict={} brain={} veto={} opp={}/{} thr={}",
-        f.pass, f.total, score, f.strict, f.brain, f.veto, f.opposite, f.opp_total, settings.brain_threshold
+        "ok={ok} pass={}/{} score={:.0}% strict={} brain={} thr={}",
+        f.pass, f.total, score, f.strict, f.brain, settings.brain_threshold
     )
-}
-
-/// Strict straight-line gate (Indicator-filters mode, scanner / NIFTY-trend legs
-/// only). When `strict_line_color` is ON, the leg must be confirmed by EVERY
-/// straight-line filter ticked on its OWN side, from BOTH sections of the
-/// Bullish/Bearish lists:
-///   * "Straight Line Indicators" - the line DIRECTION rows (`BullSl*` / `BearSl*`
-///     and the Volume line `BullVl` / `BearVl`) must trend the leg's way.
-///   * "Straight Line Indicator Color Detection" - the line COLOUR rows
-///     (`BullSlColor*` / `BearSlColor*`) must read GREEN on the CE side, RED on
-///     the PE side.
-/// A ticked line reading the opposite way vetoes the entry outright, so a
-/// majority / AI-Brain gate can no longer let one dissenting line slip a leg
-/// through. Returns `true` (non-blocking) when the feature is off, when the
-/// strategy is not a scanner leg, or when no line filter is ticked on that side.
-fn strict_line_gate_ok(settings: &Settings, strat: &Strategy, candles: &[Candle], offset: usize) -> bool {
-    if !settings.strict_line_color || !strat.synthetic {
-        return true;
-    }
-    // NIFTY Trend Following owns the opposite-side block for its universe: the
-    // assigned NIFTY confirmation indicators decide which side may run (via the
-    // `niftyNetStrict` / `niftyAllAgreeStrict` gates, which drop the opposite
-    // side at scanner level). The manually ticked straight-line filters are the
-    // entry (majority) rule only, so their all-agree gate is skipped here while
-    // NIFTY trend is on - otherwise three ticked lines would need to agree on
-    // every stock and block essentially every trade.
-    if settings.nifty_trend_on {
-        return true;
-    }
-    let _sc = IndScope::enter();
-    let bull = settings.premium_only || strategy_is_bull(strat);
-    let cons = consensus_cfg(settings);
-    let sup = support_trend_cfg(settings);
-    let res = resistance_trend_cfg(settings);
-    for (k, v) in settings.filters.iter() {
-        if !*v || is_stream_flag(k) || !is_straight_line_filter(k) {
-            continue;
-        }
-        let on_side = if bull { filter_is_bull(k) } else { filter_is_bear(k) };
-        if !on_side {
-            continue;
-        }
-        if gate_filter_eval(k, candles, offset, cons, sup, res) == Some(false) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Direction Guard: block the entry when price action + EMA9/21 + EMA21/35 +
-/// Supertrend(10,3) + close-vs-VWAP give a clear opposite majority (>=3 votes).
-fn direction_opposite(settings: &Settings, strat: &Strategy, candles: &[Candle], offset: usize) -> bool {
-    if !settings.dir_guard {
-        return false;
-    }
-    let _sc = IndScope::enter();
-    let bull = strategy_is_bull(strat);
-    let mut opp = 0usize;
-    if let (Some(a), Some(b)) = (ema_val(9, candles, offset), ema_val(21, candles, offset)) {
-        if (a > b) != bull {
-            opp += 1;
-        }
-    }
-    if let (Some(a), Some(b)) = (ema_val(21, candles, offset), ema_val(35, candles, offset)) {
-        if (a > b) != bull {
-            opp += 1;
-        }
-    }
-    if let (Some(c), Some(st)) = (close_at(candles, offset), st_val(1.0, candles, offset)) {
-        if (c > st) != bull {
-            opp += 1;
-        }
-    }
-    if let (Some(c), Some(v)) = (close_at(candles, offset), ind_at("vwap", candles, &[], offset)) {
-        if (c > v) != bull {
-            opp += 1;
-        }
-    }
-    opp >= 3
 }
 
 // ---------------------------------------------------------------------------
@@ -9887,10 +9630,11 @@ fn snap_of(rt: &RealtimeState) -> Value {
         // Budget basis = wallet BEFORE locked margin; `margin_info_from` then
         // subtracts the running trades' locked margin exactly once to show the
         // remaining available amount.
-        paper_wallet_of(d.settings.paper_capital, &d.closed, d.settings.broker_charges)
+        paper_wallet_of(paper_base_of(&d.settings), &d.closed, d.settings.broker_charges)
     } else {
         real_available
     };
+    let margin_cap = paper_margin_cap_of(&d.settings);
     json!({
         "ok": true,
         "settings": d.settings,
@@ -9900,7 +9644,7 @@ fn snap_of(rt: &RealtimeState) -> Value {
         "positions": positions,
         "closed": closed,
         "closedCount": closed_total,
-        "margin": rt.margin_info_from(d.settings.margin_amount, d.settings.margin_pct, &d.positions, margin_available),
+        "margin": rt.margin_info_from(margin_cap, d.settings.margin_pct, &d.positions, margin_available),
         "armed": d.armed,
         "engineOn": d.engine_on,
         "autoLots": d.auto_lots,
@@ -9972,14 +9716,6 @@ pub async fn settings_post(State(rt): State<RealtimeState>, Json(v): Json<Value>
         // reads a value inside the floor/ceiling (100ms default for a stray 0).
         d.settings.scan_interval_ms = scan_interval_budget(d.settings.scan_interval_ms);
         d.settings.scan_bar_close_tf = scan_bar_close_tf(&d.settings.scan_bar_close_tf).to_string();
-        // Opposite-side veto mode: accept only the two documented values so a
-        // stray payload can never silently flip the entry gate ("relative" or
-        // "off"; anything else falls back to the "relative" default).
-        d.settings.opposite_veto = if d.settings.opposite_veto.eq_ignore_ascii_case("off") {
-            "off".to_string()
-        } else {
-            "relative".to_string()
-        };
         // "Make this default setting" markers (old AST runIn/tradeIn `default`
         // flags): the routing is always persisted, so surface the confirmation
         // the old engine logged instead of leaving the checkbox silently inert.
@@ -11261,71 +10997,6 @@ mod gate_tests {
     }
 
     #[tokio::test]
-    async fn once_per_signal_blocks_repeat_strikes_until_a_fresh_signal() {
-        let market = crate::market::MarketState::new();
-        let dhan = crate::broker::DhanState::new(market);
-        let rt = RealtimeState::new_paper(dhan);
-        let id = "scan:1:CE";
-        assert!(!rt.pulse_blocked(id, 111), "nothing traded yet");
-        // Trading a strike remembers it for the current signal pulse.
-        rt.pulse_mark(id, 111);
-        assert!(rt.pulse_blocked(id, 111), "same strike is blocked within the pulse");
-        assert!(!rt.pulse_blocked(id, 222), "a different strike is still allowed");
-        assert!(!rt.pulse_blocked("scan:2:CE", 111), "another leg has its own memory");
-        // A gate that stays true keeps the strike blocked until the pulse ends.
-        rt.set_sig_state(id, true);
-        assert!(!rt.sig_state_is_set("scan:2:CE"), "only this leg's edge was set");
-        // The gate stopping ends the pulse: next meet is a brand-new fresh signal.
-        rt.clear_signal_edge(id);
-        assert!(!rt.sig_state_is_set(id), "gate reset clears the fresh-edge flag");
-        assert!(!rt.pulse_blocked(id, 111), "a fresh signal may trade the strike again");
-    }
-
-    #[tokio::test]
-    async fn once_per_signal_is_signal_scoped_not_position_scoped() {
-        let market = crate::market::MarketState::new();
-        let dhan = crate::broker::DhanState::new(market);
-        let rt = RealtimeState::new_paper(dhan);
-        let mut s = Settings::default();
-        s.once_per_signal = true;
-        s.multi_always_on = true; // stacking mode must not change the signal rule
-        let strat = Strategy {
-            id: "scan:1:PE".into(),
-            security_id: 1,
-            category: "BEARISH".into(),
-            synthetic: true,
-            ..Default::default()
-        };
-        let contract = 116798;
-        // Nothing traded this signal yet: allowed even while a position runs.
-        if let Some(mut d) = rt.doc() {
-            d.positions.push(json!({ "id": "p1", "securityId": contract, "strategyId": strat.id }));
-        }
-        assert_eq!(
-            rt.once_per_signal_block_reason(&s, &strat, contract),
-            None,
-            "a running position alone never blocks - only a repeat inside the same signal does"
-        );
-        // The same contract already traded this signal: blocked.
-        rt.pulse_mark(&strat.id, contract);
-        assert_eq!(
-            rt.once_per_signal_block_reason(&s, &strat, contract),
-            Some("already traded this strike on the current signal")
-        );
-        // A new signal (pulse reset) may trade the same strike again, position or not.
-        rt.clear_signal_edge(&strat.id);
-        assert_eq!(rt.once_per_signal_block_reason(&s, &strat, contract), None);
-        // Non-synthetic (normal-mode) strategies are never held by this guard.
-        let mut norm = strat.clone();
-        norm.synthetic = false;
-        rt.pulse_mark(&norm.id, contract);
-        assert_eq!(rt.once_per_signal_block_reason(&s, &norm, contract), None);
-        // Feature off: no guard at all.
-        s.once_per_signal = false;
-        assert_eq!(rt.once_per_signal_block_reason(&s, &strat, contract), None);
-    }
-
-    #[tokio::test]
     async fn signal_end_debounce_ignores_a_single_flicker() {
         let market = crate::market::MarketState::new();
         let dhan = crate::broker::DhanState::new(market);
@@ -12035,7 +11706,6 @@ mod gate_tests {
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["optionSide"], json!("CE"));
         assert_eq!(v["brainMode"], json!("auto"));
-        assert_eq!(v["oppositeVeto"], json!("relative"));
         assert_eq!(v["allInOne"], json!(true));
         assert_eq!(v["filterMode"], json!(true));
         assert_eq!(v["filters"]["BullIncUp"], json!(true));
@@ -12054,7 +11724,6 @@ mod gate_tests {
         assert!(back.run_in_enabled && back.run_in_side == "PE" && back.run_in_auto);
         assert!(back.filter_mode);
         assert_eq!(back.scanner_exclude, vec![17818, 1234]);
-        assert_eq!(back.opposite_veto, "relative");
     }
 
     #[test]
@@ -12074,9 +11743,9 @@ mod gate_tests {
         let mut s = Settings::default();
         s.filters.insert("BullIncUp".into(), true);
         assert!(filter_gate(&s, &bull_strategy(), &c, 0), "rising close passes BullIncUp");
-        // The armed bull filter is met while the strategy is bearish: the opposite
-        // agreement must veto the entry (it is no longer silently ignored).
-        assert!(!filter_gate(&s, &bear_strategy(), &c, 0), "met opposite filter vetoes");
+        // The armed bull filter cannot gate a bearish strategy: there is no
+        // same-side confirmation, so the entry is blocked.
+        assert!(!filter_gate(&s, &bear_strategy(), &c, 0), "no same-side filter => blocked");
         s.filters.insert("BearIncDown".into(), true);
         assert!(!filter_gate(&s, &bear_strategy(), &c, 0), "opposing down filter fails");
     }
@@ -12097,105 +11766,6 @@ mod gate_tests {
         s.premium_only = true;
         assert!(filter_gate(&s, &bear_strategy(), &c, 0), "premium chart uses bull filters on the PE side");
         assert!(filter_gate(&s, &bull_strategy(), &c, 0), "premium chart uses bull filters on the CE side");
-    }
-
-    #[test]
-    fn strict_line_gate_covers_direction_and_colour_line_filters() {
-        let _g = ind_test_lock();
-        let up = ramp(400, 100.0, 0.6);
-        let down = ramp(400, 340.0, -0.6);
-        let tokens = [
-            "AutoTrendline", "ElliottWave", "ZigZag", "SupplyDemand", "PriceAction",
-            "GannFan", "Pitchfork", "TrendProjection",
-        ];
-        // A "Straight Line Indicators" DIRECTION row whose bull gate trends up on
-        // the rising ramp and down on the falling ramp...
-        let dir_tok = tokens
-            .iter()
-            .find(|tok| {
-                filter_eval(&format!("BullSl{tok}"), &up, 0) == Some(true)
-                    && filter_eval(&format!("BullSl{tok}"), &down, 0) == Some(false)
-            })
-            .expect("a bull line whose direction is up / down");
-        // ...and a COLOUR-detection row that reads green up / red down.
-        let col_tok = tokens
-            .iter()
-            .find(|tok| {
-                filter_eval(&format!("BullSlColor{tok}"), &up, 0) == Some(true)
-                    && filter_eval(&format!("BullSlColor{tok}"), &down, 0) == Some(false)
-            })
-            .expect("a bull line that is green up / red down");
-        color_samples().lock().unwrap().clear();
-
-        let mut bull = bull_strategy();
-        bull.synthetic = true;
-        let mut bear = bear_strategy();
-        bear.synthetic = true;
-
-        // Direction row only.
-        let mut s = Settings::default();
-        s.strict_line_color = true;
-        s.filters.insert(format!("BullSl{dir_tok}"), true);
-        assert!(strict_line_gate_ok(&s, &bull, &up, 0), "direction row confirms an up line");
-        assert!(!strict_line_gate_ok(&s, &bull, &down, 0), "direction row blocks a down line");
-        // The row is a bull filter, so it never gates the opposite PE leg.
-        assert!(strict_line_gate_ok(&s, &bear, &down, 0), "opposite-side row does not gate the PE leg");
-        color_samples().lock().unwrap().clear();
-
-        // Colour row only.
-        let mut s2 = Settings::default();
-        s2.strict_line_color = true;
-        s2.filters.insert(format!("BullSlColor{col_tok}"), true);
-        color_samples().lock().unwrap().clear();
-        assert!(strict_line_gate_ok(&s2, &bull, &up, 0), "colour row confirms a green line");
-        color_samples().lock().unwrap().clear();
-        assert!(!strict_line_gate_ok(&s2, &bull, &down, 0), "colour row blocks a red line");
-        color_samples().lock().unwrap().clear();
-
-        // Both sections together: either dissenting line vetoes the leg.
-        s.filters.insert(format!("BullSlColor{col_tok}"), true);
-        color_samples().lock().unwrap().clear();
-        assert!(!strict_line_gate_ok(&s, &bull, &down, 0), "either section can veto");
-        // A non-line filter (EMA family) that fails must NOT be read by this gate.
-        let mut s3 = Settings::default();
-        s3.strict_line_color = true;
-        s3.filters.insert("BullIncUp".into(), true);
-        assert!(strict_line_gate_ok(&s3, &bull, &down, 0), "non-line filters are not part of the strict gate");
-        color_samples().lock().unwrap().clear();
-
-        // Feature off -> non-blocking again.
-        s.strict_line_color = false;
-        assert!(strict_line_gate_ok(&s, &bull, &down, 0), "gate off -> no line veto");
-        // NIFTY Trend Following ON: the manual all-agree gate is skipped for
-        // scanner legs - the assigned NIFTY indicators own the opposite-side
-        // block (niftyNetStrict / niftyAllAgreeStrict), so ticked lines must not
-        // stall every entry.
-        s.strict_line_color = true;
-        s.nifty_trend_on = true;
-        assert!(strict_line_gate_ok(&s, &bull, &down, 0), "NIFTY trend owns the strict block");
-        s.nifty_trend_on = false;
-        // Normal-mode (non-synthetic) strategies are never line-gated.
-        s.strict_line_color = true;
-        bull.synthetic = false;
-        assert!(strict_line_gate_ok(&s, &bull, &down, 0), "normal-mode strategy is not line-gated");
-        color_samples().lock().unwrap().clear();
-    }
-
-    #[test]
-    fn straight_line_filter_predicate_matches_both_sections() {
-        for k in [
-            "BullSlAutoTrendline", "BearSlPitchfork", "BullVl", "BearVl",
-            "BullSlConsensus", "BearSlSupport", "BearSlResistance",
-            "BullSlColorAutoTrendline", "BearSlColorVl", "BearSlColorConsensus",
-        ] {
-            assert!(is_straight_line_filter(k), "{k} must be a straight-line filter");
-        }
-        for k in [
-            "BullArrowZigZag", "BearArrowVl", "BullIncUp", "BearIncDown", "BullOit",
-            "BearOit", "BullCandle", "BullEmaTrend9", "BearMacd", "BullMeetOvlHma",
-        ] {
-            assert!(!is_straight_line_filter(k), "{k} must NOT be a straight-line filter");
-        }
     }
 
     #[test]
@@ -12271,24 +11841,23 @@ mod gate_tests {
     }
 
     #[test]
-    fn brain_auto_conflict_veto_blocks_strong_opposite() {
+    fn brain_auto_only_uses_own_side_score() {
         let c = ramp(60, 100.0, 1.0);
         let mut s = Settings::default();
         s.brain_mode = "auto".into();
         s.brain_threshold = 50;
         s.all_in_one = true;
         s.filters.insert("BullIncUp".into(), true);
-        // Own side passes and there is no opposite agreement.
-        assert!(filter_gate(&s, &bull_strategy(), &c, 0), "no opposite agreement => allowed");
-        // Opposite side now leads STRICTLY: the own side has no passing filter
-        // while a passing opposite filter (Elder Force is a non-blocking
-        // confirmer that always evaluates true) counts against it. The relative
-        // veto fires even though Brain mode alone would not reach this branch.
+        assert!(filter_gate(&s, &bull_strategy(), &c, 0), "own side passes the threshold");
+        // Only a failing own-side filter remains, so the score drops below the
+        // threshold and the entry is blocked. The opposite side is not consulted.
+        s.all_in_one = false;
         s.filters.clear();
         s.filters.insert("BullIncDown".into(), true);
         s.filters.insert("BearPbrElderforce".into(), true);
         let (ok, f) = filter_gate_facts(&s, &bull_strategy(), &c, 0);
-        assert!(!ok && f.veto, "opposite leading strictly vetoes even under Brain AUTO");
+        assert!(!ok, "own-side score below threshold blocks even with a met opposite filter");
+        assert_eq!(f.total, 1, "the bear filter is not part of the bull-side gate");
     }
 
     #[test]
@@ -12305,68 +11874,7 @@ mod gate_tests {
         s.filters.insert("BullIncUp".into(), true);
         s.filters.insert("BearIncDown".into(), true);
         s.brain_threshold = 50;
-        assert!(filter_gate(&s, &bull_strategy(), &c, 0), "bear filter evaluates false so no veto");
-    }
-
-    #[test]
-    fn opposite_filter_vetoes_without_brain() {
-        let c = ramp(60, 100.0, 1.0);
-        let mut s = Settings::default();
-        s.filters.insert("BullIncUp".into(), true);
-        assert!(filter_gate(&s, &bull_strategy(), &c, 0), "own side passes => allowed");
-        s.filters.insert("BearIncDown".into(), true);
-        // On a rising ramp the bear filter is unmet, so it must not veto.
-        assert!(filter_gate(&s, &bull_strategy(), &c, 0), "unmet opposite does not veto");
-        // Opposite now leads STRICTLY: the own side has no passing filter and a
-        // met opposite filter (Elder Force always evaluates true) counts once -
-        // so the relative veto fires even with Brain off.
-        s.filters.clear();
-        s.filters.insert("BullIncDown".into(), true);
-        s.filters.insert("BearPbrElderforce".into(), true);
-        let (ok, f) = filter_gate_facts(&s, &bull_strategy(), &c, 0);
-        assert!(!ok && f.veto, "opposite leading strictly vetoes with brain off");
-    }
-
-    #[test]
-    fn opposite_veto_relative_tie_and_off() {
-        let c = ramp(60, 100.0, 1.0);
-        // Tie (own 1 vs opposite 1): a symmetric Bull+Bear filter set must not
-        // deadlock into "no trade" - the relative veto leaves the entry to the
-        // ordinary own-side majority rule.
-        let mut s = Settings::default();
-        s.filters.insert("BullIncUp".into(), true);
-        s.filters.insert("BearPbrElderforce".into(), true);
-        let (ok, f) = filter_gate_facts(&s, &bull_strategy(), &c, 0);
-        assert!(ok && !f.veto, "tie (1 vs 1) must not veto");
-
-        // Mode `off`: even when the opposite side strictly leads, no veto is set.
-        let mut s = Settings::default();
-        s.opposite_veto = "off".into();
-        s.filters.insert("BullIncDown".into(), true);
-        s.filters.insert("BearPbrElderforce".into(), true);
-        let (_, f) = filter_gate_facts(&s, &bull_strategy(), &c, 0);
-        assert!(!f.veto, "opposite veto OFF must never set veto");
-
-        // Mode `relative` (the default): opposite strictly leading does veto.
-        let mut s = Settings::default();
-        assert_eq!(s.opposite_veto, "relative");
-        s.filters.insert("BullIncDown".into(), true);
-        s.filters.insert("BearPbrElderforce".into(), true);
-        let (_, f) = filter_gate_facts(&s, &bull_strategy(), &c, 0);
-        assert!(f.veto, "relative veto fires when opposite strictly leads");
-    }
-
-    #[test]
-    fn direction_guard_blocks_opposite() {
-        let up = ramp(60, 100.0, 1.0);
-        let down = ramp(60, 200.0, -1.0);
-        let mut s = Settings::default();
-        s.dir_guard = true;
-        assert!(!direction_opposite(&s, &bull_strategy(), &up, 0), "aligned bull not blocked");
-        assert!(direction_opposite(&s, &bull_strategy(), &down, 0), "clear opposite majority blocked");
-        assert!(!direction_opposite(&s, &bear_strategy(), &down, 0), "aligned bear not blocked");
-        s.dir_guard = false;
-        assert!(!direction_opposite(&s, &bull_strategy(), &down, 0), "guard off never blocks");
+        assert!(filter_gate(&s, &bull_strategy(), &c, 0), "bear filter is not counted on the bull side");
     }
 
     #[test]
@@ -12388,54 +11896,30 @@ mod gate_tests {
     }
 
     #[test]
-    fn filter_side_routing_forces_the_filter_side() {
+    fn routed_option_side_only_returns_an_assigned_leg() {
         let bull = bull_strategy();
         let bear = bear_strategy();
-        let mut s = Settings::default();
-        // Off: no forced side, normal multi-source routing applies.
+        let s = Settings::default();
+        // No assignment: normal multi-source routing applies.
         assert_eq!(routed_option_side(&s, &bull), None);
         assert_eq!(routed_option_side(&s, &bear), None);
 
-        // On: the strategy's own filter side decides the leg, so a bullish
-        // strategy can only ever trade CE and a bearish one only PE - regardless
-        // of the other direction sources being armed.
-        s.filter_side_route = true;
-        assert_eq!(routed_option_side(&s, &bull), Some("CE"));
-        assert_eq!(routed_option_side(&s, &bear), Some("PE"));
-
-        // The competing overrides are suppressed while routing is on.
-        s.nifty_trend_on = true;
-        s.run_in_enabled = true;
-        s.run_in_side = "CE".into();
-        s.option_side = "CE".into();
-        assert_eq!(routed_option_side(&s, &bear), Some("PE"), "bearish leg cannot be flipped to CE");
-
-        // A generic BUY strategy counts as bullish; a SELL one as bearish.
+        // A generic BUY/SELL strategy has no assigned leg either.
         let generic = Strategy { category: String::new(), side: "BUY".into(), ..Default::default() };
         let generic_sell = Strategy { category: String::new(), side: "SELL".into(), ..Default::default() };
-        assert_eq!(routed_option_side(&s, &generic), Some("CE"));
-        assert_eq!(routed_option_side(&s, &generic_sell), Some("PE"));
+        assert_eq!(routed_option_side(&s, &generic), None);
+        assert_eq!(routed_option_side(&s, &generic_sell), None);
     }
 
     #[test]
-    fn filter_side_route_round_trip_uses_camel_case() {
+    fn direction_gate_round_trip_uses_camel_case() {
         let mut s = Settings::default();
-        assert!(!s.filter_side_route);
-        s.filter_side_route = true;
-        s.strict_line_color = true;
-        s.once_per_signal = true;
         s.nifty_net_strict = true;
         s.nifty_all_agree_strict = true;
         let v = serde_json::to_value(&s).unwrap();
-        assert_eq!(v["filterSideRoute"], serde_json::json!(true));
-        assert_eq!(v["strictLineColor"], serde_json::json!(true));
-        assert_eq!(v["oncePerSignal"], serde_json::json!(true));
         assert_eq!(v["niftyNetStrict"], serde_json::json!(true));
         assert_eq!(v["niftyAllAgreeStrict"], serde_json::json!(true));
         let back: Settings = serde_json::from_value(v).unwrap();
-        assert!(back.filter_side_route);
-        assert!(back.strict_line_color);
-        assert!(back.once_per_signal);
         assert!(back.nifty_net_strict);
         assert!(back.nifty_all_agree_strict);
     }
@@ -12468,13 +11952,11 @@ mod gate_tests {
         assert_eq!(index_target_side(&s, 13), Some(true));
 
         // The assigned leg overrides the NIFTY lock / Run-Strategy-In / Option
-        // Type / filter-side routing for that index, even armed for the opposite
-        // side.
+        // Type for that index, even armed for the opposite side.
         s.nifty_trend_on = true;
         s.run_in_enabled = true;
         s.run_in_side = "PE".into();
         s.option_side = "PE".into();
-        s.filter_side_route = true;
         let idx = Strategy {
             exchange_segment: "IDX_I".into(),
             instrument: "INDEX".into(),
@@ -12484,7 +11966,7 @@ mod gate_tests {
         };
         assert_eq!(routed_option_side(&s, &idx), Some("CE"), "assigned CE leg wins over every other source");
 
-        // A non-index strategy with the same security id is unaffected.
+        // A non-index strategy with the same security id has no assigned leg.
         let stock = Strategy {
             exchange_segment: "NSE_EQ".into(),
             instrument: "EQUITY".into(),
@@ -12492,7 +11974,7 @@ mod gate_tests {
             category: "BEARISH".into(),
             ..Default::default()
         };
-        assert_eq!(routed_option_side(&s, &stock), Some("PE"), "filter-side routing still applies to stocks");
+        assert_eq!(routed_option_side(&s, &stock), None, "only an assigned leg is routed");
 
         // Assign PE: flips to the PE leg; an invalid side value is ignored.
         s.movers_index_legs[0] = MoversIndexLeg { security_id: 13, side: "PE".into() };
@@ -12528,13 +12010,12 @@ mod gate_tests {
         assert_eq!(commodity_leg(&s, 428348), Some("CE"));
         assert_eq!(commodity_target_side(&s, 428348), Some(true));
 
-        // The assigned leg wins over the NIFTY lock / run-in / option-type /
-        // filter-side routing for that commodity, even armed for the opposite side.
+        // The assigned leg wins over the NIFTY lock / run-in / option-type for
+        // that commodity, even armed for the opposite side.
         s.nifty_trend_on = true;
         s.run_in_enabled = true;
         s.run_in_side = "PE".into();
         s.option_side = "PE".into();
-        s.filter_side_route = true;
         let comm = Strategy {
             exchange_segment: "MCX_COMM".into(),
             instrument: "FUTCOM".into(),
@@ -12544,8 +12025,7 @@ mod gate_tests {
         };
         assert_eq!(routed_option_side(&s, &comm), Some("CE"), "assigned CE leg wins over every other source");
 
-        // A non-commodity strategy with the same security id is unaffected by the
-        // commodity leg list.
+        // A non-commodity strategy with the same security id has no assigned leg.
         let stock = Strategy {
             exchange_segment: "NSE_EQ".into(),
             instrument: "EQUITY".into(),
@@ -12553,13 +12033,71 @@ mod gate_tests {
             category: "BEARISH".into(),
             ..Default::default()
         };
-        assert_eq!(routed_option_side(&s, &stock), Some("PE"), "filter-side routing still applies to stocks");
+        assert_eq!(routed_option_side(&s, &stock), None, "only an assigned leg is routed");
 
         // Assign PE: flips to the PE leg; an invalid side value is ignored.
         s.commodity_legs[0] = MoversIndexLeg { security_id: 428348, side: "PE".into() };
         assert_eq!(commodity_target_side(&s, 428348), Some(false));
         s.commodity_legs[0] = MoversIndexLeg { security_id: 428348, side: "nonsense".into() };
         assert_eq!(commodity_leg(&s, 428348), None, "invalid side is treated as no assignment");
+    }
+
+    #[tokio::test]
+    async fn movers_legs_always_buy_their_own_side() {
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        // Hostile global direction sources, all pointing CE: Run Strategy In CE,
+        // Option Type CE, and a CE Top-Movers auto bias. None may flip a loser.
+        let mut s = Settings::default();
+        s.run_in_enabled = true;
+        s.run_in_side = "CE".into();
+        s.option_side = "CE".into();
+        s.movers_on = true;
+        s.movers_gainers = 5;
+        s.movers_losers = 5;
+        rt.mover_bias.store(1, Ordering::Relaxed);
+
+        let gainer = Strategy {
+            category: "BULLISH".into(),
+            movers_leg: true,
+            ..Default::default()
+        };
+        let loser = Strategy {
+            category: "BEARISH".into(),
+            movers_leg: true,
+            ..Default::default()
+        };
+        assert_eq!(rt.target_option_side(&gainer, &s), "CE", "Top Gainer buys CE");
+        assert_eq!(
+            rt.target_option_side(&loser, &s),
+            "PE",
+            "Top Loser must buy PE no matter what the global side says"
+        );
+
+        // Flip every global source to CE again for a non-movers bearer: the old
+        // override chain still governs strategies that are not bound to a leg.
+        let legacy_bear = Strategy {
+            category: "BEARISH".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            rt.target_option_side(&legacy_bear, &s),
+            "CE",
+            "non-movers strategies keep the legacy global-side override"
+        );
+
+        // NIFTY lock pointing CE must not flip a bound Top Loser either.
+        s.run_in_enabled = false;
+        s.option_side = "both".into();
+        s.nifty_trend_on = true;
+        rt.nifty_dir.store(1, Ordering::Relaxed);
+        rt.mover_bias.store(0, Ordering::Relaxed);
+        assert_eq!(
+            rt.target_option_side(&loser, &s),
+            "PE",
+            "a bullish NIFTY lock still leaves the Top Loser on PE"
+        );
     }
 
     const UI_BULL: &[&str] = &[
@@ -13110,6 +12648,34 @@ mod gate_tests {
         assert!((locked - 100_000.0).abs() < 1e-9);
         assert!((budget - locked - 400_000.0).abs() < 1e-9);
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn dynamic_margin_wallet_follows_realized_pnl_until_reset() {
+        let mut s = Settings::default();
+        s.paper_capital = 200_000.0;
+        s.margin_amount = 300_000.0;
+        s.dynamic_margin_on = true;
+        // Dynamic mode bases the wallet on the manual margin, not the capital,
+        // and does NOT also apply it as a hard cap (so a profit can grow the
+        // balance past the starting amount).
+        assert!((paper_base_of(&s) - 300_000.0).abs() < 1e-9);
+        assert_eq!(paper_margin_cap_of(&s), 0.0);
+
+        // A 10,000 loss shrinks the tradable wallet to 290,000.
+        let loss = vec![json!({ "pnl": -10_000.0 })];
+        assert!((paper_wallet_of(paper_base_of(&s), &loss, false) - 290_000.0).abs() < 1e-9);
+        // Adding a 15,000 profit grows it to 305,000: the reduced balance is the
+        // base for the next trade, exactly like real money.
+        let both = vec![json!({ "pnl": -10_000.0 }), json!({ "pnl": 15_000.0 })];
+        assert!((paper_wallet_of(paper_base_of(&s), &both, false) - 305_000.0).abs() < 1e-9);
+        // Reset (empty book) restores the full margin without editing the field.
+        assert!((paper_wallet_of(paper_base_of(&s), &[], false) - 300_000.0).abs() < 1e-9);
+
+        // OFF: legacy static capital, and the margin amount is a hard cap again.
+        s.dynamic_margin_on = false;
+        assert!((paper_base_of(&s) - 200_000.0).abs() < 1e-9);
+        assert!((paper_margin_cap_of(&s) - 300_000.0).abs() < 1e-9);
     }
 
     // --- Engine controls: timeframe / MTF / auto-lots wiring -----------------

@@ -21,7 +21,7 @@ const API: &str = "https://api.github.com";
 /// GitHub Releases on this repo must publish `algo-desktop-<os>-<arch>.zip`
 /// assets (+ `SHA256SUMS`) - see `.github/release-workflow.yml`.
 pub const DEFAULT_REPO: &str =
-    "saratupadhyayeditor-lang/26_Added_PingTime5second";
+    "saratupadhyayeditor-lang/27_Added_RenkoHeikenLineChart";
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 pub struct UpdateConfig {
