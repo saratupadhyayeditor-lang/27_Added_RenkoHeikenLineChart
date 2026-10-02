@@ -35,6 +35,7 @@ use dhan_hq::models::{
     ExchangeSegment, LegName, MarginRequest, MarginResponse, ModifyOrderRequest, OrderRequest, OrderType,
     ProductType, TransactionType, Validity,
 };
+use algo_core::chart_type::{ChartKind, RenkoConfig, RenkoMode, RenkoSource};
 use algo_core::model::Candle;
 
 use crate::broker::DhanState;
@@ -257,6 +258,25 @@ pub struct Settings {
     pub tf_5min: bool,
     pub mtf: bool,
     pub use_own_settings: bool,
+    /// Chart type every strategy / indicator filter / entry-exit is evaluated on:
+    /// `candles` | `line` | `heikin_ashi` | `renko`. The raw live series is run
+    /// through the exact same transform the chart tab uses
+    /// (`algo_core::chart_type::build`) before the engine reads a single value,
+    /// so the algo trades precisely the series the operator selected.
+    pub chart_kind: String,
+    /// Renko brick mode (`traditional` | `atr` | `percentage`). Only meaningful
+    /// when `chart_kind == "renko"`.
+    pub renko_mode: String,
+    /// Renko fixed brick size in price units (Traditional mode).
+    pub renko_box_size: f64,
+    /// Renko ATR lookback (ATR mode).
+    pub renko_atr_length: i64,
+    /// Renko brick size as a percent of price (Percentage mode).
+    pub renko_percentage: f64,
+    /// Renko: draw wicks to each bar's high/low instead of pure bricks.
+    pub renko_wicks: bool,
+    /// Renko brick source: `close` | `highlow`.
+    pub renko_source: String,
     pub ai_sl: bool,
     pub ai_trail_tp: bool,
     pub ai_tp_pct: bool,
@@ -572,6 +592,13 @@ impl Default for Settings {
             tf_5min: true,
             mtf: false,
             use_own_settings: false,
+            chart_kind: "candles".into(),
+            renko_mode: "traditional".into(),
+            renko_box_size: 10.0,
+            renko_atr_length: 14,
+            renko_percentage: 1.0,
+            renko_wicks: false,
+            renko_source: "close".into(),
             ai_sl: false,
             ai_trail_tp: false,
             ai_tp_pct: false,
@@ -1715,6 +1742,10 @@ impl RealtimeState {
     /// so the strategy scan never waits on (or goes stale behind) a REST
     /// round-trip. If the feed goes quiet the series ages out after
     /// [`LIVE_BAR_TTL`] and the next call re-seeds from REST.
+    ///
+    /// The raw series is then transformed into the operator-selected chart type
+    /// (Candlestick / Heikin Ashi / Line / Renko) so every indicator filter and
+    /// entry/exit the caller derives runs on the chart the operator chose.
     async fn live_candles(
         &self,
         sec_id: i64,
@@ -1722,28 +1753,30 @@ impl RealtimeState {
         inst: &str,
         tf: &str,
     ) -> Result<Vec<Candle>, dhan_hq::DhanError> {
-        if let Some(c) = self.dhan.market.live_bars_for(sec_id, tf, LIVE_BAR_TTL) {
-            return Ok(c);
-        }
-        match self.dhan.fetch_candles(sec_id, exch, inst, tf).await {
-            Ok(c) => {
-                self.dhan.market.seed_bars(sec_id, tf, c.clone());
-                Ok(c)
-            }
-            Err(e) => {
-                // Never blank a running strategy just because one REST refresh
-                // failed - serve the last live series (bounded) instead.
-                if let Some(stale) = self
-                    .dhan
-                    .market
-                    .live_bars_for(sec_id, tf, Duration::from_secs(900))
-                {
-                    Ok(stale)
-                } else {
-                    Err(e)
+        let raw = if let Some(c) = self.dhan.market.live_bars_for(sec_id, tf, LIVE_BAR_TTL) {
+            c
+        } else {
+            match self.dhan.fetch_candles(sec_id, exch, inst, tf).await {
+                Ok(c) => {
+                    self.dhan.market.seed_bars(sec_id, tf, c.clone());
+                    c
+                }
+                Err(e) => {
+                    // Never blank a running strategy just because one REST refresh
+                    // failed - serve the last live series (bounded) instead.
+                    match self
+                        .dhan
+                        .market
+                        .live_bars_for(sec_id, tf, Duration::from_secs(900))
+                    {
+                        Some(stale) => stale,
+                        None => return Err(e),
+                    }
                 }
             }
-        }
+        };
+        let settings = self.doc().map(|d| d.settings.clone()).unwrap_or_default();
+        Ok(apply_engine_chart(raw, &settings))
     }
 
     /// `(ltp, oi, volume)` for a security from the shared live-quote cache. The
@@ -6851,6 +6884,43 @@ fn mtf_pair(settings: &Settings) -> Option<(String, String)> {
         None
     } else {
         Some((entry.to_string(), trend.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chart type: the series every indicator / filter / entry read is evaluated on.
+// The operator picks Candlestick / Heikin Ashi / Line / Renko in the engine
+// controls; the raw live series is transformed with the very same
+// `algo_core::chart_type::build` the chart tab uses, so the algo trades the
+// exact chart shown on screen.
+// ---------------------------------------------------------------------------
+
+/// Chart kind the engine evaluates on. Unknown / blank settings fall back to
+/// plain candles.
+fn engine_chart_kind(settings: &Settings) -> ChartKind {
+    ChartKind::parse(&settings.chart_kind)
+}
+
+/// Renko geometry from the engine settings. Clamped so a stray 0 can never make
+/// the brick builder produce an empty / NaN series.
+fn engine_renko_cfg(settings: &Settings) -> RenkoConfig {
+    RenkoConfig {
+        mode: RenkoMode::parse(&settings.renko_mode),
+        box_size: settings.renko_box_size,
+        atr_length: settings.renko_atr_length.max(1) as usize,
+        percentage: settings.renko_percentage,
+        wicks: settings.renko_wicks,
+        source: RenkoSource::parse(&settings.renko_source),
+    }
+}
+
+/// Transform a raw candle series into the operator-selected chart type, exactly
+/// like the chart tab. `Candles` (the default) is returned untouched - no copy,
+/// no work - so the existing fast path is unaffected.
+fn apply_engine_chart(candles: Vec<Candle>, settings: &Settings) -> Vec<Candle> {
+    match engine_chart_kind(settings) {
+        ChartKind::Candles => candles,
+        kind => algo_core::chart_type::build(kind, &candles, &engine_renko_cfg(settings)),
     }
 }
 
@@ -12711,6 +12781,39 @@ mod gate_tests {
         assert_eq!(mtf_pair(&s), Some(("1min".into(), "5min".into())));
         s.tf_5min = false;
         assert_eq!(mtf_pair(&s), None);
+    }
+
+    #[test]
+    fn engine_chart_transform_follows_the_selected_kind() {
+        let src = vec![
+            Candle { time: 1, open: 100.0, high: 110.0, low: 90.0, close: 100.0, volume: 1.0 },
+            Candle { time: 2, open: 100.0, high: 130.0, low: 100.0, close: 120.0, volume: 1.0 },
+            Candle { time: 3, open: 120.0, high: 140.0, low: 110.0, close: 130.0, volume: 1.0 },
+        ];
+        // Default / unknown -> identity (raw candles, no copy semantics needed).
+        let mut s = Settings::default();
+        let raw = apply_engine_chart(src.clone(), &s);
+        assert_eq!(raw.len(), 3);
+        assert!((raw[2].close - 130.0).abs() < 1e-9);
+
+        // Heikin Ashi rewrites the OHLC.
+        s.chart_kind = "heikin_ashi".into();
+        let ha = apply_engine_chart(src.clone(), &s);
+        assert_eq!(ha.len(), 3);
+        assert!((ha[1].close - 112.5).abs() < 1e-9, "HA close = (o+h+l+c)/4");
+
+        // Line keeps the raw series (its closes drive the line).
+        s.chart_kind = "line".into();
+        assert!((apply_engine_chart(src.clone(), &s)[2].close - 130.0).abs() < 1e-9);
+
+        // Renko rebuilds the series into bricks; a bigger move yields bricks.
+        s.chart_kind = "renko".into();
+        s.renko_box_size = 10.0;
+        let bricks = apply_engine_chart(src, &s);
+        assert!(!bricks.is_empty());
+        for b in &bricks {
+            assert!(((b.close - b.open).abs() - 10.0).abs() < 1e-9, "each brick is one box");
+        }
     }
 
     #[test]

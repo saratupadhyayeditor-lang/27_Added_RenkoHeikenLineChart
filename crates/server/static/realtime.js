@@ -1024,7 +1024,40 @@ function shell() {
           <label class="rtom-f"><input type="checkbox" data-set="aiSl"> AI Stop-Loss (save capital)</label>
           <label class="rtom-f"><input type="checkbox" data-set="aiTpPct"> AI TP % (decide run)</label>
           <label class="rtom-f"><input type="checkbox" data-set="manualTrailTp"> Manual Trail TP <input type="number" data-set="manualTrailTpPct" step="1" style="width:56px"> %</label>
-        </div>
+         </div>
+       </div>
+
+      <!-- CHART TYPE: the series every indicator / filter / entry is evaluated on -->
+      <div class="rt-engine-row" id="rtChartRow" style="border-color:#4a2d7e">
+        <b class="rt-cap" style="color:#66ccff">Chart Type:</b>
+        <label class="rtom-f" title="Algo isi chart par saare indicator, filter aur entry/exit evaluate karega - bilkul wahi series jo chart tab par dikhti hai.">Evaluate on
+          <select data-set="chartKind" id="rtChartKind" style="min-width:150px">
+            <option value="candles">Candlestick</option>
+            <option value="heikin_ashi">Heikin Ashi</option>
+            <option value="line">Line</option>
+            <option value="renko">Renko</option>
+          </select>
+        </label>
+        <span id="rtRenkoCtl" style="display:none;align-items:center;gap:10px;flex-wrap:wrap">
+          <label class="rtom-f">Brick mode
+            <select data-set="renkoMode" id="rtRenkoMode" style="min-width:120px">
+              <option value="traditional">Traditional</option>
+              <option value="atr">ATR</option>
+              <option value="percentage">Percentage</option>
+            </select>
+          </label>
+          <label class="rtom-f" id="rtRenkoBoxRow">Box size <input type="number" data-set="renkoBoxSize" min="0.01" step="0.05" style="width:80px"></label>
+          <label class="rtom-f" id="rtRenkoAtrRow" style="display:none">ATR length <input type="number" data-set="renkoAtrLength" min="1" max="200" step="1" style="width:70px"></label>
+          <label class="rtom-f" id="rtRenkoPctRow" style="display:none">Percentage % <input type="number" data-set="renkoPercentage" min="0.01" step="0.05" style="width:70px"></label>
+          <label class="rtom-f">Source
+            <select data-set="renkoSource" id="rtRenkoSource" style="min-width:110px">
+              <option value="close">Close</option>
+              <option value="highlow">High-Low</option>
+            </select>
+          </label>
+          <label class="rtom-f"><input type="checkbox" data-set="renkoWicks"> Wicks</label>
+        </span>
+        <span style="font-size:9px;color:#888">Har strategy, indicator filter aur trade execution isi chart type par chalega.</span>
       </div>
 
       <!-- ENGINE RISK & QUANTITY: SL / Trail SL / Lot / Auto-Lot -->
@@ -1814,6 +1847,29 @@ function refreshEngineScanUi() {
   }
 }
 
+// Chart Type controls: reveal the Renko geometry row only when Renko is picked,
+// and inside it only the fields the selected brick mode actually uses. Reads the
+// live DOM so it can run before a server round-trip for instant feedback.
+function refreshChartKindUi() {
+  const val = (id) => {
+    const el = document.getElementById(id);
+    return el ? el.value : "";
+  };
+  const kind = val("rtChartKind") || "candles";
+  const renko = kind === "renko";
+  const ctl = document.getElementById("rtRenkoCtl");
+  if (ctl) ctl.style.display = renko ? "flex" : "none";
+  if (!renko) return;
+  const mode = val("rtRenkoMode") || "traditional";
+  const show = (id, on) => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = on ? "flex" : "none";
+  };
+  show("rtRenkoBoxRow", mode === "traditional");
+  show("rtRenkoAtrRow", mode === "atr");
+  show("rtRenkoPctRow", mode === "percentage");
+}
+
 // Sync the Engine Scan controls from a settings snapshot. Never clobbers the
 // field the user is currently typing in.
 function applyEngineScanUI(s) {
@@ -2058,6 +2114,13 @@ function wire() {
       syncInterlocks();
       API.settings(settingsFromDom()).then(refresh);
     };
+  });
+
+  // Chart Type: the generic [data-set] handler above already persists the value;
+  // this only refreshes which Renko geometry fields are visible.
+  ["rtChartKind", "rtRenkoMode"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("change", refreshChartKindUi);
   });
 
   // Manual Strike Select (testing): the checkbox is a normal [data-set] setting
@@ -3693,6 +3756,7 @@ function applySettingsToDom(s) {
   syncAstToggles(s);
   applyDataPoolUi(!!s.data_pool);
   applyEngineScanUI(s);
+  refreshChartKindUi();
   // Strike-selection base must stay ON (see strikeBaseNormalized). A legacy
   // snapshot with either flag off is corrected once, with a notice, so the
   // "Execute Trade In" dropdown always runs on the +green base.
