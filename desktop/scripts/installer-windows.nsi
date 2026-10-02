@@ -41,9 +41,49 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_LANGUAGE "English"
 
 Section "Install"
+  ; Stop any running instance first. The server child can survive a shell
+  ; crash and keep algo-server.exe locked, which makes NSIS fail with
+  ; "error opening file for writing".
+  nsExec::Exec 'taskkill /F /IM algo-server.exe /T'
+  Pop $0
+  nsExec::Exec 'taskkill /F /IM algo-desktop.exe /T'
+  Pop $0
+  Sleep 1200
+
   SetOutPath "$INSTDIR"
-  File "${STAGE}/algo-desktop.exe"
-  File "${STAGE}/algo-server.exe"
+
+  ; Copy the two binaries, retrying while Windows releases the file lock.
+  StrCpy $R0 0
+  desktop_retry:
+    ClearErrors
+    File /nonfatal "${STAGE}/algo-desktop.exe"
+    IfErrors 0 desktop_ok
+    IntOp $R0 $R0 + 1
+    IntCmp $R0 8 lock_failed
+    nsExec::Exec 'taskkill /F /IM algo-desktop.exe /T'
+    Pop $0
+    Sleep 1000
+    Goto desktop_retry
+  desktop_ok:
+
+  StrCpy $R0 0
+  server_retry:
+    ClearErrors
+    File /nonfatal "${STAGE}/algo-server.exe"
+    IfErrors 0 server_ok
+    IntOp $R0 $R0 + 1
+    IntCmp $R0 8 lock_failed
+    nsExec::Exec 'taskkill /F /IM algo-server.exe /T'
+    Pop $0
+    Sleep 1000
+    Goto server_retry
+  server_ok:
+
+  Goto static_copy
+  lock_failed:
+    MessageBox MB_ICONEXCLAMATION|MB_OK "Setup could not replace a file that is in use. Please close Algo Trading (Task Manager: end algo-server.exe and algo-desktop.exe) and run the setup again."
+    Abort
+  static_copy:
 
   SetOutPath "$INSTDIR\static"
   File /r "${STAGE}/static/*.*"
